@@ -552,6 +552,32 @@ class BlockSparseMLP(Module):
                     final_hidden_states.add_(y_shared)
 
                 return to2(final_hidden_states.view_as(x), out_dtype, self.out_dtype)
+            activate_all_experts = params.get("activate_all_experts")
+
+            # Avoid building a very large one-hot expert mask when all experts are activated.
+            # selected_experts has shape (tokens, num_experts), so one_hot would become
+            # (tokens, num_experts, num_experts), which is prohibitively large for big-MoE models.
+            if activate_all_experts:
+
+                def mlp_all(exp_i):
+                    g = self.gates[exp_i].forward(y, params)
+                    u = self.ups[exp_i].forward(y, params)
+                    a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
+                    self.activation_fn_call(g, u, a)
+                    return self.downs[exp_i].forward(a, params)
+
+                for expert_idx in range(self.num_local_experts):
+                    current_state = mlp_all(expert_idx) * routing_weights[:, expert_idx, None]
+                    final_hidden_states.add_(current_state)
+
+                if self.shared_experts is not None:
+                    y_shared = self.shared_experts.forward(y, params)
+                    if self.shared_gate is not None:
+                        sh_gate = torch.sigmoid(self.shared_gate.forward(y, params))
+                        y_shared = y_shared * sh_gate
+                    final_hidden_states.add_(y_shared)
+
+                return to2(final_hidden_states.view_as(x), out_dtype, self.out_dtype)
 
             if self.routing_device is None or self.num_local_experts == self.num_experts:
                 expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes = self.num_local_experts)
