@@ -29,6 +29,7 @@ parser.add_argument("-cc", "--cal_cols", type = int, default = 1024, help = "Cal
 # parser.add_argument("-d", "--devices", type = str, default = "0", help = "List of devices to use, e.g. --devices 0,1,2")
 parser.add_argument("-d", "--device", type = int, default = 0, help = "Device index")
 parser.add_argument("-ms", "--max_sys", type = float, default = 8, help = "Max system memory for state data, in GB")
+parser.add_argument("--activate_all_experts", type = int, default = 1, choices = [0, 1], help = "Activate all experts in MoE layers during measurement, 0/1 (default: 1)")
 
 def prepare(args) -> (dict, dict, bool, str):
     if not args.in_dir:
@@ -48,7 +49,8 @@ def prepare(args) -> (dict, dict, bool, str):
         "cal_rows": args.cal_rows,
         "cal_cols": args.cal_cols,
         "device": args.device,
-        "max_sys": args.max_sys
+        "max_sys": args.max_sys,
+        "activate_all_experts": bool(args.activate_all_experts)
     }
 
     job_state = {}
@@ -244,7 +246,7 @@ def main(args, job_state):
                 config_ref.stc.close()
 
                 # Reference forward pass
-                params = {"activate_all_experts": True, "attn_mode": "flash_attn_nc"}
+                params = {"activate_all_experts": args["activate_all_experts"], "attn_mode": "flash_attn_nc"}
                 s = module.prepare_for_device(states_ref, params)
                 s = module.forward(s, params)
                 new_states_ref = s.cpu()
@@ -275,7 +277,7 @@ def main(args, job_state):
                     del module
 
                 # Advance base state
-                params = {"activate_all_experts": True, "attn_mode": "flash_attn_nc"}
+                params = {"activate_all_experts": args["activate_all_experts"], "attn_mode": "flash_attn_nc"}
                 s = modules[0].prepare_for_device(states_q, params)
                 s = modules[0].forward(s, params)
                 if last_fwd:
@@ -295,7 +297,7 @@ def main(args, job_state):
                     # Propagate candidates
                     for i in range(len(cand_states[k])):
                         states_c = cand_states[k][i]
-                        params = {"activate_all_experts": True, "attn_mode": "flash_attn_nc"}
+                        params = {"activate_all_experts": args["activate_all_experts"], "attn_mode": "flash_attn_nc"}
                         s = modules[0].prepare_for_device(states_c, params)
                         s = modules[0].forward(s, params)
                         if last_fwd:
@@ -323,7 +325,7 @@ def main(args, job_state):
                         )
                         cand_kld[k].append(0)
                         params = {
-                            "activate_all_experts": True,
+                            "activate_all_experts": args["activate_all_experts"],
                             "attn_mode": "flash_attn_nc",
                             "ovr": {key : model_q[k + 1].find_module(key) for key in t}
                         }
