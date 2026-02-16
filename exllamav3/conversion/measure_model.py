@@ -277,7 +277,7 @@ def main(args, job_state):
                     del module
 
                 # Advance base state
-                params = {"activate_all_experts": args["activate_all_experts"], "attn_mode": "flash_attn_nc"}
+                params = {"activate_all_experts": True, "attn_mode": "flash_attn_nc"}
                 s = modules[0].prepare_for_device(states_q, params)
                 s = modules[0].forward(s, params)
                 if last_fwd:
@@ -297,7 +297,7 @@ def main(args, job_state):
                     # Propagate candidates
                     for i in range(len(cand_states[k])):
                         states_c = cand_states[k][i]
-                        params = {"activate_all_experts": args["activate_all_experts"], "attn_mode": "flash_attn_nc"}
+                        params = {"activate_all_experts": True, "attn_mode": "flash_attn_nc"}
                         s = modules[0].prepare_for_device(states_c, params)
                         s = modules[0].forward(s, params)
                         if last_fwd:
@@ -325,7 +325,7 @@ def main(args, job_state):
                         )
                         cand_kld[k].append(0)
                         params = {
-                            "activate_all_experts": args["activate_all_experts"],
+                             "activate_all_experts": args["activate_all_experts"],
                             "attn_mode": "flash_attn_nc",
                             "ovr": {key : model_q[k + 1].find_module(key) for key in t}
                         }
