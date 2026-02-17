@@ -576,8 +576,23 @@ class BlockSparseMLP(Module):
                     idx, top_x = torch.where(selected_experts == expert_idx)
                     if top_x.numel() == 0:
                         continue
-                    current_state = y[None, top_x].reshape(-1, self.hidden_size)
-                    current_state = mlp(expert_idx, current_state) * routing_weights[top_x, idx, None]
+
+                    # Defensive bounds checks: routing kernels can occasionally emit malformed
+                    # indices under device-side failure conditions. Keep execution robust.
+                    rw_rows = routing_weights.shape[0]
+                    rw_cols = routing_weights.shape[1]
+                    valid = (top_x >= 0) & (top_x < rw_rows) & (idx >= 0) & (idx < rw_cols)
+                    if not valid.any():
+                        continue
+                    top_x = top_x[valid]
+                    idx = idx[valid]
+
+                    current_state = y.index_select(0, top_x)
+                    current_state = mlp(expert_idx, current_state)
+
+                    rw = routing_weights.index_select(0, top_x)
+                    w = rw.gather(1, idx.unsqueeze(1)).to(current_state.dtype)
+                    current_state = current_state * w
                     final_hidden_states.index_add_(0, top_x, current_state)
 
             final_hidden_states = final_hidden_states.reshape(x.shape)
