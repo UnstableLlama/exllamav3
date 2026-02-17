@@ -526,22 +526,44 @@ class BlockSparseMLP(Module):
         # Torch path
         elif bsz >= self.f_threshold or not self.is_quantized:
             final_hidden_states = torch.zeros_like(y, dtype = self.out_dtype)
+            activate_all_experts = params.get("activate_all_experts")
+
+            # Avoid building a very large one-hot expert mask when all experts are activated.
+            # selected_experts has shape (tokens, num_experts), so one_hot would become
+            # (tokens, num_experts, num_experts), which is prohibitively large for big-MoE models.
+            if activate_all_experts:
+
+                def mlp_all(exp_i):
+                    g = self.gates[exp_i].forward(y, params)
+                    u = self.ups[exp_i].forward(y, params)
+                    a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
+                    self.activation_fn_call(g, u, a)
+                    return self.downs[exp_i].forward(a, params)
+
+                for expert_idx in range(self.num_local_experts):
+                    current_state = mlp_all(expert_idx) * routing_weights[:, expert_idx, None]
+                    final_hidden_states.add_(current_state)
+
+                if self.shared_experts is not None:
+                    y_shared = self.shared_experts.forward(x, params).view(-1, self.hidden_size)
+                    if self.shared_gate is not None:
+                        sh_gate = torch.sigmoid(self.shared_gate.forward(x, params)).view(-1, 1)
+                        y_shared = y_shared * sh_gate
+                    final_hidden_states.add_(y_shared)
+
+                return to2(final_hidden_states.view_as(x), out_dtype, self.out_dtype)
 
             if self.routing_device is None or self.num_local_experts == self.num_experts:
-                expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes = self.num_local_experts)
+                selected_experts = selected_experts.clamp(0, self.num_local_experts - 1)
             else:
                 # TODO: profile, maybe optimize
-                selected_experts -= self.routing_first
+                selected_experts = selected_experts - self.routing_first
                 invalid = (selected_experts < 0) | (selected_experts >= self.num_local_experts)
-                shifted = torch.where(invalid, torch.zeros_like(selected_experts), selected_experts + 1)
-                expert_mask = F.one_hot(shifted, num_classes = self.num_local_experts + 1)[..., 1:]
-                # routing_weights[invalid] = 0.0
+                selected_experts = torch.where(invalid, -torch.ones_like(selected_experts), selected_experts)
 
             if self.num_local_experts is None or self.num_local_experts > 0:
 
                 num_ex = self.num_local_experts or self.num_experts
-                expert_count = expert_mask.view(-1, num_ex).sum(dim = 0).cpu()
-                expert_mask = expert_mask.permute(2, 1, 0)
 
                 def mlp(exp_i, xc):
                     g = self.gates[exp_i].forward(xc, params)
@@ -551,9 +573,9 @@ class BlockSparseMLP(Module):
                     return self.downs[exp_i].forward(a, params)
 
                 for expert_idx in range(num_ex):
-                    if expert_count[expert_idx] == 0:
+                    idx, top_x = torch.where(selected_experts == expert_idx)
+                    if top_x.numel() == 0:
                         continue
-                    idx, top_x = torch.where(expert_mask[expert_idx])
                     current_state = y[None, top_x].reshape(-1, self.hidden_size)
                     current_state = mlp(expert_idx, current_state) * routing_weights[top_x, idx, None]
                     final_hidden_states.index_add_(0, top_x, current_state)
