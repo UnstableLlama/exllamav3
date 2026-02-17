@@ -580,14 +580,19 @@ class BlockSparseMLP(Module):
                 return to2(final_hidden_states.view_as(x), out_dtype, self.out_dtype)
 
             if self.routing_device is None or self.num_local_experts == self.num_experts:
+                invalid = (selected_experts < 0) | (selected_experts >= self.num_local_experts)
+                selected_experts = selected_experts.clamp(0, self.num_local_experts - 1)
                 expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes = self.num_local_experts)
+                if invalid.any():
+                    routing_weights = routing_weights.masked_fill(invalid, 0.0)
             else:
                 # TODO: profile, maybe optimize
                 selected_experts -= self.routing_first
                 invalid = (selected_experts < 0) | (selected_experts >= self.num_local_experts)
                 shifted = torch.where(invalid, torch.zeros_like(selected_experts), selected_experts + 1)
                 expert_mask = F.one_hot(shifted, num_classes = self.num_local_experts + 1)[..., 1:]
-                # routing_weights[invalid] = 0.0
+                if invalid.any():
+                    routing_weights = routing_weights.masked_fill(invalid, 0.0)
 
             if self.num_local_experts is None or self.num_local_experts > 0:
 
