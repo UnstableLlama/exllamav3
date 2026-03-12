@@ -7,6 +7,7 @@ from .layernorm import LayerNorm
 from .embedding import Embedding
 from .attn import Attention
 from .gated_delta_net import GatedDeltaNet
+from .olmo_gated_delta_net import OlmoGatedDeltaNet
 from .gated_rmsnorm import GatedRMSNorm
 from .transformer import TransformerBlock, ParallelDecoderBlock
 from .conv import Conv

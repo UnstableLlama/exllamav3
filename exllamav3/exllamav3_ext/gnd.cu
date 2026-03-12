@@ -9,7 +9,7 @@
 #include <cmath>
 
 using bfloat16 = __nv_bfloat16;
-#define MAX_HEAD_DIM 128
+#define MAX_HEAD_DIM 192
 #define MAX_K_HEADS 32
 #define MAX_V_HEADS 64
 
