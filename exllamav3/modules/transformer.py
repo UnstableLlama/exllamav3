@@ -3,7 +3,7 @@ from typing_extensions import override
 import torch
 from ..util.tensor import to2
 from ..model.config import Config
-from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP
+from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, OlmoGatedDeltaNet
 from ..conversion.allocation import allocate_transformer
 from ..util import profile_opt
 
@@ -123,6 +123,19 @@ class TransformerBlock(Module):
                     return strategy, surplus_bits
                 else:
                     o = self.attn.o_proj
+            elif isinstance(self.attn, OlmoGatedDeltaNet):
+                strategy = {}
+                for linear in (self.attn.q_proj, self.attn.k_proj, self.attn.v_proj, self.attn.g_proj, self.attn.o_proj):
+                    s, surplus_bits = linear.allocate_q(quant_args, surplus_bits)
+                    strategy.update(s)
+                if u is not None:
+                    s, surplus_bits = allocate_transformer(
+                        quant_args[self.qbits_key],
+                        surplus_bits,
+                        None, None, None, None, g, u, d, None
+                    )
+                    strategy.update(s)
+                return strategy, surplus_bits
 
         return allocate_transformer(
             quant_args[self.qbits_key],

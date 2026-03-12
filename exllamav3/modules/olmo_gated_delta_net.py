@@ -79,15 +79,15 @@ class OlmoGatedDeltaNet(Module):
         # Separate q/k/v projections
         self.q_proj = Linear(
             config, f"{key}.q_proj", hidden_size, self.k_dim,
-            qmap = qmap + ".input", out_dtype = torch.float, pad_to = 1
+            qmap = qmap + ".input", out_dtype = torch.float
         )
         self.k_proj = Linear(
             config, f"{key}.k_proj", hidden_size, self.k_dim,
-            qmap = qmap + ".input", out_dtype = torch.float, pad_to = 1
+            qmap = qmap + ".input", out_dtype = torch.float
         )
         self.v_proj = Linear(
             config, f"{key}.v_proj", hidden_size, self.v_dim,
-            qmap = qmap + ".input", out_dtype = torch.float, pad_to = 1
+            qmap = qmap + ".input", out_dtype = torch.float
         )
         self.register_submodule(self.q_proj)
         self.register_submodule(self.k_proj)
@@ -96,7 +96,7 @@ class OlmoGatedDeltaNet(Module):
         # Gate projection (g_proj in OLMo, equivalent to in_proj_z in Qwen)
         self.g_proj = Linear(
             config, f"{key}.g_proj", hidden_size, self.v_dim,
-            qmap = qmap + ".input", out_dtype = torch.float, pad_to = 1
+            qmap = qmap + ".input", out_dtype = torch.float
         )
         self.register_submodule(self.g_proj)
 
@@ -207,12 +207,13 @@ class OlmoGatedDeltaNet(Module):
             save_state = False
 
         # --- Projections (separate, OLMo style) ---
-        q = self.q_proj.forward(x, params)                                          # [bsz, seq, k_dim]
-        k = self.k_proj.forward(x, params)                                          # [bsz, seq, k_dim]
-        v = self.v_proj.forward(x, params)                                          # [bsz, seq, v_dim]
-        z = self.g_proj.forward(x, params).view(bsz, seqlen, self.num_v_heads, self.v_head_dim)  # gate
-        b = self.b_proj.forward(x, params)                                          # [bsz, seq, num_v_heads]
-        a = self.a_proj.forward(x, params)                                          # [bsz, seq, num_v_heads]
+        q = self.q_proj.forward(x, params)[..., :self.k_dim]                           # [bsz, seq, k_dim]
+        k = self.k_proj.forward(x, params)[..., :self.k_dim]                           # [bsz, seq, k_dim]
+        v = self.v_proj.forward(x, params)[..., :self.v_dim]                           # [bsz, seq, v_dim]
+        z = self.g_proj.forward(x, params)[..., :self.v_dim]                           # [bsz, seq, v_dim]
+        z = z.view(bsz, seqlen, self.num_v_heads, self.v_head_dim)                     # gate
+        b = self.b_proj.forward(x, params)                                              # [bsz, seq, num_v_heads]
+        a = self.a_proj.forward(x, params)                                              # [bsz, seq, num_v_heads]
 
         # Compute beta and g from b, a, dt_bias, A_log
         # (same math as gated_delta_net_fused_op_2)
