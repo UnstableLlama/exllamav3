@@ -56,6 +56,7 @@ class OlmoGatedDeltaNet(Module):
         num_v_heads: int,
         rms_norm_eps: float,
         conv_kernel_size: int,
+        allow_neg_eigval: bool = False,
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
     ):
@@ -71,6 +72,7 @@ class OlmoGatedDeltaNet(Module):
         self.num_v_groups = num_v_heads // num_k_heads
         self.rms_norm_eps = rms_norm_eps
         self.conv_kernel_size = conv_kernel_size
+        self.allow_neg_eigval = allow_neg_eigval
         self.out_dtype = out_dtype
 
         self.k_dim = self.k_head_dim * self.num_k_heads
@@ -130,14 +132,20 @@ class OlmoGatedDeltaNet(Module):
         self.a_log = None
         self.dt_bias = None
         self.q_conv1d_weight = None
+        self.q_conv1d_bias = None
         self.k_conv1d_weight = None
+        self.k_conv1d_bias = None
         self.v_conv1d_weight = None
+        self.v_conv1d_bias = None
 
         self.key_a_log = f"{key}.A_log"
         self.key_dt_bias = f"{key}.dt_bias"
         self.key_q_conv1d_weight = f"{key}.q_conv1d.weight"
+        self.key_q_conv1d_bias = f"{key}.q_conv1d.bias"
         self.key_k_conv1d_weight = f"{key}.k_conv1d.weight"
+        self.key_k_conv1d_bias = f"{key}.k_conv1d.bias"
         self.key_v_conv1d_weight = f"{key}.v_conv1d.weight"
+        self.key_v_conv1d_bias = f"{key}.v_conv1d.bias"
 
         # Total dim for the fused q+k+v used by conv and recurrence
         self.conv_dim = self.k_dim + self.k_dim + self.v_dim
@@ -158,11 +166,20 @@ class OlmoGatedDeltaNet(Module):
         self.q_conv1d_weight = self.config.stc.get_tensor(
             self.key_q_conv1d_weight, self.device, optional = False, allow_bf16 = True
         )
+        self.q_conv1d_bias = self.config.stc.get_tensor(
+            self.key_q_conv1d_bias, self.device, optional = True, allow_bf16 = True
+        )
         self.k_conv1d_weight = self.config.stc.get_tensor(
             self.key_k_conv1d_weight, self.device, optional = False, allow_bf16 = True
         )
+        self.k_conv1d_bias = self.config.stc.get_tensor(
+            self.key_k_conv1d_bias, self.device, optional = True, allow_bf16 = True
+        )
         self.v_conv1d_weight = self.config.stc.get_tensor(
             self.key_v_conv1d_weight, self.device, optional = False, allow_bf16 = True
+        )
+        self.v_conv1d_bias = self.config.stc.get_tensor(
+            self.key_v_conv1d_bias, self.device, optional = True, allow_bf16 = True
         )
         self.norm.load(device, **kwargs)
 
@@ -171,8 +188,11 @@ class OlmoGatedDeltaNet(Module):
         self.a_log = None
         self.dt_bias = None
         self.q_conv1d_weight = None
+        self.q_conv1d_bias = None
         self.k_conv1d_weight = None
+        self.k_conv1d_bias = None
         self.v_conv1d_weight = None
+        self.v_conv1d_bias = None
         self.norm.unload()
         super().unload()
 
@@ -220,7 +240,7 @@ class OlmoGatedDeltaNet(Module):
         beta = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = self.device)
         g = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.float, device = self.device)
 
-        if ext is not None:
+        if ext is not None and not self.allow_neg_eigval:
             ext.gated_delta_net_fused_op_2(
                 b, a,
                 self.dt_bias,
@@ -229,10 +249,12 @@ class OlmoGatedDeltaNet(Module):
             )
         else:
             # Fallback: manual computation
-            dt = b + self.dt_bias.unsqueeze(0).unsqueeze(0)
-            beta_float = F.softplus(dt)
-            beta.copy_(beta_float.to(torch.bfloat16))
-            g.copy_((-a.float().exp() * self.a_log.float().exp().unsqueeze(0).unsqueeze(0)).exp())
+            beta.copy_(torch.sigmoid(b).to(torch.bfloat16))
+            dt = F.softplus(a + self.dt_bias.unsqueeze(0).unsqueeze(0))
+            if self.allow_neg_eigval:
+                g.copy_(-dt * self.a_log.float().unsqueeze(0).unsqueeze(0))
+            else:
+                g.copy_(-dt * self.a_log.float().exp().unsqueeze(0).unsqueeze(0))
 
         # --- Convolutions (separate per q/k/v, OLMo style) ---
         # Concatenate for conv state tracking, then split back
@@ -247,6 +269,19 @@ class OlmoGatedDeltaNet(Module):
             dim = 0
         ).squeeze(1)
 
+        fused_conv_bias = None
+        if self.q_conv1d_bias is not None or self.k_conv1d_bias is not None or self.v_conv1d_bias is not None:
+            q_bias = self.q_conv1d_bias
+            if q_bias is None:
+                q_bias = torch.zeros(self.k_dim, dtype = mixed_qkv.dtype, device = mixed_qkv.device)
+            k_bias = self.k_conv1d_bias
+            if k_bias is None:
+                k_bias = torch.zeros(self.k_dim, dtype = mixed_qkv.dtype, device = mixed_qkv.device)
+            v_bias = self.v_conv1d_bias
+            if v_bias is None:
+                v_bias = torch.zeros(self.v_dim, dtype = mixed_qkv.dtype, device = mixed_qkv.device)
+            fused_conv_bias = torch.cat([q_bias, k_bias, v_bias], dim = 0)
+
         if conv_state is None:
             if save_state:
                 conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
@@ -254,14 +289,14 @@ class OlmoGatedDeltaNet(Module):
             mixed_qkv = causal_conv1d_fwd_function(
                 mixed_qkv,
                 fused_conv_weight,
-                None,  # no bias
+                fused_conv_bias,
             )
         else:
             mixed_qkv = causal_conv1d_update_function(
                 mixed_qkv,
                 conv_state,  # updated inplace
                 fused_conv_weight,
-                None,  # no bias
+                fused_conv_bias,
             )
 
         # --- Recurrence (identical to standard GatedDeltaNet) ---
@@ -332,7 +367,8 @@ class OlmoGatedDeltaNet(Module):
                     k_out = k_out.repeat_interleave(self.num_v_groups, dim = 2)
                 core_attn_out, recurrent_state = torch_recurrent_gated_delta_rule(
                     q_out, k_out, v_out, g, beta,
-                    recurrent_state, save_state
+                    recurrent_state, save_state,
+                    use_qk_l2norm_in_kernel = True,
                 )
 
         # --- Norm + output projection ---
@@ -358,8 +394,11 @@ class OlmoGatedDeltaNet(Module):
             (self.a_log, self.key_a_log),
             (self.dt_bias, self.key_dt_bias),
             (self.q_conv1d_weight, self.key_q_conv1d_weight),
+            (self.q_conv1d_bias, self.key_q_conv1d_bias),
             (self.k_conv1d_weight, self.key_k_conv1d_weight),
+            (self.k_conv1d_bias, self.key_k_conv1d_bias),
             (self.v_conv1d_weight, self.key_v_conv1d_weight),
+            (self.v_conv1d_bias, self.key_v_conv1d_bias),
         ]:
             if x is not None:
                 t[k] = x
