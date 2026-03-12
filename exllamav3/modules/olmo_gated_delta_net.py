@@ -319,13 +319,18 @@ class OlmoGatedDeltaNet(Module):
             )
 
         else:
-            core_attn_out = torch.empty(
-                (bsz, seqlen, self.num_v_heads, self.v_head_dim),
-                dtype = torch.bfloat16,
-                device = self.device,
+            mixed_qkv = mixed_qkv.transpose(1, 2)
+            q_out, k_out, v_out = torch.split(
+                mixed_qkv, [self.k_dim, self.k_dim, self.v_dim], dim = -1
             )
+            q_out = q_out.view(bsz, seqlen, -1, self.k_head_dim)
+            k_out = k_out.view(bsz, seqlen, -1, self.k_head_dim)
+            v_out = v_out.view(bsz, seqlen, -1, self.v_head_dim)
 
-            mixed_qkv = mixed_qkv.transpose(1, 2).contiguous()
+            if self.num_v_groups > 1:
+                q_out = q_out.repeat_interleave(self.num_v_groups, dim = 2)
+                k_out = k_out.repeat_interleave(self.num_v_groups, dim = 2)
+
             if recurrent_state is None:
                 recurrent_state = torch.zeros(
                     (bsz, self.num_v_heads, self.k_head_dim, self.v_head_dim),
@@ -333,34 +338,14 @@ class OlmoGatedDeltaNet(Module):
                     device = self.device
                 )
 
-            if ext is not None:
-                ext.cuda_recurrent_gated_delta_rule(
-                    mixed_qkv,
-                    g,
-                    beta,
-                    recurrent_state,
-                    core_attn_out,
-                    self.num_k_heads,
-                    self.num_v_heads,
-                    self.k_head_dim,
-                    self.v_head_dim
-                )
-            else:
-                # Pure torch fallback
-                mixed_qkv_t = mixed_qkv.transpose(1, 2)
-                q_out, k_out, v_out = torch.split(
-                    mixed_qkv_t, [self.k_dim, self.k_dim, self.v_dim], dim = -1
-                )
-                q_out = q_out.view(bsz, seqlen, -1, self.k_head_dim)
-                k_out = k_out.view(bsz, seqlen, -1, self.k_head_dim)
-                v_out = v_out.view(bsz, seqlen, -1, self.v_head_dim)
-                if self.num_v_groups > 1:
-                    q_out = q_out.repeat_interleave(self.num_v_groups, dim = 2)
-                    k_out = k_out.repeat_interleave(self.num_v_groups, dim = 2)
-                core_attn_out, recurrent_state = torch_recurrent_gated_delta_rule(
-                    q_out, k_out, v_out, g, beta,
-                    recurrent_state, save_state
-                )
+            # Use FLA fused recurrent kernel instead of CUDA kernel, which has
+            # alignment requirements (k_head_dim must be divisible by 64) that
+            # OLMo's k_head_dim=96 does not satisfy
+            core_attn_out, recurrent_state = fused_recurrent_gated_delta_rule(
+                q_out, k_out, v_out, g, beta,
+                recurrent_state, save_state,
+                use_qk_l2norm_in_kernel = True,
+            )
 
         # --- Norm + output projection ---
         core_attn_out = self.norm.forward(core_attn_out, params, gate = z)
