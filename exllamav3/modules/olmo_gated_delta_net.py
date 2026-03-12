@@ -56,6 +56,7 @@ class OlmoGatedDeltaNet(Module):
         num_v_heads: int,
         rms_norm_eps: float,
         conv_kernel_size: int,
+        allow_neg_eigval: bool = False,
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
     ):
@@ -71,6 +72,7 @@ class OlmoGatedDeltaNet(Module):
         self.num_v_groups = num_v_heads // num_k_heads
         self.rms_norm_eps = rms_norm_eps
         self.conv_kernel_size = conv_kernel_size
+        self.allow_neg_eigval = allow_neg_eigval
         self.out_dtype = out_dtype
 
         self.k_dim = self.k_head_dim * self.num_k_heads
@@ -250,6 +252,10 @@ class OlmoGatedDeltaNet(Module):
             beta.copy_(torch.sigmoid(b).to(torch.bfloat16))
             dt = F.softplus(a + self.dt_bias.unsqueeze(0).unsqueeze(0))
             g.copy_(-dt * self.a_log.float().exp().unsqueeze(0).unsqueeze(0))
+
+        # Scale beta for negative eigenvalue mode (allows range [0, 2] instead of [0, 1])
+        if self.allow_neg_eigval:
+            beta = beta * 2.0
 
         # --- Convolutions (separate per q/k/v, OLMo style) ---
         # Concatenate for conv state tracking, then split back

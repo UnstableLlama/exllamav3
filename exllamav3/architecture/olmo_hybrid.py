@@ -68,6 +68,7 @@ class OlmoHybridConfig(Config):
         self.linear_num_value_heads = self.read_cfg(int, "linear_num_value_heads", no_default)
         self.linear_key_head_dim = self.read_cfg(int, "linear_key_head_dim", no_default)
         self.linear_value_head_dim = self.read_cfg(int, "linear_value_head_dim", no_default)
+        self.linear_allow_neg_eigval = self.read_cfg(bool, "linear_allow_neg_eigval", True)
 
         # MLP params
         self.assert_cfg(str, "hidden_act", "silu", True)
@@ -144,6 +145,7 @@ class OlmoHybridModel(Model):
                             num_v_heads = config.linear_num_value_heads,
                             rms_norm_eps = config.rms_norm_eps,
                             conv_kernel_size = config.linear_conv_kernel_dim,
+                            allow_neg_eigval = config.linear_allow_neg_eigval,
                             qmap = "block.attn",
                             out_dtype = torch.float,
                         ),
