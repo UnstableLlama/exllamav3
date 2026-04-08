@@ -603,6 +603,18 @@ class GatedMLP(Module):
                 self.multi_gu[i] = None
 
 
+    def warmup(self):
+        # Force CUDA graph capture for the bsz=1 decode path so it doesn't stall
+        # the first token of the first generation. No-op if the bound class isn't
+        # in use (unquantized or non-CUDA device).
+        if self.bc is None:
+            return
+        x = torch.zeros((1, 1, self.hidden_size), dtype = torch.half, device = self.device)
+        d = torch.empty((1, 1, self.hidden_size), dtype = self.out_dtype or torch.float, device = self.device)
+        self.bc.run_bsz1(x, d)
+        torch.cuda.synchronize(self.device)
+
+
     @override
     def forward(
         self,

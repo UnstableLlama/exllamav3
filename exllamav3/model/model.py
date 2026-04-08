@@ -144,6 +144,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         tp_backend: str = "native",
         verbose: bool = False,
         tp_options: dict | None = None,
+        warmup: bool = True,
     ):
         """
         Load model, generator function. For regular function, call load() with the same arguments
@@ -227,6 +228,12 @@ class Model(Model_TPMixin, Model_LSMixin):
         :param tp_options:
             dict of optional values:
                 "moe_tensor_split": bool - use tensor split rather than expert parallelism for MoE layers
+
+        :param warmup:
+            Pre-capture CUDA graphs for bound-class MLP/MoE kernels at the end of load, so the
+            first few generations don't stall while lazy captures happen mid-prompt. Adds a small
+            amount of load-time latency and is mostly beneficial for MoE models where captures
+            are keyed on per-expert token count. Default: True.
         """
 
         free_mem()
@@ -332,6 +339,11 @@ class Model(Model_TPMixin, Model_LSMixin):
                 )
                 self.output_device = tp_output_device
 
+        # Pre-capture CUDA graphs for bound-class MLP/MoE kernels so the first few
+        # generations don't stall while captures happen lazily mid-prompt.
+        if warmup:
+            self._warmup_modules()
+
         free_mem()
 
         # Release all global shared tensors (refs still held by modules until model is unloaded)
@@ -347,6 +359,21 @@ class Model(Model_TPMixin, Model_LSMixin):
         kwargs["generator"] = False
         f = self.load_gen(*args, **kwargs)
         for _ in f: pass
+
+
+    @torch.inference_mode
+    def _warmup_modules(self):
+        """
+        Call warmup() on every module that defines one. Currently used to force CUDA graph
+        capture for BC_GatedMLP and BC_BlockSparseMLP, whose graphs would otherwise be
+        captured lazily during the first forward passes and cause noticeable stalls.
+        """
+        for m in self:
+            fn = getattr(m, "warmup", None)
+            if fn is not None:
+                fn()
+        for device in self.active_devices:
+            torch.cuda.synchronize(device)
 
 
     def get_load_metrics(self):
