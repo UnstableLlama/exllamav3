@@ -592,6 +592,41 @@ class BlockSparseMLP(Module):
         super().unload()
 
 
+    def warmup(self):
+        # Force CUDA graph capture for the bound-class fast paths so the first
+        # few generations don't stall. Captures:
+        #   - run_bsz1: single graph per layer (decode path)
+        #   - run_single_expert: 32 graphs per layer, one per token-count bucket
+        #     (prefill / multi-token expert fanout path)
+        # The graph is parameterized via PPTR so a single capture per shape
+        # bucket covers all experts, regardless of which expert_idx was used.
+        if self.bc is None:
+            return
+
+        device = self.device
+        H = self.hidden_size
+        numex = self.num_experts_per_tok
+
+        # run_bsz1 capture
+        y = torch.zeros((1, H), dtype = torch.half, device = device)
+        sel = torch.zeros((1, numex), dtype = torch.long, device = device)
+        w = torch.full((1, numex), 1.0 / numex, dtype = torch.half, device = device)
+        self.bc.run_bsz1(y, sel, w)
+
+        # run_single_expert captures for counts 1..TEMP_ROWS_GRAPH
+        # Pick any valid local expert index; the graph is shape-dependent only
+        # (actual expert pointers are patched in at launch time via PPTR).
+        if self.num_local_experts and self.num_local_experts > 0:
+            expert_idx = 0
+            for count in range(1, TEMP_ROWS_GRAPH + 1):
+                ys = torch.zeros((count, H), dtype = torch.half, device = device)
+                self.bc.run_single_expert(ys, expert_idx)
+
+        torch.cuda.synchronize(device)
+        # Note: shared_experts (if present) is registered as a submodule and
+        # will be visited by the model-level warmup iterator directly.
+
+
     @override
     def forward(
         self,
