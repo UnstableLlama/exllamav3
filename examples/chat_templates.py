@@ -808,13 +808,9 @@ class PromptFormat_granite(PromptFormat):
         super().__init__(*args)
 
     def default_system_prompt(self, think):
-        from datetime import datetime
-        today_str = datetime.today().strftime("%B %d, %Y")
-        return (
-            "Knowledge Cutoff Date: April 2024.\n"
-            f"Today's Date: {today_str}.\n"
-            "You are Granite, developed by IBM. You are a helpful AI assistant."
-        )
+        # Granite 4.1's chat template emits no system block unless one is
+        # supplied (or tools/documents are passed), so there is no default.
+        return ""
 
     def format(self, system_prompt, messages, think):
         context = ""
