@@ -2,6 +2,32 @@
 
 *Research notes and implementation plan, 2026-06-10.*
 
+## Status
+
+**Phase 1 implemented** (see section 3 for the original plan):
+
+- `exllamav3/architecture/diffusion_gemma.py` — `DiffusionGemmaConfig`/`DiffusionGemmaModel` as thin
+  Gemma4 subclasses (`swa_full=True`, K==V and MoE forced on, checkpoint key-prefix probing,
+  `diffusion_decode` span handling in `prepare_inputs`), registered in `architectures.py`.
+- `exllamav3/modules/arch_specific/diffusion_gemma.py` — `DiffusionGemmaSelfConditioning`, inserted
+  after the embedding layer; identity in encoder mode, stored fp16 (qmap-less Linears), so the
+  conversion pipeline needs no changes.
+- `exllamav3/generator/block_diffusion.py` — `BlockDiffusionGenerator`/`BlockDiffusionSettings`:
+  faithful port of the HF reference loop (EB sampler, linear temperature schedule, stable+confident
+  stopping, EOS-in-canvas finalization), reading defaults from `generation_config.json`.
+- `examples/diffusion_gemma.py`, `tests/test_block_diffusion.py` (sampler math vs reference,
+  26 tests passing), `tests/smoke_diffusion_gemma_arch.py` (requires checkpoint + GPU).
+- `gemma4.py`: vision tensor key prefix threaded through `config.vision_key_prefix`
+  (default `"model"`, unchanged for Gemma4; DiffusionGemma probes `"model.encoder"`).
+
+Verified against the released `config.json` (26B-A4B: 30 layers 5:1 sliding:full, hidden 2816,
+128 experts top-8, `global_head_dim` 512 with 2 KV heads, `sliding_window` 1024, proportional RoPE
+with `partial_rotary_factor` 0.25, `use_bidirectional_attention: "vision"`) via a synthetic
+checkpoint: config parsing, key-prefix detection, full text+vision module-graph construction, and
+`prepare_inputs` masking behavior. Pending GPU validation with the real checkpoint: weight loading
+(safetensors key names), HF logit parity, quantization run, and end-to-end generation
+(`tests/smoke_diffusion_gemma_arch.py --generate`).
+
 DiffusionGemma (`google/diffusiongemma-26B-A4B-it`, Apache 2.0, released 2026-06-10) is Google's
 open-weights block text diffusion model: a 26B-total / ~4B-active MoE that generates 256-token
 blocks ("canvases") in parallel by iterative denoising, claiming up to ~4x faster generation than

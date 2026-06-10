@@ -54,6 +54,10 @@ class Gemma4Config(Config):
         )
         self.is_unified = self.arch_string == "Gemma4UnifiedForConditionalGeneration"
 
+        # Prefix for vision tower and multimodal projector tensors, overridden by derived architectures
+        # (e.g. DiffusionGemma stores them under the encoder submodel)
+        self.vision_key_prefix = "model"
+
         # Layers
         self.num_hidden_layers = self.read_cfg(int, "text_config->num_hidden_layers", no_default)
         self.tie_word_embeddings = self.read_cfg(bool, "text_config->tie_word_embeddings", False)
@@ -162,7 +166,11 @@ class Gemma4Config(Config):
                 rms_norm_eps = self.read_cfg(float, "vision_config->rms_norm_eps", no_default),
                 standardize = self.read_cfg(bool, "vision_config->standardize", False),
                 num_channels = 3,
-                rope_theta = self.read_cfg(float, "vision_config->rope_theta", 100.0),
+                rope_theta = self.read_cfg(
+                    float,
+                    ["vision_config->rope_theta", "vision_config->rope_parameters->rope_theta"],
+                    100.0,
+                ),
             )
 
         processor_path = os.path.join(self.directory, "processor_config.json")
@@ -479,8 +487,8 @@ class Gemma4VisionModel(Model):
     @override
     def get_additional_compiled_tensors(config: Gemma4Config) -> dict:
         return (
-            config.stc.list_tensors(prefix = "model.vision_tower") |
-            config.stc.list_tensors(prefix = "model.embed_vision")
+            config.stc.list_tensors(prefix = f"{config.vision_key_prefix}.vision_tower") |
+            config.stc.list_tensors(prefix = f"{config.vision_key_prefix}.embed_vision")
         )
 
     def __init__(
@@ -495,11 +503,12 @@ class Gemma4VisionModel(Model):
             "supports_tp": False,
         })
         v = self.config.vision
+        key_prefix = config.vision_key_prefix
 
         self.modules += [
             Gemma4VisionPatchEmbedder(
                 config = config,
-                key = "model.vision_tower.patch_embedder",
+                key = f"{key_prefix}.vision_tower.patch_embedder",
                 hidden_size = v.hidden_size,
                 patch_dim = v.patch_dim,
                 position_embedding_size = v.position_embedding_size,
@@ -507,7 +516,7 @@ class Gemma4VisionModel(Model):
         ]
 
         for idx in range(v.num_hidden_layers):
-            key = f"model.vision_tower.encoder.layers.{idx}"
+            key = f"{key_prefix}.vision_tower.encoder.layers.{idx}"
             self.modules.append(
                 TransformerBlock(
                     config = config,
@@ -586,7 +595,7 @@ class Gemma4VisionModel(Model):
         self.modules += [
             Gemma4VisionPooler(
                 config = config,
-                key = "model.vision_tower",
+                key = f"{key_prefix}.vision_tower",
                 hidden_size = v.hidden_size,
                 key_std_bias = f"std_bias" if v.standardize else None,
                 key_std_scale = f"std_scale" if v.standardize else None,
@@ -594,7 +603,7 @@ class Gemma4VisionModel(Model):
 
             RMSNorm(
                 config = config,
-                key = "model.embed_vision.embedding_norm",
+                key = f"{key_prefix}.embed_vision.embedding_norm",
                 rms_norm_eps = config.rms_norm_eps,
                 constant_bias = 1.0,
                 out_dtype = torch.half,
@@ -602,7 +611,7 @@ class Gemma4VisionModel(Model):
             ),
             Linear(
                 config = config,
-                key = "model.embed_vision.embedding_projection",
+                key = f"{key_prefix}.embed_vision.embedding_projection",
                 in_features = config.vision.hidden_size,
                 out_features = config.hidden_size,
             )

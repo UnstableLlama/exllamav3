@@ -98,6 +98,10 @@ class Generator:
         :param kwargs:
         """
 
+        assert not model.caps.get("block_diffusion"), \
+            "Block diffusion models are not supported by the batching generator yet. Use " \
+            "exllamav3.BlockDiffusionGenerator instead."
+
         self.model = model
         self.cache = cache
         self.tokenizer = tokenizer
