@@ -8,6 +8,7 @@ import torch.testing
 from exllamav3.generator.block_diffusion import (
     BlockDiffusionSettings,
     eb_accept_mask,
+    gumbel_sample,
     token_entropy,
 )
 
@@ -62,6 +63,17 @@ def test_eb_accept_low_entropy_all():
     entropy = torch.zeros((1, 32))
     mask = eb_accept_mask(entropy, 0.1)
     assert mask.all()
+
+
+def test_gumbel_sample_distribution():
+    torch.manual_seed(0)
+    rng = torch.Generator()
+    rng.manual_seed(42)
+    probs = torch.tensor([0.5, 0.25, 0.125, 0.0625, 0.0625])
+    log_probs = probs.log().expand(20000, -1).contiguous()
+    samples = gumbel_sample(log_probs, rng)
+    freq = torch.bincount(samples, minlength = 5).float() / samples.numel()
+    torch.testing.assert_close(freq, probs, rtol = 0.08, atol = 0.01)
 
 
 def test_temperature_schedule_endpoints():
@@ -128,6 +140,7 @@ class _StubDenoiser:
     def __init__(self, argmax_canvas):
         self.argmax_canvas = argmax_canvas
         self.canvas = argmax_canvas  # non-None marks an in-progress/finished canvas
+        self.steps_taken = 12
 
 
 def _make_bd_generator(cache_tokens = 64):
@@ -170,6 +183,7 @@ def _make_bd_job(g, max_new_tokens = 10, stop_conditions = None, prompt_len = 3)
         "denoiser": None,
         "new_tokens_budget": job.max_new_tokens + 1,
         "emitted_text_tail": "",
+        "total_steps": 0,
     }
     g.active_jobs.append(job)
     return job
@@ -214,6 +228,9 @@ def test_bd_canvas_stop_token():
     assert r["new_tokens"] == 2 and r["prompt_tokens"] == 3
     assert r["full_completion"] == "[5][6]"
     assert "time_generate" in r and "cached_tokens" in r
+    assert r["canvas_steps"] == 12
+    assert r["denoising_steps"] == 12
+    assert r["tokens_per_forward"] == 2 / 12
     assert job not in g.active_jobs
     # Canvas still committed for prefix reuse by follow-up jobs
     assert job.bd_state["committed"] == 7

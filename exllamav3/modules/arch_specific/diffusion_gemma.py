@@ -92,12 +92,15 @@ class DiffusionGemmaSelfConditioning(Module):
         if not params.get("diffusion_decode"):
             return x
 
-        sc_logits = params.get("self_conditioning_logits")
-        if sc_logits is not None:
+        sc_probs = params.get("self_conditioning_probs")
+        if sc_probs is None:
+            sc_logits = params.get("self_conditioning_logits")
+            if sc_logits is not None:
+                sc_probs = torch.softmax(sc_logits.float(), dim = -1)
+        if sc_probs is not None:
             bsz, seqlen, _ = x.shape
             weight = self.embedding.embedding.weight
-            probs = torch.softmax(sc_logits.float(), dim = -1)
-            probs = probs.to(device = weight.device, dtype = weight.dtype)
+            probs = sc_probs.to(device = weight.device, dtype = weight.dtype)
             soft_emb = probs.view(-1, probs.shape[-1]) @ weight
             soft_emb = soft_emb.view(bsz, seqlen, self.hidden_size).to(x.device)
             soft_emb *= self.embedding.multiplier

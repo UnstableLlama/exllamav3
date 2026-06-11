@@ -730,21 +730,49 @@ class Attention(Module):
         if self.has_split_cache:
             cache = self.tp_cache_lookup[cache]
 
-        o = attn_dispatch(
-            q = q,
-            k = k,
-            v = v,
-            cache = cache,
-            cache_idx = self.layer_idx,
-            cache_instance = params.get("layer_instance"),
-            block_table = block_table,
-            cache_seqlens = cache_seqlens,
-            causal = causal,
-            sm_scale = self.sm_scale,
-            window_size = self.sliding_window,
-            softcap = self.logit_softcapping,
-            non_causal_spans = non_causal_spans,
-        )
+        if (
+            params.get("diffusion_decode") and
+            cache is not None and
+            self.sliding_window is not None and self.sliding_window > 0
+        ):
+            # Block-diffusion denoising pass over a sliding-window layer: the canvas attends
+            # bidirectionally to itself plus the trailing window of the committed context, which all canvas
+            # positions see in full (uniform window, per the reference mask). Canvas K/V are not written to
+            # the cache, and the cost is constant in context length. The cache is one flat sequence here
+            # (block table is the identity), so the paged tensors can be sliced by logical position.
+            assert bsz == 1, "diffusion_decode requires batch size 1"
+            num_kv_heads, kv_dim = k.shape[-2], k.shape[-1]
+            k_ctx, v_ctx = cache.get_layer(
+                self.layer_idx, cache_seqlens, block_table, self.sliding_window,
+                params.get("layer_instance"),
+            )
+            a = max(0, position - self.sliding_window + 1)
+            k_ctx = k_ctx.view(-1, num_kv_heads, kv_dim)[a:position].unsqueeze(0)
+            v_ctx = v_ctx.view(-1, num_kv_heads, kv_dim)[a:position].unsqueeze(0)
+            o = attn_dispatch(
+                q = q,
+                k = torch.cat((k_ctx, k), dim = 1),
+                v = torch.cat((v_ctx, v), dim = 1),
+                causal = False,
+                sm_scale = self.sm_scale,
+                softcap = self.logit_softcapping,
+            )
+        else:
+            o = attn_dispatch(
+                q = q,
+                k = k,
+                v = v,
+                cache = cache,
+                cache_idx = self.layer_idx,
+                cache_instance = params.get("layer_instance"),
+                block_table = block_table,
+                cache_seqlens = cache_seqlens,
+                causal = causal,
+                sm_scale = self.sm_scale,
+                window_size = self.sliding_window,
+                softcap = self.logit_softcapping,
+                non_causal_spans = non_causal_spans,
+            )
 
         if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
