@@ -74,10 +74,13 @@ class DiffusionGemmaModel(Gemma4TextModel):
     def __init__(
         self,
         config: DiffusionGemmaConfig,
+        swa_full: bool = True,
         **kwargs
     ):
-        # swa_full: sliding-window layers use the regular paged cache rather than SWA recurrent states, so
-        # that repeated denoising passes over uncommitted canvas positions never mutate rolling window state
+        # swa_full is accepted (model_init passes it for all architectures) but always forced on:
+        # sliding-window layers must use the regular paged cache rather than SWA recurrent states, so
+        # that repeated denoising passes over uncommitted canvas positions never mutate rolling window
+        # state
         super().__init__(
             config,
             key_prefix = config.text_key_prefix,
