@@ -488,6 +488,7 @@ class Generator:
             "denoiser": None,
             "new_tokens_budget": job.max_new_tokens + 1,
             "emitted_text_tail": "",
+            "total_steps": 0,
         }
         job.time_first_prefill = time.time()
 
@@ -619,7 +620,9 @@ class Generator:
         if job.stop_string_max_length > 1:
             bd["emitted_text_tail"] = (bd["emitted_text_tail"] + text)[-(job.stop_string_max_length - 1):]
 
-        self.bd_emit_canvas(job, results, kept_ids, text, eos, eos_reason, stop_token, stop_string)
+        canvas_steps = bd["denoiser"].steps_taken
+        bd["total_steps"] += canvas_steps
+        self.bd_emit_canvas(job, results, kept_ids, text, eos, eos_reason, stop_token, stop_string, canvas_steps)
 
     def bd_emit_canvas(
         self,
@@ -631,6 +634,7 @@ class Generator:
         eos_reason: str | None = None,
         stop_token: int | None = None,
         stop_string: str | None = None,
+        canvas_steps: int = 0,
     ):
         bd = job.bd_state
         job.new_tokens += kept_ids.shape[-1]
@@ -641,6 +645,7 @@ class Generator:
             "stage": "streaming",
             "eos": eos,
             "serial": job.serial_number,
+            "canvas_steps": canvas_steps,
         }
         if text != "":
             r.update({ "text": text })
@@ -668,6 +673,8 @@ class Generator:
                 "time_generate": job.time_last_token - job.time_first_token,
                 "cached_pages": bd["cached_tokens"] // PAGE_SIZE,
                 "cached_tokens": bd["cached_tokens"],
+                "denoising_steps": bd["total_steps"],
+                "tokens_per_forward": job.new_tokens / max(bd["total_steps"], 1),
             })
         if job.identifier is not None:
             r.update({ "identifier": job.identifier })

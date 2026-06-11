@@ -82,6 +82,18 @@ def token_entropy(logits: torch.Tensor) -> torch.Tensor:
     return -(log_probs.exp() * log_probs).sum(dim = -1)
 
 
+def gumbel_sample(log_probs: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+    """
+    Sample token ids from a categorical distribution given normalized log-probabilities (last dim) using
+    the Gumbel-max trick: argmax(log_probs + G), G = -log(-log(U)). Equivalent in distribution to
+    multinomial sampling, much faster at large vocabulary sizes.
+    """
+    noise = torch.rand(log_probs.shape, generator = generator, device = log_probs.device)
+    noise.clamp_min_(1e-20).log_().neg_().log_().neg_()
+    noise += log_probs
+    return noise.argmax(dim = -1)
+
+
 def eb_accept_mask(entropy: torch.Tensor, entropy_bound: float) -> torch.Tensor:
     """
     Entropy-bound acceptance: accept the k lowest-entropy positions such that
@@ -138,7 +150,7 @@ class CanvasDenoiser:
         self.committed_len = 0
         self.canvas = None
         self.argmax_canvas = None
-        self.sc_logits = None
+        self.sc_probs = None
         self.cur_step = 0
         self.steps_taken = 0
         self.argmax_history = None
@@ -157,7 +169,7 @@ class CanvasDenoiser:
             generator = self.rng, device = self.device,
         )
         self.argmax_canvas = self.canvas
-        self.sc_logits = None
+        self.sc_probs = None
         self.cur_step = settings.max_denoising_steps
         self.steps_taken = 0
         self.argmax_history = torch.full(
@@ -179,22 +191,26 @@ class CanvasDenoiser:
             "batch_shape": self.batch_shape,
             "past_len": self.committed_len,
             "diffusion_decode": True,
-            "self_conditioning_logits": self.sc_logits,
+            "self_conditioning_probs": self.sc_probs,
         }
-        logits = self.model.forward(self.canvas, params).float()
+        logits = self.model.forward(self.canvas, params).float().to(self.device)
 
         # Linear temperature schedule; cur_step counts down, so temperature anneals t_max -> t_min
         temperature = settings.t_min + (
             (settings.t_max - settings.t_min) * (self.cur_step / settings.max_denoising_steps)
         )
-        logits = (logits / temperature).to(self.device)
+        logits *= 1.0 / temperature
 
-        entropy = token_entropy(logits)
-        probs = torch.softmax(logits, dim = -1)
-        proposal = torch.multinomial(
-            probs.view(-1, probs.shape[-1]), num_samples = 1, generator = self.rng
-        ).view(1, self.canvas_length)
-        self.argmax_canvas = logits.argmax(dim = -1)
+        # One normalization pass over the vocabulary serves entropy, both samples and self-conditioning.
+        # probs reuses the logits buffer; log_probs is consumed below by the entropy reduction
+        log_probs = torch.log_softmax(logits, dim = -1)
+        probs = torch.exp(log_probs, out = logits)
+        self.argmax_canvas = probs.argmax(dim = -1)
+
+        # Gumbel-max sampling from the temperature-scaled distribution (equivalent to multinomial)
+        proposal = gumbel_sample(log_probs, self.rng)
+
+        entropy = log_probs.mul_(probs).sum(dim = -1).neg_()
 
         # Accept approximately-independent low-entropy tokens, re-noise the rest
         accept = eb_accept_mask(entropy, settings.entropy_bound)
@@ -204,20 +220,21 @@ class CanvasDenoiser:
         )
         self.canvas = torch.where(accept, proposal, renoise)
 
-        # Self-conditioning input for the next step is this step's temperature-scaled logits
-        self.sc_logits = logits.half()
+        # Self-conditioning input for the next step
+        self.sc_probs = probs.half()
 
-        # Adaptive stopping: stable argmax canvas and confident (low mean entropy)
+        # Adaptive stopping: stable argmax canvas and confident (low mean entropy). One device sync per
+        # step, on the combined flag
         if settings.stability_threshold == 0:
-            stable = True
+            stable = torch.ones((), dtype = torch.bool, device = entropy.device)
         else:
-            stable = bool((self.argmax_history == self.argmax_canvas.unsqueeze(0)).all())
+            stable = (self.argmax_history == self.argmax_canvas.unsqueeze(0)).all()
             self.argmax_history = torch.roll(self.argmax_history, shifts = -1, dims = 0)
             self.argmax_history[-1] = self.argmax_canvas
-        confident = entropy.mean().item() < settings.confidence_threshold
+        confident = entropy.mean() < settings.confidence_threshold
 
         self.steps_taken += 1
-        done = (stable and confident) or self.cur_step <= 1
+        done = bool((stable & confident).item()) or self.cur_step <= 1
         self.cur_step -= 1
         return done
 
