@@ -111,6 +111,14 @@ class DiffusionGemmaModel(Gemma4TextModel):
         })
 
     @override
+    def load_gen(self, *args, **kwargs):
+        # Denoising passes produce logits for the whole canvas, so make sure the loader reserves output
+        # buffers for at least canvas_length positions regardless of how the model is loaded
+        kwargs["max_output_size"] = max(kwargs.get("max_output_size") or 0, self.config.canvas_length)
+        kwargs["max_output_factor"] = max(kwargs.get("max_output_factor") or 1, 2)
+        yield from super().load_gen(*args, **kwargs)
+
+    @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
         if params.get("diffusion_decode"):
             # Denoising pass: the canvas attends bidirectionally to itself and to the entire cache (full

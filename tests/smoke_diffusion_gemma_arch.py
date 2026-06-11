@@ -17,7 +17,7 @@ import argparse
 import sys
 import torch
 
-from exllamav3 import BlockDiffusionGenerator, BlockDiffusionSettings, Cache, Config, Model, Tokenizer
+from exllamav3 import BlockDiffusionGenerator, BlockDiffusionSettings, Cache, Config, Generator, Job, Model, Tokenizer
 
 
 def fail(msg: str) -> None:
@@ -119,26 +119,73 @@ def main() -> None:
         if args.reserve_per_device:
             reserve = [float(v) for v in args.reserve_per_device.split(",")]
         print("[INFO] attempting full model load")
-        model.load(
-            reserve_per_device=reserve,
-            progressbar=True,
-            max_output_size=cfg.canvas_length,
-        )
+        model.load(reserve_per_device=reserve, progressbar=True)
         cache = Cache(model, max_num_tokens=2048)
-        generator = BlockDiffusionGenerator(model, cache, tokenizer)
-        print("[INFO] settings:", generator.settings)
-        result = generator.generate(
+
+        # Standalone loop
+        bd_generator = BlockDiffusionGenerator(model, cache, tokenizer)
+        print("[INFO] settings:", bd_generator.settings)
+        result = bd_generator.generate(
             prompt=model.default_chat_prompt("What is the capital of France? Answer with one word."),
             max_new_tokens=256,
             seed=1234,
         )
-        print("[INFO] output:", repr(result["text"]))
+        print("[INFO] standalone output:", repr(result["text"]))
         print(
             f"[INFO] {result['new_ids'].shape[-1]} tokens, {result['num_canvases']} canvas(es), "
             f"{result['denoising_steps']} steps, {result['tokens_per_forward']:.2f} tokens/forward"
         )
         if "paris" not in result["text"].lower():
-            fail(f"Unexpected generation output: {result['text']!r}")
+            fail(f"Unexpected standalone generation output: {result['text']!r}")
+
+        # Standard Generator/Job API (what chat front-ends use)
+        generator = Generator(model, cache, tokenizer)
+        prompt_ids = tokenizer.encode(
+            model.default_chat_prompt("What is two plus two? Answer with one word."),
+            encode_special_tokens=True,
+        )
+        job = Job(
+            input_ids=prompt_ids,
+            max_new_tokens=256,
+            stop_conditions=[tokenizer.eos_token_id, 106],
+            identifier="smoke",
+        )
+        generator.enqueue(job)
+        output_text = ""
+        last = None
+        while generator.num_remaining_jobs():
+            for r in generator.iterate():
+                assert r["serial"] == job.serial_number
+                assert r.get("identifier") == "smoke"
+                if r["stage"] == "streaming":
+                    output_text += r.get("text", "")
+                    if r["eos"]:
+                        last = r
+        print("[INFO] generator API output:", repr(output_text))
+        if last is None:
+            fail("Job did not finish with eos")
+        print(
+            f"[INFO] eos_reason: {last.get('eos_reason')}, new_tokens: {last.get('new_tokens')}, "
+            f"cached_tokens: {last.get('cached_tokens')}, time_generate: {last.get('time_generate'):.2f}s"
+        )
+        if "four" not in output_text.lower() and "4" not in output_text:
+            fail(f"Unexpected generator API output: {output_text!r}")
+
+        # Second job reuses the cache prefix of the first
+        job2 = Job(
+            input_ids=prompt_ids,
+            max_new_tokens=64,
+            stop_conditions=[tokenizer.eos_token_id, 106],
+        )
+        generator.enqueue(job2)
+        last = None
+        while generator.num_remaining_jobs():
+            for r in generator.iterate():
+                if r["stage"] == "streaming" and r["eos"]:
+                    last = r
+        if last is None or last.get("cached_tokens", 0) == 0:
+            fail(f"Expected prompt prefix reuse on second job, got {last}")
+        print(f"[INFO] second job cached_tokens: {last['cached_tokens']}")
         model.unload()
 
     if torch.cuda.is_available():

@@ -10,7 +10,7 @@ from ..model.model import Model
 from ..cache.cache import Cache
 
 """
-Standalone block-diffusion generation loop for diffusion language models (DiffusionGemma).
+Block-diffusion generation for diffusion language models (DiffusionGemma).
 
 Generation alternates between two uses of the same weight-tied transformer stack:
 
@@ -25,6 +25,10 @@ The denoising forward writes the canvas K/V into the not-yet-committed page(s) p
 length. Each denoising step simply overwrites this scratch region, and the encoder pass that commits the
 finished canvas overwrites it with the final values, so the committed cache contents always correspond to
 encoder-mode (causal) passes only.
+
+CanvasDenoiser holds the per-canvas state machine; it is driven step-by-step by the Generator class when a
+block-diffusion model is used with the regular Generator/Job API, or in a tight loop by the standalone
+BlockDiffusionGenerator below.
 
 Faithful port of the reference loop in transformers' generation_diffusion_gemma.py (EntropyBoundSampler,
 LinearTemperatureScheduleLogitsProcessor, StableAndConfidentStoppingCriteria).
@@ -102,10 +106,127 @@ def eb_accept_mask(entropy: torch.Tensor, entropy_bound: float) -> torch.Tensor:
     return mask
 
 
+class CanvasDenoiser:
+    """
+    Resumable denoising state for one canvas at a time (single sequence). Call start() with the committed
+    cache length, then step() until it returns True; argmax_canvas then holds the finished block.
+    """
+
+    def __init__(
+        self,
+        model: Model,
+        cache: Cache,
+        settings: BlockDiffusionSettings,
+        seed: int | None = None,
+    ):
+        assert model.caps.get("block_diffusion"), \
+            f"{model.config.architecture} is not a block diffusion model"
+        self.model = model
+        self.cache = cache
+        self.settings = settings
+        self.canvas_length = model.caps.get("canvas_length")
+        self.vocab_size = model.config.vocab_size
+        self.batch_shape = (1, cache.max_num_tokens)
+        self.device = model.modules[-1].device
+
+        self.rng = torch.Generator(device = self.device)
+        if seed is not None:
+            self.rng.manual_seed(seed)
+        else:
+            self.rng.seed()
+
+        self.committed_len = 0
+        self.canvas = None
+        self.argmax_canvas = None
+        self.sc_logits = None
+        self.cur_step = 0
+        self.steps_taken = 0
+        self.argmax_history = None
+
+    def start(self, committed_len: int):
+        """
+        Begin denoising a new canvas at cache position committed_len .. committed_len + canvas_length. The
+        cache must have capacity for the canvas beyond the committed length.
+        """
+        assert committed_len + self.canvas_length <= self.cache.max_num_tokens, \
+            "Cache too small for canvas beyond committed length"
+        settings = self.settings
+        self.committed_len = committed_len
+        self.canvas = torch.randint(
+            low = 0, high = self.vocab_size, size = (1, self.canvas_length),
+            generator = self.rng, device = self.device,
+        )
+        self.argmax_canvas = self.canvas
+        self.sc_logits = None
+        self.cur_step = settings.max_denoising_steps
+        self.steps_taken = 0
+        self.argmax_history = torch.full(
+            (max(settings.stability_threshold, 1), 1, self.canvas_length), -1,
+            dtype = torch.long, device = self.device,
+        )
+
+    @torch.inference_mode()
+    def step(self) -> bool:
+        """
+        Run one denoising step. Returns True when the canvas is finished (adaptive stopping triggered or
+        max_denoising_steps reached), after which argmax_canvas holds the final block.
+        """
+        settings = self.settings
+
+        params = {
+            "attn_mode": "flash_attn",
+            "cache": self.cache,
+            "batch_shape": self.batch_shape,
+            "past_len": self.committed_len,
+            "diffusion_decode": True,
+            "self_conditioning_logits": self.sc_logits,
+        }
+        logits = self.model.forward(self.canvas, params).float()
+
+        # Linear temperature schedule; cur_step counts down, so temperature anneals t_max -> t_min
+        temperature = settings.t_min + (
+            (settings.t_max - settings.t_min) * (self.cur_step / settings.max_denoising_steps)
+        )
+        logits = (logits / temperature).to(self.device)
+
+        entropy = token_entropy(logits)
+        probs = torch.softmax(logits, dim = -1)
+        proposal = torch.multinomial(
+            probs.view(-1, probs.shape[-1]), num_samples = 1, generator = self.rng
+        ).view(1, self.canvas_length)
+        self.argmax_canvas = logits.argmax(dim = -1)
+
+        # Accept approximately-independent low-entropy tokens, re-noise the rest
+        accept = eb_accept_mask(entropy, settings.entropy_bound)
+        renoise = torch.randint(
+            low = 0, high = self.vocab_size, size = (1, self.canvas_length),
+            generator = self.rng, device = self.device,
+        )
+        self.canvas = torch.where(accept, proposal, renoise)
+
+        # Self-conditioning input for the next step is this step's temperature-scaled logits
+        self.sc_logits = logits.half()
+
+        # Adaptive stopping: stable argmax canvas and confident (low mean entropy)
+        if settings.stability_threshold == 0:
+            stable = True
+        else:
+            stable = bool((self.argmax_history == self.argmax_canvas.unsqueeze(0)).all())
+            self.argmax_history = torch.roll(self.argmax_history, shifts = -1, dims = 0)
+            self.argmax_history[-1] = self.argmax_canvas
+        confident = entropy.mean().item() < settings.confidence_threshold
+
+        self.steps_taken += 1
+        done = (stable and confident) or self.cur_step <= 1
+        self.cur_step -= 1
+        return done
+
+
 class BlockDiffusionGenerator:
     """
-    Minimal single-sequence generator for block-diffusion models. Operates directly on a Model and Cache,
-    outside the batching Generator/Job framework.
+    Minimal single-sequence generator for block-diffusion models, operating directly on a Model and Cache.
+    For job queueing, streaming and front-end compatibility, the regular Generator class also supports
+    block-diffusion models through the standard Job API.
     """
 
     def __init__(
@@ -117,9 +238,7 @@ class BlockDiffusionGenerator:
     ):
         """
         :param model:
-            Loaded model instance with the "block_diffusion" capability (e.g. DiffusionGemmaModel). Load
-            with max_output_size >= the model's canvas length so the autosplit loader reserves space for
-            full-canvas logits.
+            Loaded model instance with the "block_diffusion" capability (e.g. DiffusionGemmaModel).
 
         :param cache:
             Cache with max_num_tokens >= prompt length + max_new_tokens, rounded up to a multiple of the
@@ -220,12 +339,8 @@ class BlockDiffusionGenerator:
         eos_token_ids = [e for e in (eos_token_ids or []) if e is not None]
 
         canvas_length = self.canvas_length
-        device = self.model.modules[-1].device
-        rng = torch.Generator(device = device)
-        if seed is not None:
-            rng.manual_seed(seed)
-        else:
-            rng.seed()
+        denoiser = CanvasDenoiser(self.model, self.cache, settings, seed = seed)
+        device = denoiser.device
         eos_tensor = torch.tensor(eos_token_ids, dtype = torch.long, device = device)
 
         # Prefill prompt (encoder mode, causal)
@@ -253,69 +368,17 @@ class BlockDiffusionGenerator:
                 uncommitted_canvas = None
 
             # Denoising loop for the next canvas
-            canvas = torch.randint(
-                low = 0, high = self.vocab_size, size = (1, canvas_length),
-                generator = rng, device = device,
-            )
-            argmax_canvas = canvas
-            sc_logits = None
-            argmax_history = torch.full(
-                (max(settings.stability_threshold, 1), 1, canvas_length), -1,
-                dtype = torch.long, device = device,
-            )
-
-            for cur_step in reversed(range(1, settings.max_denoising_steps + 1)):
+            denoiser.start(committed_len)
+            while True:
+                done = denoiser.step()
                 total_steps += 1
-
-                params = self._base_params()
-                params.update({
-                    "past_len": committed_len,
-                    "diffusion_decode": True,
-                    "self_conditioning_logits": sc_logits,
-                })
-                logits = self.model.forward(canvas, params).float()
-
-                # Linear temperature schedule; cur_step counts down, so temperature anneals t_max -> t_min
-                temperature = settings.t_min + (
-                    (settings.t_max - settings.t_min) * (cur_step / settings.max_denoising_steps)
-                )
-                logits = logits / temperature
-                logits = logits.to(device)
-
-                entropy = token_entropy(logits)
-                probs = torch.softmax(logits, dim = -1)
-                proposal = torch.multinomial(
-                    probs.view(-1, probs.shape[-1]), num_samples = 1, generator = rng
-                ).view(1, canvas_length)
-                argmax_canvas = logits.argmax(dim = -1)
-
-                # Accept approximately-independent low-entropy tokens, re-noise the rest
-                accept = eb_accept_mask(entropy, settings.entropy_bound)
-                renoise = torch.randint(
-                    low = 0, high = self.vocab_size, size = (1, canvas_length),
-                    generator = rng, device = device,
-                )
-                canvas = torch.where(accept, proposal, renoise)
-
-                # Self-conditioning input for the next step is this step's temperature-scaled logits
-                sc_logits = logits.half()
-
                 if on_draft is not None:
-                    on_draft(settings.max_denoising_steps - cur_step, argmax_canvas)
-
-                # Adaptive stopping: stable argmax canvas and confident (low mean entropy)
-                if settings.stability_threshold == 0:
-                    stable = True
-                else:
-                    stable = bool((argmax_history == argmax_canvas.unsqueeze(0)).all())
-                    argmax_history = torch.roll(argmax_history, shifts = -1, dims = 0)
-                    argmax_history[-1] = argmax_canvas
-                confident = entropy.mean().item() < settings.confidence_threshold
-                if stable and confident:
+                    on_draft(denoiser.steps_taken - 1, denoiser.argmax_canvas)
+                if done:
                     break
 
             num_canvases += 1
-            canvas_ids = argmax_canvas
+            canvas_ids = denoiser.argmax_canvas
 
             # Finalize: cut at the first EOS token, enforce max_new_tokens
             is_eos = torch.isin(canvas_ids, eos_tensor)

@@ -4,6 +4,22 @@
 
 ## Status
 
+**Phase 2 (Generator API integration) implemented**: block-diffusion models work through the regular
+`Generator`/`Job`/`iterate()`/`generate()` interface, so existing front-ends need no changes. When
+`model.caps["block_diffusion"]` is set, the Generator routes jobs through a serial canvas-denoising
+decode path (`generator.py: iterate_block_diffusion` and helpers) that emits the standard
+started/prefill/streaming result dicts, honors token and string stop conditions (including strings
+spanning canvas boundaries), max_new_tokens, identifiers and timing/eos metadata, and reuses the longest
+common prompt token prefix of the flat cache across jobs (multi-turn chat does not re-prefill history).
+Unsupported job features either raise (CFG, filters, token healing, multimodal embeddings) or are
+ignored with a one-time warning (banned strings, loop detection, min_new_tokens, AR samplers,
+logits/probs returns). Speculative decoding and n-gram drafting are rejected at Generator construction.
+`DiffusionGemmaModel.load_gen` forces `max_output_size >= canvas_length` so unmodified loaders reserve
+VRAM for full-canvas logits. The shared per-canvas state machine lives in
+`block_diffusion.py: CanvasDenoiser`; the standalone `BlockDiffusionGenerator` remains for direct use
+and per-step draft visualization. True batched denoising across concurrent jobs remains future work
+(jobs queue and run serially).
+
 **Phase 1 implemented** (see section 3 for the original plan):
 
 - `exllamav3/architecture/diffusion_gemma.py` — `DiffusionGemmaConfig`/`DiffusionGemmaModel` as thin
