@@ -9,8 +9,9 @@ from ..util import cuda_sync_active
 from .pagetable import PageTable
 from .job import Job
 from .filter import Filter
+from .block_diffusion import BlockDiffusionSettings, CanvasDenoiser
 from concurrent.futures import ThreadPoolExecutor
-from .sampler import Sampler
+from .sampler import Sampler, DefaultSampler
 from .visualizer import CacheVisualizer
 import time
 import threading
@@ -98,15 +99,26 @@ class Generator:
         :param kwargs:
         """
 
-        assert not model.caps.get("block_diffusion"), \
-            "Block diffusion models are not supported by the batching generator yet. Use " \
-            "exllamav3.BlockDiffusionGenerator instead."
-
         self.model = model
         self.cache = cache
         self.tokenizer = tokenizer
         cfg = self.model.config
         self.padded_vocab_size = ((cfg.vocab_size + 31) // 32) * 32
+
+        # Block diffusion models bypass the paged token-by-token decode path: jobs are processed serially
+        # through the canvas denoising loop in iterate_block_diffusion(), with the cache treated as a
+        # single flat sequence. The public enqueue/iterate/Job interface is unchanged.
+        self.bd_mode = bool(model.caps.get("block_diffusion"))
+        if self.bd_mode:
+            assert draft_model is None, \
+                "Block diffusion models do not support speculative decoding with a draft model"
+            assert not ngram_match_min, \
+                "Block diffusion models do not support n-gram drafting"
+            self.bd_settings = kwargs.get("block_diffusion_settings") or \
+                BlockDiffusionSettings.from_directory(cfg.directory)
+            self.bd_canvas_length = model.caps.get("canvas_length")
+            self.bd_cached_ids = torch.empty((1, 0), dtype = torch.long)
+            self.bd_warned = set()
 
         # Paging
         self.pagetable = PageTable(self, cache)
@@ -211,6 +223,11 @@ class Generator:
         Abort all active and pending jobs
         """
 
+        if self.bd_mode:
+            self.active_jobs.clear()
+            self.pending_jobs.clear()
+            return
+
         num_jobs = self.num_remaining_jobs()
         for job in self.active_jobs + self.pending_jobs:
             job.deallocate_pages()
@@ -244,6 +261,9 @@ class Generator:
                 serials.append(self.enqueue(j))
             return serials
 
+        if self.bd_mode:
+            self.validate_job_block_diffusion(job)
+
         job.prepare_for_queue(self, self.job_serial)
         self.job_serial += 1
         self.pending_jobs.append(job)
@@ -262,6 +282,13 @@ class Generator:
         cancellation drains the generator completely, the page table is defragmented immediately because no active
         block tables still depend on the current physical page ordering.
         """
+
+        if self.bd_mode:
+            if job in self.pending_jobs:
+                self.pending_jobs.remove(job)
+            elif job in self.active_jobs:
+                self.active_jobs.remove(job)
+            return
 
         num_jobs = self.num_remaining_jobs()
 
@@ -340,6 +367,9 @@ class Generator:
             }
         """
 
+        if self.bd_mode:
+            return self.iterate_block_diffusion()
+
         results = []
         self.iterate_start_jobs(results)
 
@@ -375,6 +405,306 @@ class Generator:
 
         # Finished iteration
         return results
+
+
+    def validate_job_block_diffusion(self, job: Job):
+        """
+        Check a job against the limitations of the block diffusion decode path. Structural features that
+        would produce wrong output raise; soft features are ignored with a one-time warning.
+        """
+        assert len(job.sequences) == 1, \
+            "Block diffusion jobs do not support CFG or multi-sequence inputs"
+        assert not job.filters, \
+            "Block diffusion jobs do not support filters"
+        assert job.prefix_token is None, \
+            "Block diffusion jobs do not support token healing"
+        assert not job.embeddings, \
+            "Block diffusion jobs do not support multimodal embeddings yet"
+        assert job.sequences[0].input_ids.torch().shape[-1] + self.bd_canvas_length <= self.cache.max_num_tokens, \
+            "Cache too small for prompt plus one canvas"
+
+        def warn(key, msg):
+            if key not in self.bd_warned:
+                self.bd_warned.add(key)
+                print(f" !! {msg}")
+
+        if job.banned_strings:
+            warn("banned_strings", "Block diffusion jobs do not support banned strings (ignored)")
+        if job.stop_on_loop:
+            warn("stop_on_loop", "Block diffusion jobs do not support loop detection (ignored)")
+        if job.min_new_tokens:
+            warn("min_new_tokens", "Block diffusion jobs do not support min_new_tokens (ignored)")
+        if job.return_logits or job.return_probs or job.return_top_tokens:
+            warn("return_extras", "Block diffusion jobs do not return logits/probs/top tokens (ignored)")
+        if not isinstance(job.sampler, DefaultSampler) and job.sampler is not None:
+            warn("sampler", "Block diffusion jobs use the diffusion sampler; job samplers are ignored")
+
+    def iterate_block_diffusion(self) -> list[dict]:
+        """
+        One round of block-diffusion inference. Jobs are processed serially: each call advances the active
+        job by one prefill chunk or one canvas denoising step. Results use the same format as the regular
+        decode path; tokens stream one canvas at a time.
+        """
+        results = []
+
+        # Activate the next pending job when idle
+        if not self.active_jobs and self.pending_jobs:
+            job = self.pending_jobs.pop(0)
+            self.active_jobs.append(job)
+            self.start_job_block_diffusion(job, results)
+
+        if not self.active_jobs:
+            return results
+
+        job = self.active_jobs[0]
+        bd = job.bd_state
+        if bd["phase"] == "prefill":
+            self.iterate_bd_prefill(job, results)
+        else:
+            self.iterate_bd_gen(job, results)
+        return results
+
+    def start_job_block_diffusion(self, job: Job, results: list):
+        prompt_ids = job.sequences[0].input_ids.torch().cpu()
+        prompt_len = prompt_ids.shape[-1]
+
+        # The cache is one flat sequence; reuse the longest common token prefix with its current contents
+        # (e.g. the previous turns of an ongoing chat) and prefill only the rest
+        cached = self.bd_cached_ids
+        n = min(cached.shape[-1], prompt_len)
+        common = 0
+        if n > 0:
+            neq = (cached[0, :n] != prompt_ids[0, :n]).nonzero()
+            common = n if neq.numel() == 0 else int(neq[0].item())
+        self.bd_cached_ids = self.bd_cached_ids[:, :common]
+
+        job.bd_state = {
+            "phase": "prefill",
+            "prompt_ids": prompt_ids,
+            "prompt_len": prompt_len,
+            "prefill_pos": common,
+            "committed": common,
+            "cached_tokens": common,
+            "denoiser": None,
+            "new_tokens_budget": job.max_new_tokens + 1,
+            "emitted_text_tail": "",
+        }
+        job.time_first_prefill = time.time()
+
+        r = {
+            "job": job,
+            "stage": "started",
+            "eos": False,
+            "serial": job.serial_number,
+        }
+        if job.identifier is not None:
+            r.update({ "identifier": job.identifier })
+        results.append(r)
+
+    def bd_base_params(self) -> dict:
+        return {
+            "attn_mode": "flash_attn",
+            "cache": self.cache,
+            "batch_shape": (1, self.cache.max_num_tokens),
+        }
+
+    def iterate_bd_prefill(self, job: Job, results: list):
+        bd = job.bd_state
+        if bd["prefill_pos"] < bd["prompt_len"]:
+            a = bd["prefill_pos"]
+            b = min(a + self.max_chunk_size, bd["prompt_len"])
+            params = self.bd_base_params()
+            params["past_len"] = a
+            self.model.prefill(bd["prompt_ids"][:, a:b], params)
+            bd["prefill_pos"] = b
+            self.bd_cached_ids = torch.cat((self.bd_cached_ids, bd["prompt_ids"][:, a:b]), dim = -1)
+
+        r = {
+            "job": job,
+            "stage": "prefill",
+            "curr_progress": bd["prefill_pos"],
+            "max_progress": bd["prompt_len"],
+            "eos": False,
+            "serial": job.serial_number,
+        }
+        if job.identifier is not None:
+            r.update({ "identifier": job.identifier })
+        results.append(r)
+
+        if bd["prefill_pos"] >= bd["prompt_len"]:
+            bd["committed"] = bd["prompt_len"]
+            bd["phase"] = "gen"
+            bd["denoiser"] = CanvasDenoiser(self.model, self.cache, self.bd_settings, seed = job.seed)
+            job.time_first_token = time.time()
+
+    def iterate_bd_gen(self, job: Job, results: list):
+        bd = job.bd_state
+        denoiser = bd["denoiser"]
+
+        # Start the next canvas if none is in progress
+        if denoiser.canvas is None:
+            if bd["committed"] + self.bd_canvas_length > self.cache.max_num_tokens:
+                # Out of cache space; end the response here
+                self.bd_emit_canvas(
+                    job, results,
+                    kept_ids = torch.empty((1, 0), dtype = torch.long),
+                    text = "",
+                    eos = True, eos_reason = "max_new_tokens",
+                )
+                return
+            denoiser.start(bd["committed"])
+
+        if not denoiser.step():
+            return
+        self.bd_finalize_canvas(job, results)
+
+    def bd_finalize_canvas(self, job: Job, results: list):
+        """
+        Apply stop conditions to a finished canvas, stream its tokens, commit it to the cache and either
+        end the job or begin the next canvas.
+        """
+        bd = job.bd_state
+        canvas_ids = bd["denoiser"].argmax_canvas.cpu()
+        canvas_tokens = canvas_ids[0].tolist()
+
+        eos = False
+        eos_reason = None
+        stop_token = None
+        stop_string = None
+
+        # First stop token in the canvas ends the response; the token itself is not emitted. Tokens
+        # after the first EOS in a canvas are unconditioned output and always discarded, so the model's
+        # EOS tokens apply even if not given as stop conditions
+        stop_tokens = job.stop_tokens | set(t for t in self.model.config.eos_token_id_list if t is not None)
+        keep = len(canvas_tokens)
+        for i, t in enumerate(canvas_tokens):
+            if t in stop_tokens:
+                keep = i
+                eos = True
+                eos_reason = "stop_token"
+                stop_token = t
+                break
+
+        # Token budget. A stop token beyond the budget cut is never reached
+        remaining = bd["new_tokens_budget"] - job.new_tokens
+        if keep > remaining:
+            keep = remaining
+            eos = True
+            eos_reason = "max_new_tokens"
+            stop_token = None
+        elif keep == remaining and not eos:
+            eos = True
+            eos_reason = "max_new_tokens"
+
+        kept_ids = canvas_ids[:, :keep]
+        text = self.bd_decode(kept_ids, job)
+
+        # Stop strings, including matches that started in the previous canvas
+        if job.stop_strings:
+            lookback = bd["emitted_text_tail"]
+            search = lookback + text
+            first = None
+            for s in job.stop_strings:
+                p = search.find(s)
+                if p >= 0 and (first is None or p < first[0]):
+                    first = (p, s)
+            if first is not None:
+                cut = max(0, first[0] - len(lookback))
+                text = text[:cut]
+                eos = True
+                eos_reason = "stop_string"
+                stop_token = None
+                stop_string = first[1]
+                kept_ids = self.bd_trim_ids_to_text(kept_ids, text, job)
+        if job.stop_string_max_length > 1:
+            bd["emitted_text_tail"] = (bd["emitted_text_tail"] + text)[-(job.stop_string_max_length - 1):]
+
+        self.bd_emit_canvas(job, results, kept_ids, text, eos, eos_reason, stop_token, stop_string)
+
+    def bd_emit_canvas(
+        self,
+        job: Job,
+        results: list,
+        kept_ids: torch.Tensor,
+        text: str,
+        eos: bool,
+        eos_reason: str | None = None,
+        stop_token: int | None = None,
+        stop_string: str | None = None,
+    ):
+        bd = job.bd_state
+        job.new_tokens += kept_ids.shape[-1]
+        job.full_completion += text
+
+        r = {
+            "job": job,
+            "stage": "streaming",
+            "eos": eos,
+            "serial": job.serial_number,
+        }
+        if text != "":
+            r.update({ "text": text })
+        if kept_ids.shape[-1] > 0:
+            r.update({ "token_ids": kept_ids.clone() })
+        if eos_reason is not None:
+            r.update({ "eos_reason": eos_reason })
+            if eos_reason == "stop_token":
+                id_to_piece = self.tokenizer.get_id_to_piece_list(True)
+                r.update({
+                    "eos_triggering_token_id": stop_token,
+                    "eos_triggering_token_str": id_to_piece[stop_token],
+                })
+            if eos_reason == "stop_string":
+                r.update({ "eos_triggering_string": stop_string })
+        if eos:
+            job.is_finished = True
+            job.time_last_token = time.time()
+            r.update({
+                "full_completion": job.full_completion,
+                "new_tokens": job.new_tokens,
+                "prompt_tokens": bd["prompt_len"],
+                "time_enqueued": job.time_first_prefill - job.time_enqueue,
+                "time_prefill": job.time_first_token - job.time_first_prefill,
+                "time_generate": job.time_last_token - job.time_first_token,
+                "cached_pages": bd["cached_tokens"] // PAGE_SIZE,
+                "cached_tokens": bd["cached_tokens"],
+            })
+        if job.identifier is not None:
+            r.update({ "identifier": job.identifier })
+        results.append(r)
+
+        # Commit the full canvas to the cache. When continuing, the next canvas conditions on it; when
+        # finishing, it remains available for prompt prefix reuse by a follow-up job
+        denoiser = bd["denoiser"]
+        if denoiser is not None and denoiser.canvas is not None:
+            canvas_ids = denoiser.argmax_canvas.cpu()
+            if bd["committed"] + self.bd_canvas_length <= self.cache.max_num_tokens:
+                params = self.bd_base_params()
+                params["past_len"] = bd["committed"]
+                self.model.prefill(canvas_ids, params)
+                bd["committed"] += self.bd_canvas_length
+                self.bd_cached_ids = torch.cat((self.bd_cached_ids, canvas_ids), dim = -1)
+            denoiser.canvas = None
+
+        if eos:
+            self.active_jobs.remove(job)
+
+    def bd_decode(self, ids: torch.Tensor, job: Job) -> str:
+        if ids.shape[-1] == 0:
+            return ""
+        text = self.tokenizer.decode(ids, decode_special_tokens = job.decode_special_tokens)
+        return text[0] if isinstance(text, list) else text
+
+    def bd_trim_ids_to_text(self, kept_ids: torch.Tensor, text: str, job: Job) -> torch.Tensor:
+        """
+        Find the shortest token prefix whose decoding covers the (stop-string truncated) text.
+        """
+        if text == "":
+            return kept_ids[:, :0]
+        for i in range(1, kept_ids.shape[-1] + 1):
+            if len(self.bd_decode(kept_ids[:, :i], job)) >= len(text):
+                return kept_ids[:, :i]
+        return kept_ids
 
 
     def recurrent_checkpoint(self):

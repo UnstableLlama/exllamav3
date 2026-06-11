@@ -26,11 +26,12 @@ def main():
     parser.add_argument("--show_drafts", action = "store_true", help = "Print intermediate canvases")
     args = parser.parse_args()
 
-    # Load model. max_output_size must cover the canvas so the loader reserves space for full-canvas logits
+    # Load model. Block diffusion models can also be used through the regular Generator/Job API; this
+    # example uses the standalone loop for the per-step draft visualization
     config = Config.from_directory(args.model_dir)
     model = Model.from_config(config)
     cache = Cache(model, max_num_tokens = args.cache_size)
-    model.load(progressbar = True, max_output_size = config.canvas_length)
+    model.load(progressbar = True)
     tokenizer = Tokenizer.from_config(config)
 
     settings = BlockDiffusionSettings.from_directory(args.model_dir)
