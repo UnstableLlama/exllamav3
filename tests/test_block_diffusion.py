@@ -7,8 +7,8 @@ import torch.testing
 
 from exllamav3.generator.block_diffusion import (
     BlockDiffusionSettings,
+    categorical_sample,
     eb_accept_mask,
-    gumbel_sample,
     token_entropy,
 )
 
@@ -65,13 +65,18 @@ def test_eb_accept_low_entropy_all():
     assert mask.all()
 
 
-def test_gumbel_sample_distribution():
+def test_categorical_sample_distribution():
     torch.manual_seed(0)
     rng = torch.Generator()
     rng.manual_seed(42)
     probs = torch.tensor([0.5, 0.25, 0.125, 0.0625, 0.0625])
-    log_probs = probs.log().expand(20000, -1).contiguous()
-    samples = gumbel_sample(log_probs, rng)
+    batch = probs.expand(20000, -1).contiguous()
+    samples = categorical_sample(batch, rng)
+    freq = torch.bincount(samples, minlength = 5).float() / samples.numel()
+    torch.testing.assert_close(freq, probs, rtol = 0.08, atol = 0.01)
+    # Preallocated noise buffer path
+    noise = torch.empty_like(batch)
+    samples = categorical_sample(batch, rng, noise)
     freq = torch.bincount(samples, minlength = 5).float() / samples.numel()
     torch.testing.assert_close(freq, probs, rtol = 0.08, atol = 0.01)
 

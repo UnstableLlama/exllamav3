@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import os
+import time
 from dataclasses import dataclass, replace
 from typing import Callable
 
@@ -8,6 +9,10 @@ import torch
 
 from ..model.model import Model
 from ..cache.cache import Cache
+
+# Set EXL3_BD_STATS=1 to print per-canvas timing: denoising steps taken, forward time and sampling
+# overhead per step. Adds device syncs, so leave unset when not profiling
+BD_STATS = bool(os.environ.get("EXL3_BD_STATS"))
 
 """
 Block-diffusion generation for diffusion language models (DiffusionGemma).
@@ -82,16 +87,16 @@ def token_entropy(logits: torch.Tensor) -> torch.Tensor:
     return -(log_probs.exp() * log_probs).sum(dim = -1)
 
 
-def gumbel_sample(log_probs: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+def categorical_sample(probs: torch.Tensor, generator: torch.Generator, noise: torch.Tensor | None = None) -> torch.Tensor:
     """
-    Sample token ids from a categorical distribution given normalized log-probabilities (last dim) using
-    the Gumbel-max trick: argmax(log_probs + G), G = -log(-log(U)). Equivalent in distribution to
-    multinomial sampling, much faster at large vocabulary sizes.
+    Sample token ids from a categorical distribution given probabilities (last dim) via the exponential
+    racing trick: argmax(p_i / E_i), E ~ Exp(1). Equivalent in distribution to multinomial sampling, in
+    two elementwise passes plus a reduction. An optional preallocated noise buffer avoids allocation.
     """
-    noise = torch.rand(log_probs.shape, generator = generator, device = log_probs.device)
-    noise.clamp_min_(1e-20).log_().neg_().log_().neg_()
-    noise += log_probs
-    return noise.argmax(dim = -1)
+    if noise is None:
+        noise = torch.empty_like(probs)
+    noise.exponential_(generator = generator)
+    return torch.div(probs, noise, out = noise).argmax(dim = -1)
 
 
 def eb_accept_mask(entropy: torch.Tensor, entropy_bound: float) -> torch.Tensor:
@@ -155,6 +160,13 @@ class CanvasDenoiser:
         self.steps_taken = 0
         self.argmax_history = None
 
+        # Persistent full-vocabulary work buffers, allocated on first step
+        self._probs = None
+        self._noise = None
+        self._sc_probs = None
+        self._stat_fwd = 0.0
+        self._stat_total = 0.0
+
     def start(self, committed_len: int):
         """
         Begin denoising a new canvas at cache position committed_len .. committed_len + canvas_length. The
@@ -176,6 +188,8 @@ class CanvasDenoiser:
             (max(settings.stability_threshold, 1), 1, self.canvas_length), -1,
             dtype = torch.long, device = self.device,
         )
+        self._stat_fwd = 0.0
+        self._stat_total = 0.0
 
     @torch.inference_mode()
     def step(self) -> bool:
@@ -184,6 +198,9 @@ class CanvasDenoiser:
         max_denoising_steps reached), after which argmax_canvas holds the final block.
         """
         settings = self.settings
+        if BD_STATS:
+            torch.cuda.synchronize(self.device)
+            t0 = time.time()
 
         params = {
             "attn_mode": "flash_attn",
@@ -195,20 +212,29 @@ class CanvasDenoiser:
         }
         logits = self.model.forward(self.canvas, params).float().to(self.device)
 
+        if BD_STATS:
+            torch.cuda.synchronize(self.device)
+            self._stat_fwd += time.time() - t0
+
         # Linear temperature schedule; cur_step counts down, so temperature anneals t_max -> t_min
         temperature = settings.t_min + (
             (settings.t_max - settings.t_min) * (self.cur_step / settings.max_denoising_steps)
         )
         logits *= 1.0 / temperature
 
-        # One normalization pass over the vocabulary serves entropy, both samples and self-conditioning.
-        # probs reuses the logits buffer; log_probs is consumed below by the entropy reduction
-        log_probs = torch.log_softmax(logits, dim = -1)
-        probs = torch.exp(log_probs, out = logits)
-        self.argmax_canvas = probs.argmax(dim = -1)
+        # Normalize in place; the logits buffer becomes the log-probabilities and one persistent buffer
+        # holds the probabilities, serving entropy, both samples and self-conditioning
+        lse = torch.logsumexp(logits, dim = -1, keepdim = True)
+        log_probs = logits.sub_(lse)
+        self.argmax_canvas = log_probs.argmax(dim = -1)
 
-        # Gumbel-max sampling from the temperature-scaled distribution (equivalent to multinomial)
-        proposal = gumbel_sample(log_probs, self.rng)
+        if self._probs is None:
+            self._probs = torch.empty_like(log_probs)
+            self._noise = torch.empty_like(log_probs)
+            self._sc_probs = torch.empty(log_probs.shape, dtype = torch.half, device = log_probs.device)
+        probs = torch.exp(log_probs, out = self._probs)
+
+        proposal = categorical_sample(probs, self.rng, self._noise)
 
         entropy = log_probs.mul_(probs).sum(dim = -1).neg_()
 
@@ -220,8 +246,10 @@ class CanvasDenoiser:
         )
         self.canvas = torch.where(accept, proposal, renoise)
 
-        # Self-conditioning input for the next step
-        self.sc_probs = probs.half()
+        # Self-conditioning input for the next step. The buffer is mutated only after the next forward
+        # pass has consumed it (calls are stream-ordered)
+        self._sc_probs.copy_(probs)
+        self.sc_probs = self._sc_probs
 
         # Adaptive stopping: stable argmax canvas and confident (low mean entropy). One device sync per
         # step, on the combined flag
@@ -236,6 +264,18 @@ class CanvasDenoiser:
         self.steps_taken += 1
         done = bool((stable & confident).item()) or self.cur_step <= 1
         self.cur_step -= 1
+
+        if BD_STATS:
+            torch.cuda.synchronize(self.device)
+            self._stat_total += time.time() - t0
+            if done:
+                n = self.steps_taken
+                fwd = self._stat_fwd / n * 1000.0
+                rest = (self._stat_total - self._stat_fwd) / n * 1000.0
+                print(
+                    f" -- bd canvas @ ctx {self.committed_len}: {n} steps, "
+                    f"forward {fwd:.1f} ms/step, sampler {rest:.1f} ms/step"
+                )
         return done
 
 
