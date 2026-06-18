@@ -35,16 +35,27 @@ from __future__ import annotations
 import os
 import sys
 import argparse
+import importlib.util
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)
 
-from exllamav3.training.qlora_linear import (
-    EXL3LoRAFunction,
-    reference_forward,
-    qlora_linear_forward,
-    QLoRALinear,
+# Load qlora_linear directly from its file. It only depends on torch (no
+# intra-package imports), so tiers 1-2 run on any machine -- importing the
+# exllamav3 package would otherwise trigger a CUDA extension build, which is
+# only actually needed for the tier-3 real-model test.
+_spec = importlib.util.spec_from_file_location(
+    "exllamav3_qlora_linear",
+    os.path.join(_ROOT, "exllamav3", "training", "qlora_linear.py"),
 )
+_qll = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_qll)
+
+EXL3LoRAFunction = _qll.EXL3LoRAFunction
+reference_forward = _qll.reference_forward
+qlora_linear_forward = _qll.qlora_linear_forward
+QLoRALinear = _qll.QLoRALinear
 
 
 def _mock_weight_fn(weight: torch.Tensor):
