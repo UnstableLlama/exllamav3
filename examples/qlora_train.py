@@ -62,13 +62,21 @@ def main():
     ap.add_argument("--batch", type=int, default=2)
     ap.add_argument("--targets", nargs="*", default=None,
                     help="Target module leaf names (default: attn+mlp projections)")
+    ap.add_argument("--no-fused-ce", action="store_true",
+                    help="Use the standard HF head/loss instead of fused cross-entropy")
+    ap.add_argument("--no-grad-ckpt", action="store_true",
+                    help="Disable gradient checkpointing")
+    ap.add_argument("--ce-chunk", type=int, default=1024,
+                    help="Token chunk size for fused cross-entropy")
     args = ap.parse_args()
 
     from transformers import (AutoTokenizer, AutoModelForCausalLM,
                               Trainer, TrainingArguments,
                               DataCollatorForLanguageModeling)
     from exllamav3.integration.transformers import patch_transformers
-    from exllamav3.training import attach_qlora, save_lora_adapter
+    from exllamav3.training import (attach_qlora, save_lora_adapter,
+                                   prepare_model_for_qlora_training,
+                                   qlora_causal_lm_loss)
 
     # 1. Register the EXL3 quantizer with Transformers and load the model.
     patch_transformers()
@@ -84,12 +92,33 @@ def main():
         model, r=args.r, alpha=args.alpha, target_modules=args.targets,
         compute_dtype=torch.bfloat16,
     )
-    model.train()
-    model.config.use_cache = False  # required when training with grad checkpointing
 
-    # 3. Data + Trainer (we reuse HF's loop, optimizer, accumulation, etc.).
+    # 3. Memory: gradient checkpointing (+ input-grad hook, use_cache off).
+    prepare_model_for_qlora_training(
+        model, use_gradient_checkpointing=not args.no_grad_ckpt
+    )
+
+    # 4. Data + Trainer. With fused cross-entropy we override compute_loss so
+    #    the [tokens x vocab] logits are never materialised.
     ds = build_tiny_dataset(tokenizer)
     collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
+
+    ce_chunk = args.ce_chunk
+    use_fused_ce = not args.no_fused_ce
+
+    class QLoRATrainer(Trainer):
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            if not use_fused_ce:
+                return super().compute_loss(model, inputs, return_outputs, **kwargs)
+            labels = inputs["input_ids"] if "labels" not in inputs else inputs["labels"]
+            loss = qlora_causal_lm_loss(
+                model,
+                input_ids=inputs["input_ids"],
+                labels=labels,
+                attention_mask=inputs.get("attention_mask"),
+                chunk=ce_chunk,
+            )
+            return (loss, None) if return_outputs else loss
 
     targs = TrainingArguments(
         output_dir=args.out,
@@ -101,9 +130,10 @@ def main():
         bf16=True,
         report_to=[],
         save_strategy="no",
+        gradient_checkpointing=False,  # already enabled via prepare_* above
         # Adam state covers only the few-MB adapter, so this stays cheap.
     )
-    trainer = Trainer(
+    trainer = QLoRATrainer(
         model=model, args=targs, train_dataset=ds, data_collator=collator,
     )
     trainer.train()

@@ -39,6 +39,7 @@ import torch
 import torch.nn as nn
 
 from .qlora_linear import EXL3LoRAFunction
+from .fused_ce import fused_linear_cross_entropy, DEFAULT_CHUNK, IGNORE_INDEX
 
 
 DEFAULT_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
@@ -196,6 +197,93 @@ def attach_qlora(
                   f"(target_modules={targets})")
 
     return trainable
+
+
+def prepare_model_for_qlora_training(
+    model: nn.Module,
+    use_gradient_checkpointing: bool = True,
+) -> nn.Module:
+    """
+    Make a (mostly frozen, EXL3) HF model ready for adapter training.
+
+    Mirrors what PEFT's ``prepare_model_for_kbit_training`` does for the bits
+    that matter here:
+
+      * enable gradient checkpointing (trade compute for activation memory --
+        essential at 7-8B), and
+      * register the input-embedding hook so activations require grad. Without
+        this, checkpointing silently drops gradients because the frozen
+        embedding output has ``requires_grad=False`` and nothing in the
+        checkpointed region is a leaf that needs grad.
+      * disable the KV cache (incompatible with training / checkpointing).
+    """
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+
+    if use_gradient_checkpointing:
+        # Non-reentrant checkpointing plays well with frozen params + custom
+        # autograd Functions and doesn't need the input-grad hack, but we set
+        # the hook anyway for the reentrant fallback and for safety.
+        if hasattr(model, "gradient_checkpointing_enable"):
+            try:
+                model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+            except TypeError:
+                model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+
+    model.train()
+    return model
+
+
+def _head_weight_fn(head: nn.Module) -> Callable[[], torch.Tensor]:
+    """
+    Return a closure giving the head weight in ``[hidden, vocab]`` orientation
+    (so ``logits = hidden @ W``), for either an EXL3 head or a plain Linear.
+    """
+    inner = getattr(head, "inner", None)
+    if inner is not None and hasattr(inner, "get_weight_tensor"):
+        return lambda: inner.get_weight_tensor()
+    if hasattr(head, "get_weight_tensor"):
+        return lambda: head.get_weight_tensor()
+    if isinstance(head, nn.Linear):
+        # nn.Linear weight is [vocab, hidden]; transpose to [hidden, vocab].
+        return lambda: head.weight.t()
+    raise TypeError(f"Unsupported LM head type for fused CE: {type(head)}")
+
+
+def qlora_causal_lm_loss(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    chunk: int = DEFAULT_CHUNK,
+    ignore_index: int = IGNORE_INDEX,
+    **decoder_kwargs,
+) -> torch.Tensor:
+    """
+    Causal-LM loss via the fused linear cross-entropy head.
+
+    Runs the decoder backbone to hidden states, then computes the shifted
+    cross-entropy without ever materialising the full ``[tokens, vocab]``
+    logits. Assumes the LM head is frozen (standard QLoRA) and that the model
+    does not apply final-logit softcapping (e.g. Gemma2 needs the standard
+    head instead).
+
+    Works with any model exposing the standard HF ``get_decoder()`` /
+    ``get_output_embeddings()`` interface.
+    """
+    decoder = model.get_decoder()
+    out = decoder(input_ids=input_ids, attention_mask=attention_mask, **decoder_kwargs)
+    hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+
+    head = model.get_output_embeddings()
+    weight_fn = _head_weight_fn(head)
+    return fused_linear_cross_entropy(
+        hidden, weight_fn, labels, chunk=chunk, ignore_index=ignore_index, shift=True
+    )
 
 
 def iter_lora_modules(model: nn.Module):

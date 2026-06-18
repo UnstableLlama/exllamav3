@@ -22,7 +22,14 @@ from .hf_qlora import (
     attach_qlora,
     iter_lora_modules,
     save_lora_adapter,
+    prepare_model_for_qlora_training,
+    qlora_causal_lm_loss,
     DEFAULT_TARGET_MODULES,
+)
+from .fused_ce import (
+    FusedLinearCrossEntropy,
+    fused_linear_cross_entropy,
+    DEFAULT_CHUNK,
 )
 
 __all__ = [
@@ -34,5 +41,10 @@ __all__ = [
     "attach_qlora",
     "iter_lora_modules",
     "save_lora_adapter",
+    "prepare_model_for_qlora_training",
+    "qlora_causal_lm_loss",
     "DEFAULT_TARGET_MODULES",
+    "FusedLinearCrossEntropy",
+    "fused_linear_cross_entropy",
+    "DEFAULT_CHUNK",
 ]

@@ -112,32 +112,68 @@ a mock EXL3 weight: loss decreases, the frozen base and all non-adapter
 params are unchanged, only adapters move, and the saved PEFT orientation
 reproduces the exact training-time delta. **Verified passing.**
 
+## Step 3 — memory-readiness for 7-8B (checkpointing + fused CE)
+
+Two additions in `exllamav3/training/` make the path usable on a single
+consumer GPU at 7-8B scale:
+
+- `prepare_model_for_qlora_training(model)` — enables gradient checkpointing
+  (trade compute for activation memory), registers the input-embedding
+  require-grad hook (without it, checkpointing silently drops gradients
+  because the frozen embedding output doesn't require grad — the same fix
+  PEFT's `prepare_model_for_kbit_training` applies), and disables the KV
+  cache.
+- `fused_ce.py` — `FusedLinearCrossEntropy`, a streaming linear
+  cross-entropy that **never materialises the `[tokens, vocab]` logits or
+  their gradient**, the single biggest memory spike at large vocab. It walks
+  token chunks, computes loss and `grad_hidden`, and recomputes the
+  (dequantized, frozen) head weight in the backward rather than storing it
+  (a 128k-vocab head can be ~1 GB on its own). `qlora_causal_lm_loss(...)`
+  wires it to any model with the standard HF
+  `get_decoder()`/`get_output_embeddings()` interface, handling the causal
+  shift and head orientation. Assumes a frozen head and no final-logit
+  softcapping (Gemma2-style models should use the standard head).
+
+`examples/qlora_train.py` now calls `prepare_model_for_qlora_training` and
+uses a `QLoRATrainer` whose `compute_loss` routes through the fused head
+(togglable with `--no-fused-ce` / `--no-grad-ckpt`).
+
+`tests/test_fused_ce.py` proves it on CPU: loss and `grad_hidden` match
+`F.cross_entropy` exactly (incl. `ignore_index`), results are invariant to
+chunk size, the backward passes `gradcheck`, and `qlora_causal_lm_loss`
+reproduces HF-style shifted CausalLM loss with gradients flowing into the
+backbone. **Verified passing.**
+
+## Status summary
+
+Done and CPU-verified:
+
+- ✅ Differentiable EXL3 linear (frozen base) with gradchecked backward.
+- ✅ Trainable model via the HF integration (only linears are EXL3; the rest
+  is stock differentiable PyTorch), adapter attach + PEFT-format save.
+- ✅ Gradient checkpointing wiring (`prepare_model_for_qlora_training`).
+- ✅ Fused linear cross-entropy head (no `[tokens × vocab]` logit spike).
+- ✅ Optimizer state — trivial; only adapters train, handled by HF Trainer.
+
 ## What is NOT done yet (the rest of the roadmap)
 
-This proves one linear layer. A full training path additionally needs:
-
-1. **A differentiable model forward.** The inference forward runs under
-   `@torch.inference_mode` and uses fused, backward-less kernels
-   (`ext.rms_norm`, fused MLP, `exl3_mgemm`, `had_r_128`, softcap, paged
-   flash-attn). Training mode must disable `inference_mode` and route
-   through torch-native / autograd-friendly equivalents (note `RMSNorm`
-   already has a `forward_torch`), with flash-attn in its training (varlen,
-   backward-enabled) configuration.
-2. **Gradient checkpointing** — essentially mandatory given per-layer weight
-   reconstruction.
-3. **Fused / cut cross-entropy** at the LM head to avoid the
-   `[tokens × vocab]` logit+grad memory spike.
-4. **Optimizer state** — trivial in size (adapters only), but wire it up.
-5. **Adapter save** in PEFT format (the inference `LoRA` loader in
-   `exllamav3/model/lora.py` already handles load; mirror it for save).
-6. **Multi-GPU**: start single-GPU → layer-pipeline (matches the existing
-   device split) → FSDP much later (EXL3's packed trellis tensors don't
-   shard like bf16 params, so FSDP-QLoRA needs real design work).
-
-A pragmatic alternative to writing a trainer: expose EXL3 linears as
-autograd-friendly `nn.Module`s (this PoC is step one) and reuse the
-existing HF Transformers integration + PEFT + `Trainer`/axolotl for the
-loop, owning only the EXL3 forward/backward.
+1. **Run on real hardware.** Everything above the EXL3 kernel is exercised by
+   CPU tests with mock weights; the GPU integration (`examples/qlora_train.py`,
+   tier-3 of the grad test) has not been executed in the authoring sandbox.
+   First real step: fine-tune a small EXL3 model end-to-end on a GPU and
+   confirm loss + a learned adapter loaded back for inference.
+2. **Native (non-HF) differentiable forward** — only needed if you want to
+   train without Transformers. The native inference forward runs under
+   `@torch.inference_mode` with fused, backward-less kernels; it would have to
+   be routed through torch-native equivalents (note `RMSNorm.forward_torch`
+   already exists) with flash-attn in training config. The HF path sidesteps
+   this entirely.
+3. **Model coverage caveats** for the fused head: final-logit softcapping
+   (Gemma2) and non-standard head layouts need the standard CE path
+   (`--no-fused-ce`).
+4. **Multi-GPU**: single-GPU → layer-pipeline (matches the existing device
+   split) → FSDP much later (EXL3's packed trellis tensors don't shard like
+   bf16 params, so FSDP-QLoRA needs real design work).
 
 ## Bottom line
 
