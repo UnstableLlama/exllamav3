@@ -81,6 +81,37 @@ python tests/test_qlora_grad.py                  # tiers 1–2, any machine w/ t
 python tests/test_qlora_grad.py --model /path/to/exl3_model   # + tier 3 on GPU
 ```
 
+## Step 2 — trainable model via the HF integration
+
+The Transformers integration (`exllamav3/integration/transformers.py`)
+replaces **only the linear layers** with EXL3 (`Exl3HfLinear`); norms,
+attention, RoPE and the LM-head loss stay as stock, autograd-friendly
+PyTorch. So the *whole* model becomes trainable the moment the EXL3 linears
+are differentiable — no need to reimplement any other backward.
+
+`exllamav3/training/hf_qlora.py` builds on that:
+
+- `Exl3LoRALinear` — wraps a frozen `Exl3HfLinear`, reconstructs the base
+  weight on the fly (`get_weight_tensor`), and routes the forward through
+  the gradchecked `EXL3LoRAFunction`. Base frozen, only `lora_a`/`lora_b`
+  trainable, `B` zero-initialised (no-op at start).
+- `attach_qlora(model, r, alpha, target_modules, ...)` — walks an HF model,
+  swaps matching EXL3 linears for trainable wrappers, freezes everything
+  else, returns the trainable parameter list.
+- `save_lora_adapter(...)` — writes a PEFT-format adapter (correct A/B
+  transpose + unscaled B) that the inference loader
+  (`exllamav3/model/lora.py`) reproduces exactly.
+
+`examples/qlora_train.py` ties it together with HF `Trainer`:
+`patch_transformers()` → `from_pretrained` → `attach_qlora` → `Trainer.train`
+→ `save_lora_adapter`. (Targets a real GPU + model; not run in the authoring
+sandbox.)
+
+`tests/test_qlora_train_loop.py` proves the mechanics end-to-end on CPU with
+a mock EXL3 weight: loss decreases, the frozen base and all non-adapter
+params are unchanged, only adapters move, and the saved PEFT orientation
+reproduces the exact training-time delta. **Verified passing.**
+
 ## What is NOT done yet (the rest of the roadmap)
 
 This proves one linear layer. A full training path additionally needs:

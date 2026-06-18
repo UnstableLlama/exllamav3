@@ -17,10 +17,22 @@ from .qlora_linear import (
     QLoRALinear,
     reference_forward,
 )
+from .hf_qlora import (
+    Exl3LoRALinear,
+    attach_qlora,
+    iter_lora_modules,
+    save_lora_adapter,
+    DEFAULT_TARGET_MODULES,
+)
 
 __all__ = [
     "EXL3LoRAFunction",
     "qlora_linear_forward",
     "QLoRALinear",
     "reference_forward",
+    "Exl3LoRALinear",
+    "attach_qlora",
+    "iter_lora_modules",
+    "save_lora_adapter",
+    "DEFAULT_TARGET_MODULES",
 ]
