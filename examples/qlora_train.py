@@ -15,6 +15,11 @@ Usage:
         --model /path/to/exl3_model \
         --out   out/exl3_qlora_adapter
 
+By default this fine-tunes on TeeZee/dolly-15k-pirate-speech -- an instruction
+dataset whose responses are rewritten in pirate speech ("Arrr, batten down the
+hatches!"). It's a deliberately obvious style so the before/after is
+unmistakable; see examples/qlora_infer.py to compare base vs adapted output.
+
 The resulting adapter is saved in PEFT format and can be loaded back for
 inference with exllamav3.model.lora.LoRA (or PEFT).
 
@@ -27,28 +32,55 @@ import argparse
 import torch
 
 
-def build_tiny_dataset(tokenizer, n_examples: int = 64, seq_len: int = 64):
-    """A throwaway in-memory dataset so the loop is self-contained."""
-    from datasets import Dataset
+def build_sft_dataset(tokenizer, dataset_name: str, max_samples: int, seq_len: int):
+    """
+    Load an instruction/response dataset (Dolly schema) and tokenize it for
+    completion-only SFT: the prompt tokens are masked with -100 so the loss is
+    computed only over the (pirate) response.
+    """
+    from datasets import load_dataset
 
-    texts = [
-        "ExLlamaV3 runs EXL3-quantized language models efficiently on consumer GPUs.",
-        "QLoRA freezes the quantized base weights and trains only low-rank adapters.",
-        "The trellis weight is reconstructed on the fly and treated as a constant.",
-        "Gradients flow to the adapter and to the input, never through the quantizer.",
-    ]
-    rows = [{"text": texts[i % len(texts)]} for i in range(n_examples)]
-    ds = Dataset.from_list(rows)
+    ds = load_dataset(dataset_name, split="train")
+    if max_samples and max_samples < len(ds):
+        ds = ds.shuffle(seed=0).select(range(max_samples))
 
-    def tok(batch):
-        out = tokenizer(
-            batch["text"], truncation=True, max_length=seq_len,
-            padding="max_length",
-        )
-        out["labels"] = out["input_ids"].copy()
-        return out
+    has_chat = getattr(tokenizer, "chat_template", None) is not None
 
-    return ds.map(tok, batched=True, remove_columns=["text"])
+    def format_example(ex):
+        instr = (ex.get("instruction") or "").strip()
+        ctx = (ex.get("context") or "").strip()
+        resp = (ex.get("response") or "").strip()
+        user = instr if not ctx else f"{instr}\n\n{ctx}"
+
+        if has_chat:
+            prompt_ids = tokenizer.apply_chat_template(
+                [{"role": "user", "content": user}],
+                tokenize=True, add_generation_prompt=True,
+            )
+            full_ids = tokenizer.apply_chat_template(
+                [{"role": "user", "content": user},
+                 {"role": "assistant", "content": resp}],
+                tokenize=True, add_generation_prompt=False,
+            )
+        else:
+            prompt = f"### Instruction:\n{user}\n\n### Response:\n"
+            prompt_ids = tokenizer(prompt, add_special_tokens=True)["input_ids"]
+            full_ids = tokenizer(
+                prompt + resp + (tokenizer.eos_token or ""),
+                add_special_tokens=True,
+            )["input_ids"]
+
+        full_ids = full_ids[:seq_len]
+        labels = list(full_ids)
+        for i in range(min(len(prompt_ids), len(full_ids))):
+            labels[i] = -100  # mask the prompt; train only on the response
+        return {
+            "input_ids": full_ids,
+            "labels": labels,
+            "attention_mask": [1] * len(full_ids),
+        }
+
+    return ds.map(format_example, remove_columns=ds.column_names)
 
 
 def main():
@@ -58,8 +90,12 @@ def main():
     ap.add_argument("--r", type=int, default=16)
     ap.add_argument("--alpha", type=float, default=32.0)
     ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--steps", type=int, default=30)
+    ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--batch", type=int, default=2)
+    ap.add_argument("--dataset", default="TeeZee/dolly-15k-pirate-speech",
+                    help="HF instruction dataset (Dolly schema: instruction/context/response)")
+    ap.add_argument("--max-samples", type=int, default=4000)
+    ap.add_argument("--seq-len", type=int, default=512)
     ap.add_argument("--targets", nargs="*", default=None,
                     help="Target module leaf names (default: attn+mlp projections)")
     ap.add_argument("--no-fused-ce", action="store_true",
@@ -72,7 +108,7 @@ def main():
 
     from transformers import (AutoTokenizer, AutoModelForCausalLM,
                               Trainer, TrainingArguments,
-                              DataCollatorForLanguageModeling)
+                              DataCollatorForSeq2Seq)
     from exllamav3.integration.transformers import patch_transformers
     from exllamav3.training import (attach_qlora, save_lora_adapter,
                                    prepare_model_for_qlora_training,
@@ -100,8 +136,9 @@ def main():
 
     # 4. Data + Trainer. With fused cross-entropy we override compute_loss so
     #    the [tokens x vocab] logits are never materialised.
-    ds = build_tiny_dataset(tokenizer)
-    collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
+    ds = build_sft_dataset(tokenizer, args.dataset, args.max_samples, args.seq_len)
+    # DataCollatorForSeq2Seq pads input_ids with pad_token and labels with -100.
+    collator = DataCollatorForSeq2Seq(tokenizer, padding=True, label_pad_token_id=-100)
 
     ce_chunk = args.ce_chunk
     use_fused_ce = not args.no_fused_ce

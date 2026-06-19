@@ -144,6 +144,18 @@ chunk size, the backward passes `gradcheck`, and `qlora_causal_lm_loss`
 reproduces HF-style shifted CausalLM loss with gradients flowing into the
 backbone. **Verified passing.**
 
+## Demo dataset & before/after
+
+`examples/qlora_train.py` defaults to
+[`TeeZee/dolly-15k-pirate-speech`](https://hf.co/datasets/TeeZee/dolly-15k-pirate-speech)
+(CC-BY-SA-3.0): the Dolly-15k instruction set with responses rewritten in
+pirate speak. The style is deliberately obvious so the effect of fine-tuning
+is unmistakable — a successful run makes the model answer with "Arrr", "matey",
+"th'", "batten down the hatches", etc. Training uses completion-only masking
+(prompt tokens set to `-100`), so the loss is computed only over the pirate
+response. `examples/qlora_infer.py` generates from the base vs the adapted
+model on the same prompts for a direct side-by-side.
+
 ## Status summary
 
 Done and CPU-verified:

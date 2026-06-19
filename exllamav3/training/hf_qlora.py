@@ -346,3 +346,59 @@ def save_lora_adapter(
         json.dump(config, f, indent=2)
 
     print(f" -- saved LoRA adapter ({len(target_leaves)} target types) to {directory}")
+
+
+def load_lora_adapter(
+    model: nn.Module,
+    directory: str,
+    compute_dtype: torch.dtype = torch.bfloat16,
+) -> nn.Module:
+    """
+    Attach an adapter saved by :func:`save_lora_adapter` (PEFT format) onto an
+    HF model for inference. Reads the config for r/alpha/targets, wraps the
+    matching EXL3 linears, and loads the A/B weights (transposing back from the
+    PEFT ``[r, in]`` / ``[out, r]`` orientation to our internal layout).
+    """
+    from safetensors.torch import load_file
+
+    with open(os.path.join(directory, "adapter_config.json"), encoding="utf8") as f:
+        cfg = json.load(f)
+
+    attach_qlora(
+        model,
+        r=cfg["r"],
+        alpha=cfg["lora_alpha"],
+        target_modules=cfg.get("target_modules"),
+        use_rslora=cfg.get("use_rslora", False),
+        compute_dtype=compute_dtype,
+        verbose=False,
+    )
+
+    wrappers = {name: mod for name, mod in iter_lora_modules(model)}
+    state = load_file(os.path.join(directory, "adapter_model.safetensors"))
+
+    loaded = 0
+    for key, tensor in state.items():
+        # base_model.model.<name>.lora_A.weight  /  .lora_B.weight
+        if not key.startswith("base_model.model."):
+            continue
+        body = key[len("base_model.model."):]
+        if body.endswith(".lora_A.weight"):
+            name, half = body[:-len(".lora_A.weight")], "A"
+        elif body.endswith(".lora_B.weight"):
+            name, half = body[:-len(".lora_B.weight")], "B"
+        else:
+            continue
+        mod = wrappers.get(name)
+        if mod is None:
+            continue
+        with torch.no_grad():
+            if half == "A":  # [r, in] -> [in, r]
+                mod.lora_a.copy_(tensor.t().to(mod.lora_a.dtype).to(mod.lora_a.device))
+            else:            # [out, r] -> [r, out]
+                mod.lora_b.copy_(tensor.t().to(mod.lora_b.dtype).to(mod.lora_b.device))
+        loaded += 1
+
+    print(f" -- loaded LoRA adapter from {directory} ({loaded} tensors into "
+          f"{len(wrappers)} modules)")
+    return model
