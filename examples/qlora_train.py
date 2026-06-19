@@ -53,15 +53,17 @@ def build_sft_dataset(tokenizer, dataset_name: str, max_samples: int, seq_len: i
         user = instr if not ctx else f"{instr}\n\n{ctx}"
 
         if has_chat:
-            prompt_ids = tokenizer.apply_chat_template(
+            prompt_text = tokenizer.apply_chat_template(
                 [{"role": "user", "content": user}],
-                tokenize=True, add_generation_prompt=True,
+                tokenize=False, add_generation_prompt=True,
             )
-            full_ids = tokenizer.apply_chat_template(
+            full_text = tokenizer.apply_chat_template(
                 [{"role": "user", "content": user},
                  {"role": "assistant", "content": resp}],
-                tokenize=True, add_generation_prompt=False,
+                tokenize=False, add_generation_prompt=False,
             )
+            prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+            full_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
         else:
             prompt = f"### Instruction:\n{user}\n\n### Response:\n"
             prompt_ids = tokenizer(prompt, add_special_tokens=True)["input_ids"]
