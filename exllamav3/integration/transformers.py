@@ -98,8 +98,13 @@ class Exl3HfLinear(torch.nn.Module):
         self.inner = None
 
         # Some implementations in transformers (Cohere2 at least) seem to reference .weight.dtype directly, so create
-        # a dummy tensor keep them happy
-        self.weight = torch.zeros((1,), dtype = torch.float16, device = "meta")
+        # a dummy tensor keep them happy. It must be an nn.Parameter (not a bare tensor): newer Transformers walks
+        # tied weights during load finalization via get_parameter(), which raises "is not an nn.Parameter" otherwise.
+        # Frozen (requires_grad=False) so it never enters an optimizer; the real compute uses self.inner.
+        self.weight = torch.nn.Parameter(
+            torch.zeros((1,), dtype = torch.float16, device = "meta"),
+            requires_grad = False,
+        )
 
 
     def finalize(self):

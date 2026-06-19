@@ -83,6 +83,36 @@ def build_sft_dataset(tokenizer, dataset_name: str, max_samples: int, seq_len: i
     return ds.map(format_example, remove_columns=ds.column_names)
 
 
+@torch.inference_mode()
+def _sample(model, tokenizer, prompt: str, max_new_tokens: int = 48) -> str:
+    """Quick generation for live progress feedback; restores train state after."""
+    was_training = model.training
+    prev_cache = getattr(model.config, "use_cache", None)
+    model.eval()
+    model.config.use_cache = True
+    try:
+        if getattr(tokenizer, "chat_template", None):
+            ids = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=True, add_generation_prompt=True, return_tensors="pt",
+            ).to(model.device)
+        else:
+            ids = tokenizer(f"### Instruction:\n{prompt}\n\n### Response:\n",
+                            return_tensors="pt").input_ids.to(model.device)
+        out = model.generate(
+            input_ids=ids, max_new_tokens=max_new_tokens, do_sample=True,
+            top_p=0.9, temperature=0.8,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        )
+        text = tokenizer.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
+    finally:
+        model.config.use_cache = prev_cache
+        if was_training:
+            model.train()
+    return text.strip().replace("\n", " ")
+
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="Path to a local EXL3 model dir")
@@ -104,10 +134,14 @@ def main():
                     help="Disable gradient checkpointing")
     ap.add_argument("--ce-chunk", type=int, default=1024,
                     help="Token chunk size for fused cross-entropy")
+    ap.add_argument("--sample-every", type=int, default=25,
+                    help="Generate a sample completion every N steps (0 to disable)")
+    ap.add_argument("--sample-prompt", default="Tell me about your day at sea.",
+                    help="Prompt used for the live progress samples")
     args = ap.parse_args()
 
     from transformers import (AutoTokenizer, AutoModelForCausalLM,
-                              Trainer, TrainingArguments,
+                              Trainer, TrainingArguments, TrainerCallback,
                               DataCollatorForSeq2Seq)
     from exllamav3.integration.transformers import patch_transformers
     from exllamav3.training import (attach_qlora, save_lora_adapter,
@@ -157,6 +191,31 @@ def main():
             )
             return (loss, None) if return_outputs else loss
 
+    # Live feedback: print loss each step and a generated pirate sample every
+    # --sample-every steps, so you can watch the model pick up the accent.
+    class SampleCallback(TrainerCallback):
+        def __init__(self, every, prompt):
+            self.every = every
+            self.prompt = prompt
+
+        def on_log(self, a, state, control, logs=None, **kw):
+            if logs and "loss" in logs:
+                print(f"  step {state.global_step:>5} | loss {logs['loss']:.4f}"
+                      f" | lr {logs.get('learning_rate', 0):.2e}")
+
+        def on_step_end(self, a, state, control, **kw):
+            if self.every and state.global_step % self.every == 0:
+                txt = _sample(model, tokenizer, self.prompt)
+                print(f"\n  \U0001f3f4‍☠️  [step {state.global_step}] "
+                      f"{self.prompt}\n     -> {txt}\n")
+
+    callbacks = []
+    if args.sample_every:
+        # Show the base model's answer first as a baseline.
+        print("\n\U0001f3f4‍☠️  baseline (step 0):")
+        print(f"     {args.sample_prompt}\n     -> {_sample(model, tokenizer, args.sample_prompt)}\n")
+        callbacks.append(SampleCallback(args.sample_every, args.sample_prompt))
+
     targs = TrainingArguments(
         output_dir=args.out,
         per_device_train_batch_size=args.batch,
@@ -164,6 +223,8 @@ def main():
         max_steps=args.steps,
         learning_rate=args.lr,
         logging_steps=1,
+        logging_first_step=True,
+        disable_tqdm=False,        # keep the progress bar + ETA
         bf16=True,
         report_to=[],
         save_strategy="no",
@@ -172,6 +233,7 @@ def main():
     )
     trainer = QLoRATrainer(
         model=model, args=targs, train_dataset=ds, data_collator=collator,
+        callbacks=callbacks,
     )
     trainer.train()
 
