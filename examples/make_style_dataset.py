@@ -127,15 +127,46 @@ def build_rewrite_prompt(model, style_key, text):
 
 def clean_output(s):
     s = s.strip()
-    # Models sometimes wrap the answer in quotes or a "STYLED:" prefix despite
-    # instructions; strip the common cases without mangling real content.
+    # 1) Hard-cut at any turn/sequence marker. RP-tuned models (e.g. Rocinante,
+    #    a Mistral finetune) end their turn with </s> and then happily role-play
+    #    a whole conversation; keep only the first turn. These markers should
+    #    never appear inside a single styled answer.
+    for marker in ("</s>", "<|im_end|>", "<|eot_id|>", "<|endoftext|>",
+                   "[INST]", "[/INST]", "<|start_header_id|>"):
+        i = s.find(marker)
+        if i != -1:
+            s = s[:i]
+    # 2) Drop meta-commentary the model adds about its own rewrite. If such a
+    #    line appears, cut everything from it onward (the real answer precedes).
+    meta_markers = (
+        "\n*Rewritten", "\n(Rewritten", "\n*Yoda", "\n*The passage",
+        "\n*I ", "\n(Note", "\n*Note", "\nI see", "\nI understand",
+        "\nApologies", "\nCould you", "\nHere's", "\nHere is the",
+        "\n*Original meaning", "\n*(", "\nUnderstood",
+    )
+    for marker in meta_markers:
+        i = s.find(marker)
+        if i != -1:
+            s = s[:i]
+    s = s.strip()
+    # 3) Strip a leading prefix / surrounding quotes.
     for prefix in ("STYLED:", "Rewritten:", "Here is the rewritten passage:",
                    "Sure!", "Sure,"):
         if s.startswith(prefix):
             s = s[len(prefix):].strip()
     if len(s) >= 2 and s[0] in "\"'" and s[-1] == s[0]:
         s = s[1:-1].strip()
-    return s
+    # 4) Collapse runaway repetition loops (model degenerated without emitting
+    #    EOS, e.g. the same sentence 30x). Keep first occurrence of each line.
+    lines, seen, out = s.split("\n"), set(), []
+    for ln in lines:
+        key = ln.strip()
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        out.append(ln)
+    return "\n".join(out).strip()
 
 
 def main():
@@ -163,6 +194,11 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cache-tokens", type=int, default=8192)
     args = ap.parse_args()
+
+    # Create the output directory up front, so a missing path fails here rather
+    # than after loading the (large) rewriter model.
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    os.makedirs(out_dir, exist_ok=True)
 
     from datasets import load_dataset
     ds = load_dataset(args.source_dataset, split=args.source_split)
@@ -198,6 +234,14 @@ def main():
     generator = Generator(model=model, cache=cache, tokenizer=tokenizer)
     sampler = ComboSampler(temperature=args.temperature, top_p=args.top_p)
 
+    # Stop at end-of-turn. Without this the model keeps generating past its
+    # answer (RP finetunes role-play a whole conversation), so pass the
+    # tokenizer's EOS id(s) plus the common chat end-markers as strings.
+    stop = list(getattr(config, "eos_token_id_list", None) or [])
+    if tokenizer.eos_token_id is not None and tokenizer.eos_token_id not in stop:
+        stop.append(tokenizer.eos_token_id)
+    stop += ["</s>", "<|im_end|>", "<|eot_id|>", "<|endoftext|>", "[INST]"]
+
     out_f = open(args.out, "a", encoding="utf-8")
     todo = kept[done:]
     for start in range(0, len(todo), args.batch):
@@ -207,7 +251,7 @@ def main():
         outs = generator.generate(
             prompt=prompts, max_new_tokens=args.max_new_tokens,
             sampler=sampler, seed=args.seed, add_bos=False,
-            completion_only=True,
+            completion_only=True, stop_conditions=stop, min_new_tokens=4,
         )
         if isinstance(outs, str):  # single-item safety
             outs = [outs]
