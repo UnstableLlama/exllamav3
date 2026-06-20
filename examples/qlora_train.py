@@ -94,10 +94,12 @@ def _sample(model, tokenizer, prompt: str, max_new_tokens: int = 48) -> str:
     model.config.use_cache = True
     try:
         if getattr(tokenizer, "chat_template", None):
-            ids = tokenizer.apply_chat_template(
+            text = tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}],
-                tokenize=True, add_generation_prompt=True, return_tensors="pt",
-            ).to(model.device)
+                tokenize=False, add_generation_prompt=True,
+            )
+            ids = tokenizer(text, return_tensors="pt",
+                            add_special_tokens=False).input_ids.to(model.device)
         else:
             ids = tokenizer(f"### Instruction:\n{prompt}\n\n### Response:\n",
                             return_tensors="pt").input_ids.to(model.device)
