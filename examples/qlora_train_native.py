@@ -37,6 +37,7 @@ The adapter is saved in PEFT format, loadable by exllamav3.model.lora.LoRA
 
 import argparse
 import random
+import re
 import torch
 
 from exllamav3 import Config, Model, Tokenizer
@@ -45,10 +46,24 @@ from exllamav3.training.native_llama import NativeLlamaQLoRA
 
 EOT = "<|eot_id|>"
 
+# Stage directions / inline actions, e.g. "[as CAMBIO]", "[TRINCULO grabs ...]",
+# "*stares at the ceiling*". Style datasets built from play scripts carry these,
+# and the model happily learns to emit them, producing disjoint non-answers.
+_STAGE_DIR = re.compile(r"\[[^\]]*\]|\*[^*]*\*")
+_WHITESPACE = re.compile(r"\s+")
+
+
+def clean_style_text(s):
+    """Strip stage directions and collapse runaway whitespace/newlines."""
+    s = _STAGE_DIR.sub(" ", s)
+    s = _WHITESPACE.sub(" ", s)
+    return s.strip()
+
 
 def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
                        instruction_key="instruction", context_key="context",
-                       response_key="response", split="train"):
+                       response_key="response", split="train",
+                       clean_text=True, min_response_words=3):
     """
     Load an instruction dataset and tokenize for completion-only SFT using the
     model's native Llama-3 chat template. Prompt tokens are masked with -100 so
@@ -57,6 +72,11 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
     Columns are addressed by name (instruction_key / context_key / response_key)
     so the loader is not tied to the Dolly schema; context_key may be absent in
     the dataset (treated as empty).
+
+    clean_text strips stage directions / inline actions and normalizes
+    whitespace (helps play-script style sets like the Shakespeare default, whose
+    raw rows otherwise teach the model to emit "[stage directions]"). Rows whose
+    cleaned response has fewer than min_response_words tokens are dropped.
 
     Returns a list of dicts with python int lists: input_ids / labels.
     """
@@ -71,7 +91,10 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
         instr = (ex.get(instruction_key) or "").strip()
         ctx = (ex.get(context_key) or "").strip()
         resp = (ex.get(response_key) or "").strip()
-        if not resp:
+        if clean_text:
+            instr, ctx, resp = (clean_style_text(instr), clean_style_text(ctx),
+                                clean_style_text(resp))
+        if not resp or len(resp.split()) < min_response_words:
             continue
         user = instr if not ctx else f"{instr}\n\n{ctx}"
 
@@ -150,6 +173,12 @@ def main():
                     help="Optional extra-context column; absent columns are ignored")
     ap.add_argument("--response-key", default="og_response",
                     help="Column holding the target response (Dolly: 'response')")
+    ap.add_argument("--no-clean-text", action="store_true",
+                    help="Disable stripping of [stage directions]/*actions* and "
+                         "whitespace normalization (on by default; helps play-script "
+                         "style sets, leave off for code/markdown datasets)")
+    ap.add_argument("--min-response-words", type=int, default=3,
+                    help="Drop rows whose cleaned response is shorter than this")
     ap.add_argument("--max-samples", type=int, default=4000)
     ap.add_argument("--seq-len", type=int, default=512)
     ap.add_argument("--targets", nargs="*", default=None,
@@ -202,6 +231,8 @@ def main():
         model, tokenizer, args.dataset, args.max_samples, args.seq_len,
         instruction_key=args.instruction_key, context_key=args.context_key,
         response_key=args.response_key, split=args.dataset_split,
+        clean_text=not args.no_clean_text,
+        min_response_words=args.min_response_words,
     )
     print(f" -- {len(examples)} SFT examples")
     assert examples, "no usable training examples"
