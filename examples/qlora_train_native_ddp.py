@@ -23,7 +23,8 @@ Launch with torchrun (one process per GPU):
         --out   out/exl3_qlora_adapter \
         --dataset TeeZee/dolly-15k-pirate-speech \
         --instruction-key instruction --context-key context --response-key response \
-        --r 64 --alpha 64 --batch 16 --steps 800
+        --lora-r 64 --alpha 64 --batch 16 --steps 800
+        # NB: use --lora-r, not --r -- torchrun intercepts the abbreviated "--r".
 
 Effective batch = --batch * nproc_per_node * --grad-accum.
 
@@ -65,7 +66,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", default="out/exl3_qlora_adapter")
-    ap.add_argument("--r", type=int, default=64)
+    # NB: not "--r" -- torchrun greedily abbreviation-matches "--r" against its
+    # own --rdzv-*/--role/--run-path options and errors out before our script
+    # ever sees it. "--lora-r" sidesteps that; dest stays "r" so code is unchanged.
+    ap.add_argument("--lora-r", dest="r", type=int, default=64)
     ap.add_argument("--alpha", type=float, default=64.0)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--steps", type=int, default=800)
