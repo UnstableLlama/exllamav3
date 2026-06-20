@@ -120,62 +120,173 @@ must be allocated before `model.load()`; exact prompt/response label masking. Th
 
 ---
 
-## 0c. Dataset iteration — what works for a strong, coherent style
+## 0c. Session 2 — PROVEN end-to-end on a visible demo; dataset density is the key variable
 
-> Branch `claude/zen-franklin-g5hedw`. Several runs on Llama-3.2-1B 4bpw.
+> Branch `claude/zen-franklin-g5hedw` (merged to master). Many runs on
+> Llama-3.2-1B and -3B (4bpw), single-GPU and 2× RTX 3090 (DDP).
 
-**The lesson:** for a visible style adapter, *dataset structure matters more than
-rank or steps*. What works is **clean instruction→on-topic-answer Q&A with a
-strong, consistent style** (like pirate, but stronger). What fails is
-**play-script / dialogue-pair data**, whose responses are tangential monologues
-with stage directions.
+### Headline result
 
-**Tried and rejected — Shakespeare** (`Roudranil/shakespearean-...`): strong
-register, but it's a *play script*. Results: at strength it degenerated
-(repetition, `*blank stare*` non-answers — the model parroting stage
-directions); tamed down it went bland (style washed out). No setting gave
-coherent-and-clearly-styled. Structural ceiling of the data, not the method.
+The EXL3-QLoRA path is **proven end-to-end with an unambiguous visible demo.** An
+**ALL-CAPS smoke test** (`--uppercase-response`: train the model to RESPOND IN
+CAPS) gave a clean, controllable before/after on Llama-3.2-1B 4bpw:
+- BASE → normal mixed case; ADAPTED → SHOUTS IN CAPS, strength scaling with
+  `--lora-scaling` (subtle at 1.0 after a short run, consistent across all prompts
+  at 2–3). No ambiguity: differentiable forward over the trellis-quantized base,
+  frozen base + trained LoRA, save/reload/steer — all working on quantized weights.
 
-**Chosen — `superdrew100/UwU_Alpaca_data`** (MIT, 10.6K): Alpaca-cleaned with
-every `output` rewritten in over-the-top UwU furry speak (caps/emoji/OwO).
-Keeps clean Q&A structure → coherent + on-topic, with an unmistakable style at
-scale 1.0. Alpaca schema, so defaults are now `instruction-key=instruction`,
-`context-key=input`, `response-key=output`. Caveat: mild PG-13 furry innuendo in
-some rows. Use `--no-clean-text` to keep the `*action*` flavor (the default
-cleaner strips `*...*`/`[...]`, which is wanted for play scripts but optional
-here).
+### THE key lesson: signal *density*, not rank/steps/model size
 
-**Code added during this iteration (all on the branch):**
-- Dataset-agnostic loader: `--instruction-key/--context-key/--response-key`,
-  `--dataset-split`. For pirate: `--dataset TeeZee/dolly-15k-pirate-speech
-  --instruction-key instruction --context-key context --response-key response`.
-- `--save-every N` + save-on-Ctrl-C (the adapter used to only save at the end, so
-  early-stopping at the plateau discarded everything).
-- `clean_style_text`: strips `[stage directions]`/`*actions*` + normalizes
-  whitespace (default on; `--no-clean-text` to disable), and `--min-response-words`
-  drops junk-short rows.
-- `--r 32 --alpha 64` defaults. NOTE: `alpha/r = 2.0` means `--lora-scaling 1.0`
-  is *effective 2.0* — aggressive. For a gentler knob use `--alpha 32` (ratio 1.0).
+Every earlier style demo was muddy for ONE reason — sparse/inconsistent training
+signal. The uppercase test isolated the variable:
+- **Uppercase** — *every token of every row* changes → learns cleanly, shows
+  controllably (can't reach low loss without it, can't hide it at decode). ✅
+- **Pirate** (`TeeZee/dolly-15k-pirate-speech`) — `arrr`-library swaps
+  (the→th', is→be, you→ye) are *sparse* and many rows barely pirate. Trained hard
+  (r64, ~2 epochs, 1B & 3B) it DOES show th'/be/ye when cranked (effective ~2.5–3
+  on 1B; coherent further up on 3B) but collapses into "be be be" past that. Real
+  but light.
+- **UwU** (`superdrew100/UwU_Alpaca_data`) — style in *rare* tokens
+  (emoji/caps/OwO). Loss fell to ~0.7 (English backbone fit) but markers stayed
+  low-probability and never surfaced at decode, even at scale 2 + temp; only soft
+  persona traces ("shy being") leaked. Sparse-marker styles don't transfer to a
+  small model's greedy/low-temp generation.
+- **Shakespeare** (`Roudranil/shakespearean-...`) — dense register BUT a *play
+  script*: tangential monologues + stage directions. At strength it degenerated
+  (parroted `*stage directions*`, repetition); tamed it went bland. Data-structure
+  ceiling.
 
-**Tuning lessons (1B + narrow style data):**
-- EMA plateaus fast (~50–150 steps); that's diminishing *loss* returns, but style
-  can keep firming up past it (watch `|B|`). Stop when samples look right AND no
-  overfit (loss diverging low while samples repeat/parrot).
-- Overtraining + high effective scale → degeneration (repetition loops). Less is
-  often more here.
+**Recipe for a good visible demo: a DENSE, CONSISTENT style on CLEAN
+instruction→answer Q&A.** Uppercase is the trivial (no-LLM) instance of exactly
+that. A heavily-styled *generated* dataset (every row strongly transformed) would
+behave like the caps demo — clean and controllable. Light off-the-shelf style
+sets (pirate) or sparse-marker ones (UwU) won't give a clean scale-1.0 demo on a
+small model.
 
-**Run command (GPU box):**
+### Tooling added this session (on the branch / merged to master)
+
+`examples/qlora_train_native.py` (+ DDP variant):
+- **Dataset-agnostic loader** — `--instruction-key/--context-key/--response-key`,
+  `--dataset-split`. Defaults are Alpaca (`instruction`/`input`/`output`, dataset
+  `superdrew100/UwU_Alpaca_data`). Pirate (Dolly schema):
+  `--dataset TeeZee/dolly-15k-pirate-speech --instruction-key instruction
+  --context-key context --response-key response`.
+- **`--uppercase-response`** — the dense smoke test (uppercases only the response).
+- **`clean_style_text`** (default on; `--no-clean-text`) — strips
+  `[stage directions]`/`*actions*` + normalizes whitespace; `--min-response-words`
+  drops junk-short rows. Use `--no-clean-text` for UwU (keeps `*action*` flavor).
+- **Checkpointing** — `--save-every N` + save-on-Ctrl-C (previously saved only at
+  the end, so early-stopping discarded everything).
+- **Resume** — `--resume <adapter_dir>` + `NativeLlamaQLoRA.load_adapter()`
+  (inverse of `save_adapter`). NOTE optimizer state is NOT restored (cold AdamW
+  re-warmup; harmless for LoRA); `--r`/`--targets` must match the checkpoint.
+
+`examples/qlora_infer_native.py`:
+- **Sampling controls** — `--temperature/--min-p/--top-p/--top-k/--seed`. Library
+  default is temp 0.8 + min_p 0.08, which truncates the low-prob tail and hides
+  sparse-marker styles; `--temperature 0` = greedy. `--lora-scaling` unchanged.
+
+`examples/qlora_train_native_ddp.py` (NEW): multi-GPU via DDP (see §0d).
+
+### Multi-GPU (DDP) — confirmed working on hardware (2× RTX 3090)
+
+Both GPUs 100% util; disjoint data shards (~total/N per rank); loss tracks a
+single-GPU run at the same *effective* batch. **GPU1 was on PCIe ×4 and it didn't
+matter** — only the tiny LoRA grads are all-reduced, so the slow lane isn't a
+bottleneck. That's exactly why DDP (not FSDP) fits QLoRA-on-EXL3.
+
 ```
-python examples/qlora_validate_native.py --model /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/   # PASS gate first
-python examples/qlora_train_native.py \
-    --model /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/ \
-    --out   /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/uwu \
-    --batch 16 --no-grad-ckpt --no-clean-text --steps 200 --save-every 50
-python examples/qlora_infer_native.py \
-    --model   /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/ \
-    --adapter /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/uwu --lora-scaling 1.0
+torchrun --standalone --nproc_per_node=2 examples/qlora_train_native_ddp.py \
+    --model /mnt/two/Weights/<model>/4/ --out /mnt/two/Weights/<model>/4/run \
+    --dataset ... --lora-r 128 --alpha 128 --batch 16 --steps 600 --save-every 100
 ```
-**Status: UwU wired + committed; NOT yet run on the GPU box.**
+- Run once in one terminal — `torchrun` spawns one process per GPU. Only rank 0
+  prints/saves (so the log looks single — confirm both GPUs with `nvidia-smi`).
+- Resume a single-GPU checkpoint on N GPUs: add `--resume <dir>` (loaded on every
+  rank before the broadcast). Effective batch = `--batch × nproc × --grad-accum`.
+- DDP script has NO live `🎭` samples / `|B|` column — confirm via the infer sweep.
+
+### Tuning lessons
+
+- **Effective strength = `(alpha/r) × --lora-scaling`.** Single-GPU default is
+  r=32/alpha=64 (ratio 2.0); DDP default r=64/alpha=64 (ratio 1.0). Use ratio 1.0
+  (`--alpha == --r`) for an intuitive knob.
+- **Loss plateau ≠ done.** EMA flattens fast; style keeps firming past it.
+  Pirate-hard *broke through* a second time (~2.0→~1.4 around 1 epoch) learning the
+  deeper swaps. EMA is a local logging var — it "resets" on resume (meaningless);
+  watch raw loss.
+- **Harder training → lower inference scale.** A harder-trained adapter is stronger
+  per unit scale, so the coherent sweet spot moves DOWN; sweep low first.
+- **Bigger base holds coherence under amplification** (3B coherent at higher scale
+  than 1B before "be be be" collapse).
+- **Live samples run at effective `alpha/r`** — light/sparse styles show nothing
+  there even when learned; judge by the inference scale sweep. (Dense styles like
+  uppercase DO show live.)
+
+### Gotchas hit (and fixed)
+
+- **torchrun eats `--r`** (abbrev-matches `--rdzv-*`/`--role`). DDP script uses
+  `--lora-r` (dest `r`); single-GPU `--r` is fine.
+- **OOM from `--batch 48 --no-grad-ckpt`** on wordy data — full attention
+  activations × layers exceed 24GB. Fix: drop `--no-grad-ckpt` (checkpointing on)
+  and/or lower `--batch`. Only use `--no-grad-ckpt` with VRAM to spare.
+- **`<|eot_id|>` spam** in some generations — infer script sets no EOT stop
+  condition, so it runs into new assistant turns. Cosmetic; adapter unaffected.
+- **`.../4/` in chat commands is a placeholder** for the full model path.
+
+### Run status
+- **Uppercase smoke test (1B):** ✅ PROVEN — clean CAPS before/after, scalable.
+- **Pirate-hard (1B r64, resumed single→2-GPU):** light but real pirate at
+  effective ~2.5–3; collapses past that.
+- **Pirate-hard (3B r128, 2 epochs, DDP):** th'/ye at scale ~3, coherent (no hard
+  collapse) but still light — dataset ceiling.
+- **UwU (1B/3B):** soft persona only; sparse markers don't surface. Not recommended.
+- **Shakespeare:** rejected (play-script structure).
+
+### Recommended next step
+A **dense funny style on clean Q&A** — *generate* it (take Alpaca/Dolly prompts,
+rewrite every answer in a strong style with a local model) so every row is heavily
+styled; it'll then behave like the caps demo. OR move to the flagship: low-bpw
+(2.5–3) bigger-model fine-tune on a real task with a metric, benchmarked vs what
+BNB NF4 can fit (the actually-valuable result — see §0d / implications).
+
+---
+
+## 0d. Multi-GPU strategy (rationale)
+
+"Multi-GPU" splits by *goal*, and QLoRA changes which tool fits, because only the
+tiny LoRA params train and the frozen quantized base is small:
+
+- **DDP (data parallel) — easy, the right default for throughput.** Replicate the
+  small quantized model per GPU, shard the batch, all-reduce only the LoRA grads
+  (a few MB). Built (`qlora_train_native_ddp.py`), confirmed on 2× 3090. We
+  hand-average the LoRA grads rather than wrapping in
+  `nn.parallel.DistributedDataParallel`, because the module is mostly frozen
+  buffers + a custom `autograd.Function` + grad checkpointing, which DDP's
+  bucketing handles awkwardly.
+- **Pipeline / layer-split — moderate, for models too big for one GPU.** exllamav3
+  already splits layers across GPUs for *inference*; the native training forward
+  would need to be made device-aware (move hidden states across block boundaries;
+  autograd handles cross-device grads). Not built.
+- **FSDP — hard, and usually the WRONG tool here.** Its value is sharding huge
+  *trainable* params + optimizer; here the trainable surface is tiny and the frozen
+  base is a packed trellis that doesn't shard like bf16. You'd gain ~nothing and do
+  real engineering to make the packed format FSDP-compatible (cf. Answer.AI's
+  FSDP-QLoRA, a genuine research project for exactly this). EXL3's compression also
+  partly dissolves FSDP's main use case: a 70B at 2.5bpw is ~22GB → fits one 24GB
+  card, so you may never need to shard the model — DDP for throughput +
+  pipeline-split for long context is enough.
+
+**Implications (the real prize):** EXL3 makes a bitrate regime *trainable* that
+BNB NF4 can't reach (NF4 is unusable ≤3bpw; EXL3's trellis stays coherent at
+2.5–3bpw). So QLoRA on a 2.5bpw 70B fits a single 24GB card, and you train the
+adapter against the *exact* weights you deploy (no train/serve quant mismatch).
+Expected outcome: rough parity with BNB at 4-bit, clear EXL3 win in the low-bitrate
+regime. The flagship experiment to substantiate it: same model fine-tuned BNB-NF4
+vs EXL3-4bpw vs EXL3-~2.5bpw at matched VRAM, compared on a real downstream metric
++ tokens/sec.
+
+---
 
 ---
 
