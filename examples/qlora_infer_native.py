@@ -17,14 +17,14 @@ from exllamav3 import Config, Model, Cache, Tokenizer, Generator
 from exllamav3.model.lora import LoRA
 
 
-# Content-rich prompts: the arrr-generated dataset converts words like
-# the->th', is/are->be, you->ye, my->me, so prompts that elicit longer, plain
-# expository answers surface the learned style better than meta/refusal prompts.
+# General everyday prompts: a style adapter is most convincing on plain,
+# open-ended questions, where the learned voice (e.g. florid Shakespearean
+# English) colours an ordinary answer rather than a meta/refusal one.
 PROMPTS = [
+    "Tell me about your day.",
+    "Give me some advice about love.",
     "Explain how the water cycle works.",
-    "Describe what a typical day on a sailing ship is like.",
-    "Tell me a short story about a treasure hunt.",
-    "What is the best way to cook a fish?",
+    "What should I have for dinner tonight?",
 ]
 
 

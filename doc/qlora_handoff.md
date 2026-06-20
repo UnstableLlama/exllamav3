@@ -120,6 +120,45 @@ must be allocated before `model.load()`; exact prompt/response label masking. Th
 
 ---
 
+## 0c. Next run — stronger funny dataset (Shakespeare) + higher rank
+
+> Branch `claude/zen-franklin-g5hedw`.
+
+The pirate demo's only weakness was the *dataset* (light, inconsistent `arrr`
+substitutions; §0 caveat). Swapped the default in `examples/qlora_train_native.py`
+to a **strong, consistent comedic style**:
+
+- **Dataset:** `Roudranil/shakespearean-and-modern-english-conversational-dataset`
+  (CC, ~5.3K train pairs). Modern-English line → original Early-Modern-English
+  play line. Mapped `translated_dialog → instruction`, `og_response → response`
+  (no `context`). An assistant trained on it answers everyday questions in florid
+  Shakespearean — funny and unmistakable, expected to land at `--lora-scaling 1.0`
+  (no cranking needed, unlike pirate).
+- **Loader is now dataset-agnostic:** `build_sft_examples` takes
+  `--instruction-key / --context-key / --response-key` (+ `--dataset-split`).
+  Defaults match the Shakespeare columns; for the old pirate set pass
+  `--dataset TeeZee/dolly-15k-pirate-speech --instruction-key instruction
+  --context-key context --response-key response` (Dolly schema).
+- **Higher rank:** defaults bumped `r=16→32`, `alpha=32→64` (kept `alpha=2r`, so
+  effective scale unchanged; just more adapter capacity for a strong style).
+- `examples/qlora_infer_native.py` default prompts made style-neutral (everyday
+  questions) so the Shakespearean voice shows on plain answers.
+
+**Run command (GPU box):**
+```
+python examples/qlora_validate_native.py --model /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/   # PASS gate first
+python examples/qlora_train_native.py \
+    --model /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/ \
+    --out   /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/shakespeare_r32
+python examples/qlora_infer_native.py \
+    --model   /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/ \
+    --adapter /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/shakespeare_r32
+```
+**Status: wired + committed; NOT yet run on the GPU box.** Expect first loss
+~2–4 dropping, `|B|` climbing, live samples turning Shakespearean.
+
+---
+
 ## 1. TL;DR status (historical — see §0 for the resolved status)
 
 > This section describes the state *before* the transformers-free native path was
