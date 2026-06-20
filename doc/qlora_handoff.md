@@ -250,6 +250,34 @@ styled; it'll then behave like the caps demo. OR move to the flagship: low-bpw
 (2.5–3) bigger-model fine-tune on a real task with a metric, benchmarked vs what
 BNB NF4 can fit (the actually-valuable result — see §0d / implications).
 
+### Session 3 — chose the dense-style path; Yoda generator built (tooling only)
+
+Picked option 1 above (dense funny style on clean Q&A) with **Yoda-speak** as the
+style. Rationale tied to the density lesson: Yoda is a *syntactic* transform
+(clause/word-order inversion over COMMON tokens), so unlike pirate/UwU it should
+surface at greedy/low-temp decode — the same property that made uppercase work,
+but actually funny. The off-the-shelf search came up dry: the only style-transfer
+Q&A sets on the Hub are the three we already burned (pirate=sparse, UwU=rare-token
+even in the denser V2, Shakespeare=play-script); the lone Yoda set
+(`dvgodoy/yoda_sentences`) is 720 translation pairs, not instruction Q&A. So we
+*generate* instead.
+
+New tooling (not yet run on hardware):
+- `examples/make_style_dataset.py` — rewrites ONLY the response of a normal
+  instruction set (default `yahma/alpaca-cleaned`) into a target style via a LOCAL
+  exllamav3 model; writes Alpaca-schema JSONL. Built-in styles: `yoda` (default),
+  `archaic`, `pirate`, `corporate` (each a system prompt + few-shot anchor).
+  Batched, resumable. **Use your largest instruct model as `--gen-model`** — a 1B
+  is too weak to invert sentences; keep it separate from the eventual training
+  target `--model`.
+- `qlora_train_native.py` loader now accepts a **local file path** for `--dataset`
+  (json/jsonl/parquet/csv), so the generated set drops straight in. DDP variant
+  inherits it (reuses `build_sft_examples`).
+
+Next: run the generator on the GPU box, eyeball style density on the JSONL, then
+train Llama-3.2-1B/3B on it (NO `--uppercase-response`) and verify with the infer
+sweep. Expect it to behave like the caps demo if every row is densely inverted.
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)
