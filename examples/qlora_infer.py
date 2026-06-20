@@ -40,7 +40,8 @@ def generate(model, tokenizer, prompt: str, max_new_tokens: int) -> str:
     model.config.use_cache = True
     with torch.inference_mode():
         out = model.generate(
-            input_ids=input_ids, max_new_tokens=max_new_tokens,
+            input_ids=input_ids, attention_mask=torch.ones_like(input_ids),
+            max_new_tokens=max_new_tokens,
             do_sample=True, top_p=0.9, temperature=0.8,
             pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
         )
@@ -66,7 +67,7 @@ def main():
 
     # --- BASE ---
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, device_map="cuda", torch_dtype=torch.bfloat16)
+        args.model, device_map="cuda", dtype=torch.float16)
     model.eval()
     print("=" * 70)
     print("BASE MODEL")
