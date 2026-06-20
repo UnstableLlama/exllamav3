@@ -162,6 +162,9 @@ def main():
     ap.add_argument("--sample-every", type=int, default=25,
                     help="Generate a sample completion every N steps (0 to disable)")
     ap.add_argument("--sample-prompt", default="Tell me about your day.")
+    ap.add_argument("--save-every", type=int, default=0,
+                    help="Checkpoint the adapter to --out every N steps (0 = only "
+                         "at the end). The adapter is also saved on Ctrl-C.")
     args = ap.parse_args()
 
     cdt = {"float32": torch.float32, "float16": torch.float16,
@@ -230,43 +233,59 @@ def main():
             return sum(w.lora_b.float().pow(2).sum() for w in net._wrappers
                        if w.r > 0).sqrt().item()
 
+    def save(tag):
+        # Always leave net in train mode after; saving touches the adapter only.
+        net.save_adapter(args.out, base_model_name_or_path=args.model)
+        print(f"{tag} Adapter written to {args.out}")
+
     bgen = batches()
     opt.zero_grad(set_to_none=True)
     ema = None
-    for step in range(1, args.steps + 1):
-        accum_loss = 0.0
-        for _ in range(args.grad_accum):
-            batch = next(bgen)
-            input_ids, labels, attn = collate(batch, pad_id)
-            loss = net.compute_loss(input_ids, labels, attention_mask=attn,
-                                    chunk=args.ce_chunk)
-            (loss / args.grad_accum).backward()
-            accum_loss += loss.item() / args.grad_accum
+    step = 0
+    try:
+        for step in range(1, args.steps + 1):
+            accum_loss = 0.0
+            for _ in range(args.grad_accum):
+                batch = next(bgen)
+                input_ids, labels, attn = collate(batch, pad_id)
+                loss = net.compute_loss(input_ids, labels, attention_mask=attn,
+                                        chunk=args.ce_chunk)
+                (loss / args.grad_accum).backward()
+                accum_loss += loss.item() / args.grad_accum
 
-        # grad norm BEFORE clipping is a direct check that gradients reach the
-        # adapters (a flat ~0 here would mean the backward graph is broken).
-        gnorm = torch.nn.utils.clip_grad_norm_(
-            net.lora_parameters(), args.max_grad_norm or float("inf")
-        ).item()
-        opt.step()
-        opt.zero_grad(set_to_none=True)
+            # grad norm BEFORE clipping is a direct check that gradients reach the
+            # adapters (a flat ~0 here would mean the backward graph is broken).
+            gnorm = torch.nn.utils.clip_grad_norm_(
+                net.lora_parameters(), args.max_grad_norm or float("inf")
+            ).item()
+            opt.step()
+            opt.zero_grad(set_to_none=True)
 
-        ema = accum_loss if ema is None else 0.9 * ema + 0.1 * accum_loss
-        print(f"  step {step:>5}/{args.steps} | loss {accum_loss:6.4f} | "
-              f"ema {ema:6.4f} | grad {gnorm:7.4f} | |B| {adapter_b_norm():7.3f}")
+            ema = accum_loss if ema is None else 0.9 * ema + 0.1 * accum_loss
+            print(f"  step {step:>5}/{args.steps} | loss {accum_loss:6.4f} | "
+                  f"ema {ema:6.4f} | grad {gnorm:7.4f} | |B| {adapter_b_norm():7.3f}")
 
-        if args.sample_every and step % args.sample_every == 0:
-            net.eval()
-            net.apply_to_native()          # make generation reflect the adapter
-            with torch.inference_mode():
-                txt = sample(model, cache, tokenizer, generator, args.sample_prompt)
-            net.remove_from_native()
-            net.train()
-            print(f"\n  \U0001f3ad  [step {step}] {args.sample_prompt}\n     -> {txt}\n")
+            if args.sample_every and step % args.sample_every == 0:
+                net.eval()
+                net.apply_to_native()      # make generation reflect the adapter
+                with torch.inference_mode():
+                    txt = sample(model, cache, tokenizer, generator, args.sample_prompt)
+                net.remove_from_native()
+                net.train()
+                print(f"\n  \U0001f3ad  [step {step}] {args.sample_prompt}\n     -> {txt}\n")
+
+            if args.save_every and step % args.save_every == 0:
+                save(f"[checkpoint step {step}]")
+    except KeyboardInterrupt:
+        # Stopping early at the loss plateau is a normal workflow; don't discard
+        # the adapter trained so far.
+        print(f"\nInterrupted at step {step}; saving adapter before exit.")
+        if step > 0:
+            save("[interrupted]")
+        raise SystemExit(0)
 
     # 6. Save adapter (PEFT format; loadable by exllamav3.model.lora.LoRA).
-    net.save_adapter(args.out, base_model_name_or_path=args.model)
-    print(f"Done. Adapter written to {args.out}")
+    save("Done.")
     print("Verify with: python examples/qlora_infer_native.py "
           f"--model {args.model} --adapter {args.out}")
 
