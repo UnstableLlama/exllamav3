@@ -251,7 +251,7 @@ def main():
         outs = generator.generate(
             prompt=prompts, max_new_tokens=args.max_new_tokens,
             sampler=sampler, seed=args.seed, add_bos=False,
-            completion_only=True, stop_conditions=stop, min_new_tokens=4,
+            completion_only=True, stop_conditions=stop,
         )
         if isinstance(outs, str):  # single-item safety
             outs = [outs]
