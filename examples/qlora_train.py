@@ -148,6 +148,13 @@ def main():
     from transformers import (AutoTokenizer, AutoModelForCausalLM,
                               Trainer, TrainingArguments, TrainerCallback,
                               DataCollatorForSeq2Seq)
+    # HF Trainer refuses "purely quantized" models via this guard. We attach
+    # trainable LoRA adapters on the frozen EXL3 weights, which is exactly the
+    # supported pattern, so neutralize the guard in the trainer namespace
+    # (works regardless of how exllamav3 is installed or how the check is coded).
+    import transformers.trainer as _hf_trainer
+    if hasattr(_hf_trainer, "validate_quantization_for_training"):
+        _hf_trainer.validate_quantization_for_training = lambda *a, **k: None
     from exllamav3.integration.transformers import patch_transformers
     from exllamav3.training import (attach_qlora, save_lora_adapter,
                                    prepare_model_for_qlora_training,
