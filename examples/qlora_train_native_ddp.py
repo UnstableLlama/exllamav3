@@ -82,6 +82,9 @@ def main():
     ap.add_argument("--response-key", default="output")
     ap.add_argument("--no-clean-text", action="store_true")
     ap.add_argument("--min-response-words", type=int, default=3)
+    ap.add_argument("--uppercase-response", action="store_true",
+                    help="Smoke test: train to RESPOND IN ALL CAPS (dense, "
+                         "unambiguous proof the training path works).")
     ap.add_argument("--max-samples", type=int, default=0)
     ap.add_argument("--seq-len", type=int, default=512)
     ap.add_argument("--targets", nargs="*", default=None)
@@ -141,6 +144,7 @@ def main():
         response_key=args.response_key, split=args.dataset_split,
         clean_text=not args.no_clean_text,
         min_response_words=args.min_response_words,
+        uppercase_response=args.uppercase_response,
     )
     shard = examples[rank::world_size]
     assert shard, "no training examples on this rank"
