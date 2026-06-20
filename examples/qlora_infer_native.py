@@ -17,10 +17,14 @@ from exllamav3 import Config, Model, Cache, Tokenizer, Generator
 from exllamav3.model.lora import LoRA
 
 
+# Content-rich prompts: the arrr-generated dataset converts words like
+# the->th', is/are->be, you->ye, my->me, so prompts that elicit longer, plain
+# expository answers surface the learned style better than meta/refusal prompts.
 PROMPTS = [
-    "Tell me about your morning.",
-    "What is the best way to learn programming?",
-    "Describe the weather today.",
+    "Explain how the water cycle works.",
+    "Describe what a typical day on a sailing ship is like.",
+    "Tell me a short story about a treasure hunt.",
+    "What is the best way to cook a fish?",
 ]
 
 
@@ -35,9 +39,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--adapter", required=True)
-    ap.add_argument("--max-new-tokens", type=int, default=80)
-    ap.add_argument("--lora-scaling", type=float, default=1.0)
+    ap.add_argument("--max-new-tokens", type=int, default=120)
+    ap.add_argument("--lora-scaling", type=float, default=1.0,
+                    help="Extra multiplier on the adapter (on top of alpha/r). "
+                         ">1 amplifies the learned style to make a subtle adapter visible.")
+    ap.add_argument("--prompts", nargs="*", default=None,
+                    help="Custom prompts (default: a content-rich built-in set)")
     args = ap.parse_args()
+
+    prompts = args.prompts or PROMPTS
 
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
@@ -50,7 +60,7 @@ def main():
         print("=" * 70)
         print(label)
         print("=" * 70)
-        for p in PROMPTS:
+        for p in prompts:
             resp = generator.generate(
                 prompt=llama3_prompt(p),
                 max_new_tokens=args.max_new_tokens,
