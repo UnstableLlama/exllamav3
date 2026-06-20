@@ -104,7 +104,8 @@ def _sample(model, tokenizer, prompt: str, max_new_tokens: int = 48) -> str:
             ids = tokenizer(f"### Instruction:\n{prompt}\n\n### Response:\n",
                             return_tensors="pt").input_ids.to(model.device)
         out = model.generate(
-            input_ids=ids, max_new_tokens=max_new_tokens, do_sample=True,
+            input_ids=ids, attention_mask=torch.ones_like(ids),
+            max_new_tokens=max_new_tokens, do_sample=True,
             top_p=0.9, temperature=0.8,
             pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
         )
@@ -153,9 +154,12 @@ def main():
                                    qlora_causal_lm_loss)
 
     # 1. Register the EXL3 quantizer with Transformers and load the model.
+    #    EXL3 reconstruction and kernels are fp16-native; loading/computing in
+    #    fp16 (not bf16) keeps the dequantized weights faithful.
     patch_transformers()
+    compute_dtype = torch.float16
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, device_map="cuda", torch_dtype=torch.bfloat16,
+        args.model, device_map="cuda", dtype=compute_dtype,
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token is None:
@@ -164,7 +168,7 @@ def main():
     # 2. Attach trainable LoRA adapters; freeze everything else.
     attach_qlora(
         model, r=args.r, alpha=args.alpha, target_modules=args.targets,
-        compute_dtype=torch.bfloat16,
+        compute_dtype=compute_dtype,
     )
 
     # 3. Memory: gradient checkpointing (+ input-grad hook, use_cache off).
@@ -229,7 +233,7 @@ def main():
         logging_steps=1,
         logging_first_step=True,
         disable_tqdm=False,        # keep the progress bar + ETA
-        bf16=True,
+        fp16=True,
         report_to=[],
         save_strategy="no",
         gradient_checkpointing=False,  # already enabled via prepare_* above

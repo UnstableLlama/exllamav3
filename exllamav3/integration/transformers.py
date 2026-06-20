@@ -257,7 +257,10 @@ class Exl3HfQuantizer(HfQuantizer):
 
     @property
     def is_trainable(self, model = None):
-        return False
+        # Training is supported by attaching LoRA adapters on top of the frozen
+        # EXL3 weights (see exllamav3.training.attach_qlora). Reporting True lets
+        # HF Trainer's validate_quantization_for_training pass.
+        return True
 
     def is_serializable(self, safe_serialization = None):
         return False
