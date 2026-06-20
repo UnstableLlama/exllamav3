@@ -15,6 +15,7 @@ Usage:
 import argparse
 from exllamav3 import Config, Model, Cache, Tokenizer, Generator
 from exllamav3.model.lora import LoRA
+from exllamav3.generator.sampler import ComboSampler
 
 
 # General everyday prompts: a style adapter is most convincing on plain,
@@ -45,9 +46,23 @@ def main():
                          ">1 amplifies the learned style to make a subtle adapter visible.")
     ap.add_argument("--prompts", nargs="*", default=None,
                     help="Custom prompts (default: a content-rich built-in set)")
+    # Sampling. The library default is temp 0.8 + min_p 0.08, which truncates the
+    # low-probability tail -- if a style's markers are sparse/rare, they get cut.
+    # Raise --temperature and set --min-p 0 to test whether the style is in the
+    # tail (vs not learned). --temperature 0 = greedy/argmax.
+    ap.add_argument("--temperature", type=float, default=0.8)
+    ap.add_argument("--min-p", type=float, default=0.08)
+    ap.add_argument("--top-p", type=float, default=1.0)
+    ap.add_argument("--top-k", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=None,
+                    help="Sampling seed for reproducible before/after comparison")
     args = ap.parse_args()
 
     prompts = args.prompts or PROMPTS
+    sampler = ComboSampler(
+        temperature=args.temperature, min_p=args.min_p,
+        top_p=args.top_p, top_k=args.top_k,
+    )
 
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
@@ -64,6 +79,8 @@ def main():
             resp = generator.generate(
                 prompt=llama3_prompt(p),
                 max_new_tokens=args.max_new_tokens,
+                sampler=sampler,
+                seed=args.seed,
                 add_bos=False,
                 completion_only=True,
             )
