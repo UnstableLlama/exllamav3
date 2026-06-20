@@ -62,23 +62,23 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len):
 
         # default_chat_prompt() already includes <|begin_of_text|> and ends with
         # the assistant header, so encode specials and don't add another BOS.
+        # Tokenize the prompt and the response SEPARATELY and concatenate, so the
+        # prompt/response boundary is exact -- masking by the prompt-string length
+        # is vulnerable to tokenizer boundary merges that mis-align the mask.
         prompt_text = model.default_chat_prompt(user)
-        full_text = prompt_text + resp + EOT
-
         prompt_ids = tokenizer.encode(
             prompt_text, add_bos=False, encode_special_tokens=True
         )[0].tolist()
-        full_ids = tokenizer.encode(
-            full_text, add_bos=False, encode_special_tokens=True
+        resp_ids = tokenizer.encode(
+            resp + EOT, add_bos=False, encode_special_tokens=True
         )[0].tolist()
 
-        full_ids = full_ids[:seq_len]
-        labels = list(full_ids)
-        for i in range(min(len(prompt_ids), len(full_ids))):
-            labels[i] = -100
+        input_ids = (prompt_ids + resp_ids)[:seq_len]
+        labels = [-100] * len(prompt_ids) + list(resp_ids)
+        labels = labels[:seq_len]
         if all(l == -100 for l in labels):
             continue  # response got truncated away; skip
-        examples.append({"input_ids": full_ids, "labels": labels})
+        examples.append({"input_ids": input_ids, "labels": labels})
 
     return examples
 
@@ -118,8 +118,10 @@ def main():
     ap.add_argument("--r", type=int, default=16)
     ap.add_argument("--alpha", type=float, default=32.0)
     ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--steps", type=int, default=200)
-    ap.add_argument("--batch", type=int, default=2)
+    ap.add_argument("--steps", type=int, default=1000,
+                    help="Training steps. ~steps*batch examples seen; aim for >=1 "
+                         "epoch (dataset_size/batch) to pick up a strong style.")
+    ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--grad-accum", type=int, default=1)
     ap.add_argument("--dataset", default="TeeZee/dolly-15k-pirate-speech")
     ap.add_argument("--max-samples", type=int, default=4000)
