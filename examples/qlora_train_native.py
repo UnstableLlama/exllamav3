@@ -142,6 +142,15 @@ def main():
     # 1. Load native model + tokenizer (the forward that's correct on EXL3).
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
+
+    # The KV cache must be created BEFORE model.load() so each attention layer
+    # allocates its cache during loading; otherwise generation asserts on a
+    # missing k_cache. Only needed for the live samples.
+    cache = None
+    if args.sample_every:
+        from exllamav3 import Cache
+        cache = Cache(model, max_num_tokens=4096)
+
     model.load(device=args.device, progressbar=True)
     tokenizer = Tokenizer.from_config(config)
     pad_id = tokenizer.pad_token_id
@@ -163,11 +172,11 @@ def main():
     print(f" -- {len(examples)} SFT examples")
     assert examples, "no usable training examples"
 
-    # 4. Optional generator for live samples (KV-cache inference path).
-    generator = cache = None
+    # 4. Optional generator for live samples (KV-cache inference path). The cache
+    #    was allocated before load() above.
+    generator = None
     if args.sample_every:
-        from exllamav3 import Cache, Generator
-        cache = Cache(model, max_num_tokens=4096)
+        from exllamav3 import Generator
         generator = Generator(model=model, cache=cache, tokenizer=tokenizer)
         net.eval()
         with torch.inference_mode():
