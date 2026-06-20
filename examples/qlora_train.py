@@ -161,10 +161,10 @@ def main():
                                    qlora_causal_lm_loss)
 
     # 1. Register the EXL3 quantizer with Transformers and load the model.
-    #    EXL3 reconstruction and kernels are fp16-native; loading/computing in
-    #    fp16 (not bf16) keeps the dequantized weights faithful.
+    #    bf16 compute avoids the fp16 GradScaler entirely (adapters are fp32
+    #    master weights regardless). Per-layer error vs the EXL3 kernel is tiny.
     patch_transformers()
-    compute_dtype = torch.float16
+    compute_dtype = torch.bfloat16
     model = AutoModelForCausalLM.from_pretrained(
         args.model, device_map="cuda", dtype=compute_dtype,
     )
@@ -240,7 +240,7 @@ def main():
         logging_steps=1,
         logging_first_step=True,
         disable_tqdm=False,        # keep the progress bar + ETA
-        fp16=True,
+        bf16=True,
         report_to=[],
         save_strategy="no",
         gradient_checkpointing=False,  # already enabled via prepare_* above

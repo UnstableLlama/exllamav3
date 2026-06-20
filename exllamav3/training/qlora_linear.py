@@ -112,9 +112,14 @@ class EXL3LoRAFunction(torch.autograd.Function):
 
         y = x @ weight
         if lora_a is not None and lora_b is not None:
-            y = y + scale * ((x @ lora_a) @ lora_b)
+            # Adapters are kept as fp32 master weights but the matmul runs in
+            # the compute dtype (bf16/fp16); cast for the product. (A no-op when
+            # everything is already the same dtype, e.g. float64 gradcheck.)
+            a = lora_a.to(x.dtype)
+            b = lora_b.to(x.dtype)
+            y = y + scale * ((x @ a) @ b)
         if bias is not None:
-            y = y + bias
+            y = y + bias.to(y.dtype)
 
         # Deliberately do NOT save `weight`; recompute it in backward.
         ctx.save_for_backward(x, lora_a, lora_b)
@@ -141,16 +146,18 @@ class EXL3LoRAFunction(torch.autograd.Function):
 
         if lora_a is not None and lora_b is not None:
             # y_lora = scale * (x @ A) @ B
-            # let P = x @ A  -> [N, r]
-            #     g_B = grad_y @ B^T -> [N, r]
-            g_through_b = gf @ lora_b.transpose(-1, -2)          # [N, r]
+            # Math in the grad/compute dtype; grads cast back to the adapter's
+            # (fp32 master) dtype before returning.
+            a = lora_a.to(gf.dtype)
+            b = lora_b.to(gf.dtype)
+            g_through_b = gf @ b.transpose(-1, -2)               # [N, r]
             # contribution of LoRA branch to grad_x
-            grad_x = grad_x + scale * (g_through_b @ lora_a.transpose(-1, -2)).view_as(grad_x)
+            grad_x = grad_x + scale * (g_through_b @ a.transpose(-1, -2)).view_as(grad_x)
             if ctx.needs_input_grad[1]:
-                grad_a = scale * (xf.transpose(-1, -2) @ g_through_b)   # [in, r]
+                grad_a = (scale * (xf.transpose(-1, -2) @ g_through_b)).to(lora_a.dtype)
             if ctx.needs_input_grad[2]:
-                p = xf @ lora_a                                          # [N, r]
-                grad_b = scale * (p.transpose(-1, -2) @ gf)             # [r, out]
+                p = xf @ a                                        # [N, r]
+                grad_b = (scale * (p.transpose(-1, -2) @ gf)).to(lora_b.dtype)
 
         if ctx.has_bias and ctx.needs_input_grad[3]:
             grad_bias = gf.sum(dim=0)

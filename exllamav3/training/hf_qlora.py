@@ -79,9 +79,12 @@ class Exl3LoRALinear(nn.Module):
         self.compute_dtype = compute_dtype
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else None
 
+        # Adapters are fp32 master weights (compute happens in compute_dtype via
+        # casting inside EXL3LoRAFunction). fp32 params keep the optimizer stable
+        # and satisfy the fp16 GradScaler, which refuses to unscale fp16 grads.
         dev = self._infer_device()
-        self.lora_a = nn.Parameter(torch.empty(self.in_features, r, dtype=compute_dtype, device=dev))
-        self.lora_b = nn.Parameter(torch.zeros(r, self.out_features, dtype=compute_dtype, device=dev))
+        self.lora_a = nn.Parameter(torch.empty(self.in_features, r, dtype=torch.float32, device=dev))
+        self.lora_b = nn.Parameter(torch.zeros(r, self.out_features, dtype=torch.float32, device=dev))
         nn.init.kaiming_uniform_(self.lora_a, a=5 ** 0.5)
 
         # Freeze everything in the base.
