@@ -83,9 +83,19 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
 
     Returns a list of dicts with python int lists: input_ids / labels.
     """
+    import os
     from datasets import load_dataset
 
-    ds = load_dataset(dataset_name, split=split)
+    # Accept either a Hub dataset id or a local file (e.g. a styled set produced
+    # by examples/make_style_dataset.py). load_dataset() can't sniff a bare local
+    # path, so pick the builder from the extension when the path exists.
+    if os.path.exists(dataset_name):
+        ext = os.path.splitext(dataset_name)[1].lower()
+        builder = {".json": "json", ".jsonl": "json",
+                   ".parquet": "parquet", ".csv": "csv"}.get(ext, "json")
+        ds = load_dataset(builder, data_files=dataset_name, split=split)
+    else:
+        ds = load_dataset(dataset_name, split=split)
     if max_samples and max_samples < len(ds):
         ds = ds.shuffle(seed=0).select(range(max_samples))
 
