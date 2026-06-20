@@ -32,6 +32,12 @@ from .fused_ce import (
     fused_linear_cross_entropy,
     DEFAULT_CHUNK,
 )
+# native_llama imports exllamav3.modules lazily (inside __init__), so importing
+# the symbols here does not pull in the CUDA extension at package import time.
+from .native_llama import (
+    NativeLlamaQLoRA,
+    DiffLinear,
+)
 
 __all__ = [
     "EXL3LoRAFunction",
@@ -49,4 +55,6 @@ __all__ = [
     "FusedLinearCrossEntropy",
     "fused_linear_cross_entropy",
     "DEFAULT_CHUNK",
+    "NativeLlamaQLoRA",
+    "DiffLinear",
 ]

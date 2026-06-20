@@ -1,0 +1,291 @@
+"""
+CPU tests for the transformers-free differentiable Llama forward
+(``exllamav3/training/native_llama.py``).
+
+No GPU, no compiled extension, no transformers, no real model: this loads the
+training modules under a synthetic package (so their relative imports resolve
+without importing the full exllamav3 package, which would build the CUDA ext),
+mocks the EXL3 linears as frozen random weights, and checks:
+
+  * ``DiffLinear`` reproduces ``x @ W + scale·x@A@B`` and gradchecks, with the
+    frozen base receiving no gradient;
+  * a single decoder block's forward matches an independent plain-torch
+    reference (RMSNorm + GQA/NeoX-RoPE attention + SwiGLU + residuals);
+  * backprop through the block + a fused-CE head reaches the LoRA adapters in
+    every projection while leaving the base weights untouched.
+
+Run:  python tests/test_native_llama.py
+"""
+
+from __future__ import annotations
+import os
+import sys
+import types
+import importlib.util
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_TRAIN_DIR = os.path.join(_ROOT, "exllamav3", "training")
+
+_pkg = types.ModuleType("exl3train")
+_pkg.__path__ = [_TRAIN_DIR]
+sys.modules["exl3train"] = _pkg
+
+
+def _load(name: str):
+    spec = importlib.util.spec_from_file_location(
+        f"exl3train.{name}", os.path.join(_TRAIN_DIR, f"{name}.py")
+    )
+    m = importlib.util.module_from_spec(spec)
+    sys.modules[f"exl3train.{name}"] = m
+    spec.loader.exec_module(m)
+    return m
+
+
+_qll = _load("qlora_linear")
+_fce = _load("fused_ce")
+_nl = _load("native_llama")
+DiffLinear = _nl.DiffLinear
+NativeLlamaQLoRA = _nl.NativeLlamaQLoRA
+_rotate_half_neox = _nl._rotate_half_neox
+fused_linear_cross_entropy = _fce.fused_linear_cross_entropy
+
+
+# ----------------------------------------------------------------------------
+# Mock EXL3 linear: a frozen random weight masquerading as a trellis layer.
+# ----------------------------------------------------------------------------
+class _MockInner:
+    def __init__(self, weight):
+        self._w = weight                 # [in, out], frozen
+        self.trellis = weight            # device inference
+        self.bias = None
+
+    def get_weight_tensor(self):
+        return self._w
+
+    def get_bias_tensor(self):
+        return None
+
+
+class MockLinear(nn.Module):
+    def __init__(self, in_features, out_features, key, scale=0.05, dtype=torch.float64):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.key = key
+        self.device = torch.device("cpu")
+        w = torch.randn(in_features, out_features, dtype=dtype) * scale
+        self.register_buffer("frozen_weight", w)
+        self.inner = _MockInner(self.frozen_weight)
+        self.lora_a_tensors = {}
+        self.lora_b_tensors = {}
+
+
+def _ns_norm(dim, dtype=torch.float64):
+    ns = types.SimpleNamespace()
+    ns.weight = nn.Parameter(1.0 + 0.02 * torch.randn(dim, dtype=dtype), requires_grad=False)
+    return ns
+
+
+# ----------------------------------------------------------------------------
+# Independent plain-torch reference for one Llama decoder block.
+# ----------------------------------------------------------------------------
+def _ref_rmsnorm(x, w, eps):
+    var = x.float().pow(2).mean(-1, keepdim=True) + eps
+    return (x.float() * torch.rsqrt(var)) * w.float()
+
+
+def _ref_rope(x, inv_freq, positions):
+    # x: [b,t,nh,hd]
+    freqs = positions.float().unsqueeze(-1) * inv_freq.float().view(1, 1, -1)
+    emb = torch.cat((freqs, freqs), -1)
+    cos = emb.cos().unsqueeze(2)
+    sin = emb.sin().unsqueeze(2)
+    half = x.shape[-1] // 2
+    rot = torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+    return x * cos + rot * sin
+
+
+def _ref_block(meta, weights, hidden, positions):
+    eps_a, eps_m = meta["attn_eps"], meta["mlp_eps"]
+    nq, nkv, hd = meta["num_q_heads"], meta["num_kv_heads"], meta["head_dim"]
+    sm = meta["sm_scale"]
+    inv_freq = meta["inv_freq"]
+    b, t, _ = hidden.shape
+
+    normed = _ref_rmsnorm(hidden, weights["attn_norm"], eps_a)
+    q = (normed @ weights["q"]).view(b, t, nq, hd)
+    k = (normed @ weights["k"]).view(b, t, nkv, hd)
+    v = (normed @ weights["v"]).view(b, t, nkv, hd)
+    q = _ref_rope(q, inv_freq, positions)
+    k = _ref_rope(k, inv_freq, positions)
+    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    rep = nq // nkv
+    k = k.repeat_interleave(rep, 1)
+    v = v.repeat_interleave(rep, 1)
+    scores = (q @ k.transpose(-1, -2)) * sm
+    mask = torch.triu(torch.full((t, t), float("-inf"), dtype=scores.dtype), 1)
+    scores = scores + mask
+    ctx = torch.softmax(scores, -1) @ v
+    ctx = ctx.transpose(1, 2).reshape(b, t, nq * hd)
+    hidden = hidden + ctx @ weights["o"]
+
+    normed2 = _ref_rmsnorm(hidden, weights["mlp_norm"], eps_m)
+    a = F.silu(normed2 @ weights["gate"]) * (normed2 @ weights["up"])
+    hidden = hidden + a @ weights["down"]
+    return hidden
+
+
+def _build_block(d, nq, nkv, hd, inter, dtype=torch.float64, r=0):
+    norm_a = _ns_norm(d, dtype)
+    norm_m = _ns_norm(d, dtype)
+    lins = {
+        "q": MockLinear(d, nq * hd, "blk.self_attn.q_proj", dtype=dtype),
+        "k": MockLinear(d, nkv * hd, "blk.self_attn.k_proj", dtype=dtype),
+        "v": MockLinear(d, nkv * hd, "blk.self_attn.v_proj", dtype=dtype),
+        "o": MockLinear(nq * hd, d, "blk.self_attn.o_proj", dtype=dtype),
+        "gate": MockLinear(d, inter, "blk.mlp.gate_proj", dtype=dtype),
+        "up": MockLinear(d, inter, "blk.mlp.up_proj", dtype=dtype),
+        "down": MockLinear(inter, d, "blk.mlp.down_proj", dtype=dtype),
+    }
+    entry = types.SimpleNamespace()
+    entry.attn_norm = norm_a
+    entry.mlp_norm = norm_m
+    entry.q_proj = DiffLinear(lins["q"], r=r, compute_dtype=dtype)
+    entry.k_proj = DiffLinear(lins["k"], r=r, compute_dtype=dtype)
+    entry.v_proj = DiffLinear(lins["v"], r=r, compute_dtype=dtype)
+    entry.o_proj = DiffLinear(lins["o"], r=r, compute_dtype=dtype)
+    entry.gates = [DiffLinear(lins["gate"], r=r, compute_dtype=dtype)]
+    entry.ups = [DiffLinear(lins["up"], r=r, compute_dtype=dtype)]
+    entry.downs = [DiffLinear(lins["down"], r=r, compute_dtype=dtype)]
+
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, hd, 2, dtype=dtype) / hd))
+    meta = {
+        "num_q_heads": nq, "num_kv_heads": nkv, "head_dim": hd,
+        "sm_scale": hd ** -0.5, "attn_eps": 1e-5, "mlp_eps": 1e-5,
+        "inv_freq": inv_freq, "attn_factor": 1.0,
+    }
+    ref_weights = {
+        "attn_norm": norm_a.weight, "mlp_norm": norm_m.weight,
+        "q": lins["q"].frozen_weight, "k": lins["k"].frozen_weight,
+        "v": lins["v"].frozen_weight, "o": lins["o"].frozen_weight,
+        "gate": lins["gate"].frozen_weight, "up": lins["up"].frozen_weight,
+        "down": lins["down"].frozen_weight,
+    }
+    return entry, meta, ref_weights, lins
+
+
+def _headless_net():
+    # We only need the bound helper methods (_rmsnorm/_apply_rope/_attn_bias/
+    # _block_forward); none touch construction-time state.
+    return NativeLlamaQLoRA.__new__(NativeLlamaQLoRA)
+
+
+def test_difflinear_matches_reference_and_gradchecks():
+    torch.manual_seed(0)
+    d_in, d_out, r = 6, 8, 3
+    lin = MockLinear(d_in, d_out, "x", dtype=torch.float64)
+    dl = DiffLinear(lin, r=r, alpha=2.0 * r, compute_dtype=torch.float64)
+    with torch.no_grad():
+        dl.lora_b.copy_(torch.randn(r, d_out, dtype=torch.float64) * 0.1)
+
+    x = torch.randn(4, d_in, dtype=torch.float64)
+    y = dl(x)
+    # Adapters are fp32 master weights; EXL3LoRAFunction casts them to the input
+    # dtype internally, so the fp64 reference casts them to double too.
+    a64 = dl.lora_a.detach().double()
+    b64 = dl.lora_b.detach().double()
+    ref = x @ lin.frozen_weight + dl.scale * (x @ a64 @ b64)
+    assert torch.allclose(y, ref, atol=1e-10), "DiffLinear forward mismatch"
+
+    # gradcheck wrt input and adapters (all fp64 for numerical stability); the
+    # base weight is a constant supplied through the weight_fn closure.
+    def f(x_, a_, b_):
+        return _qll.EXL3LoRAFunction.apply(
+            x_, a_, b_, None, dl.scale, lambda: lin.frozen_weight
+        )
+    a = a64.clone().requires_grad_(True)
+    b = b64.clone().requires_grad_(True)
+    xin = x.detach().clone().requires_grad_(True)
+    assert torch.autograd.gradcheck(f, (xin, a, b), eps=1e-6, atol=1e-6)
+    print("[difflinear] forward matches reference + gradcheck PASSED")
+
+
+def test_block_matches_reference():
+    torch.manual_seed(1)
+    # The residual stream runs in fp32 (the block promotes via .float()), so the
+    # whole block is an fp32 computation; compare against the fp32 reference.
+    d, nq, nkv, hd, inter = 16, 4, 2, 8, 32
+    entry, meta, refw, lins = _build_block(d, nq, nkv, hd, inter, dtype=torch.float32, r=0)
+    net = _headless_net()
+
+    b, t = 2, 5
+    hidden = torch.randn(b, t, d, dtype=torch.float32)
+    positions = torch.arange(t).unsqueeze(0).expand(b, t)
+    attn_bias = net._attn_bias(None, t, hidden.device, torch.float32)
+
+    out = net._block_forward(meta, entry, hidden, positions, attn_bias)
+    ref = _ref_block(meta, refw, hidden, positions)
+    err = (out - ref).abs().max().item()
+    assert err < 1e-4, f"block forward mismatch vs reference: max|Δ|={err}"
+    print(f"[block] forward matches plain-torch reference (max|Δ|={err:.2e}) PASSED")
+
+
+def test_block_backward_reaches_adapters_only():
+    torch.manual_seed(2)
+    d, nq, nkv, hd, inter, r = 16, 4, 2, 8, 32, 4
+    entry, meta, refw, lins = _build_block(d, nq, nkv, hd, inter, dtype=torch.float32, r=r)
+    net = _headless_net()
+
+    # B inits to zero (no-op adapter), which makes grad_A exactly zero on the
+    # first step; give B a nonzero value so grad flow into A is exercised too.
+    adapters_all = [entry.q_proj, entry.k_proj, entry.v_proj, entry.o_proj,
+                    entry.gates[0], entry.ups[0], entry.downs[0]]
+    with torch.no_grad():
+        for adp in adapters_all:
+            adp.lora_b.copy_(torch.randn_like(adp.lora_b) * 0.1)
+
+    # Snapshot frozen base weights.
+    base0 = {k: v.frozen_weight.clone() for k, v in lins.items()}
+
+    b, t, V = 2, 6, 20
+    hidden = torch.randn(b, t, d, dtype=torch.float32, requires_grad=True)
+    positions = torch.arange(t).unsqueeze(0).expand(b, t)
+    attn_bias = net._attn_bias(None, t, hidden.device, torch.float32)
+
+    head = torch.randn(d, V, dtype=torch.float32)        # frozen LM head
+    labels = torch.randint(0, V, (b, t))
+
+    out = net._block_forward(meta, entry, hidden, positions, attn_bias)
+    loss = fused_linear_cross_entropy(out, lambda: head, labels, chunk=8, shift=True)
+    loss.backward()
+
+    # Every adapter must have received a gradient (signal flows through rope,
+    # attention, GQA repeat, softmax, SwiGLU and both residual joins).
+    adapters = [entry.q_proj, entry.k_proj, entry.v_proj, entry.o_proj,
+                entry.gates[0], entry.ups[0], entry.downs[0]]
+    for adp in adapters:
+        assert adp.lora_a.grad is not None and adp.lora_a.grad.abs().sum() > 0, \
+            f"no grad into lora_a of {adp.key}"
+        assert adp.lora_b.grad is not None, f"no grad into lora_b of {adp.key}"
+    assert hidden.grad is not None and hidden.grad.abs().sum() > 0, "no grad into input"
+
+    # Optimiser step must not touch the frozen base.
+    opt = torch.optim.SGD([p for a in adapters for p in (a.lora_a, a.lora_b)], lr=0.1)
+    opt.step()
+    for k, v in lins.items():
+        assert torch.equal(v.frozen_weight, base0[k]), f"frozen base {k} changed!"
+    print("[block] backward reaches all adapters, base stays frozen PASSED")
+
+
+def main():
+    test_difflinear_matches_reference_and_gradchecks()
+    test_block_matches_reference()
+    test_block_backward_reaches_adapters_only()
+    print("\nAll native-Llama differentiable-forward checks passed.")
+
+
+if __name__ == "__main__":
+    main()
