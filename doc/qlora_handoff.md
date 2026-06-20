@@ -7,6 +7,75 @@
 
 ---
 
+## 0. UPDATE — transformers-free native path implemented (option 2)
+
+> Added on branch `claude/determined-gauss-suq9gx`.
+
+Rather than keep fighting the transformers-5.x RoPE bug (§4–5 below), the
+**fallback option 2 (§6) is now built**: a self-contained, autograd-friendly
+Llama forward on exllamav3's *own* loaded weights — **no `transformers` import in
+the training path at all**, so it cannot be broken by an upstream version bump.
+This is now the recommended path.
+
+**New code (all CUDA-free to import; pure torch):**
+- `exllamav3/training/native_llama.py`
+  - `NativeLlamaQLoRA(model, r, alpha, target_modules, compute_dtype, …)` —
+    builds a differentiable Llama decoder (RMSNorm + GQA/NeoX-RoPE attention +
+    SwiGLU + residuals) directly over a **loaded native `exllamav3.Model`**. It
+    reuses the exact RoPE table (`attn.rope.inv_freq`), norms, and `sm_scale`
+    the correct native inference forward uses. Frozen base weights are
+    reconstructed on the fly via `get_weight_tensor()`; only LoRA `a`/`b` (fp32)
+    train, routed through the gradchecked `EXL3LoRAFunction`. Head loss via the
+    streaming `fused_linear_cross_entropy` (no `[tokens, vocab]` logits).
+    `.compute_loss()`, `.logits()`, `.save_adapter()` (PEFT format),
+    `.apply_to_native()/.remove_from_native()` (so generation reflects the
+    adapter mid-train). Unsupported features (q/k-norm, sliding window,
+    softcapping, MoE, gating, partial/mRoPE, non-NeoX) are rejected loudly.
+  - `DiffLinear` — differentiable frozen-base + optional-LoRA linear.
+- `examples/qlora_validate_native.py` — **the correctness gate.** Compares the
+  differentiable forward's logits against the native (correct) forward,
+  per-prompt: top-1 token agreement, per-position argmax agreement, last-token
+  `max|Δ|` / cosine. Run this FIRST.
+- `examples/qlora_train_native.py` — plain PyTorch training loop (no HF Trainer /
+  transformers / accelerate; just `pip install datasets`). Pirate SFT,
+  completion-only masking via the native Llama-3 chat template, fused-CE,
+  gradient checkpointing, live native samples.
+- `tests/test_native_llama.py` — CPU tests (torch only): `DiffLinear` matches
+  reference + gradcheck; one decoder block matches an independent plain-torch
+  reference to <1e-4; backward reaches every adapter while the base stays
+  frozen. (Other CPU tests in §3 still apply.)
+
+**Workflow (on the GPU box, any transformers version or none):**
+```
+# 1. PROVE the forward is correct (no training):
+python examples/qlora_validate_native.py --model /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/
+#    Expect: PASS, "The capital of France is" -> ' Paris', high argmax agreement.
+
+# 2. TRAIN (transformers-free):
+python examples/qlora_train_native.py \
+    --model /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/ \
+    --out   /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/pirate2
+#    Expect: first loss ~2-4 and dropping; live samples turn piratey.
+
+# 3. VERIFY on the native inference path (already worked before):
+python examples/qlora_infer_native.py \
+    --model /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/ \
+    --adapter /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/pirate2
+```
+
+**Status / what still needs the GPU:** the code is written and CPU-syntax/unit
+checked, but the **end-to-end run on the real EXL3 model has not been executed**
+(the authoring container has no GPU/weights). Step 1 (`validate_native`) is the
+gate: if top-1 matches native, the differentiable backbone is sound and training
+is meaningful. If validation shows a mismatch, the most likely suspects are (a)
+the RMSNorm cast order vs the native CUDA kernel, or (b) a RoPE layout detail —
+diff `NativeLlamaQLoRA._block_forward` per-layer hidden states against the native
+forward (the §5 Step-1 probe pattern) to localize. The §4–5 transformers-5.x
+investigation below is now **optional** (only needed if someone specifically
+wants the HF-Trainer path); the native path supersedes it.
+
+---
+
 ## 1. TL;DR status
 
 - **The QLoRA-on-EXL3 mechanism is built and verified.** Differentiable EXL3
