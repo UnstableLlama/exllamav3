@@ -17,19 +17,21 @@ Usage:
         --model /path/to/exl3_model \
         --out   out/exl3_qlora_adapter
 
-Defaults fine-tune on a Shakespeare style-transfer set (Roudranil/
-shakespearean-and-modern-english-conversational-dataset): a modern-English
-line in, the original Early-Modern-English play line out. The style is strong
-and consistent, so an assistant trained on it answers everyday questions in
-florid Shakespearean -- the before/after is unmistakable at scale 1.0.
+Defaults fine-tune on superdrew100/UwU_Alpaca_data: the Alpaca-cleaned
+instruction set with every answer rewritten in over-the-top "UwU" furry speak
+(caps, emoji, "OwO", "*twitches whiskers*"). Because it keeps Alpaca's clean
+question->on-topic-answer structure, the model stays coherent while the style
+is unmistakable at scale 1.0 -- unlike play-script style sets, whose responses
+are tangential monologues that teach the model to ramble. (Note: the persona
+has mild PG-13 innuendo in places.)
 
 The data loader is dataset-agnostic: it reads instruction / context / response
 columns whose names are configurable via --instruction-key / --context-key /
---response-key, so swapping in another instruction set (e.g. the older
-TeeZee/dolly-15k-pirate-speech, which uses instruction/context/response) needs
-no code change. Validate first with examples/qlora_validate_native.py, then
-check the trained adapter with examples/qlora_infer_native.py -- both are also
-transformers-free.
+--response-key, so swapping in another instruction set (e.g. Dolly-schema
+TeeZee/dolly-15k-pirate-speech via --instruction-key instruction --context-key
+context --response-key response) needs no code change. Validate first with
+examples/qlora_validate_native.py, then check the trained adapter with
+examples/qlora_infer_native.py -- both are also transformers-free.
 
 The adapter is saved in PEFT format, loadable by exllamav3.model.lora.LoRA
 (and by PEFT).
@@ -163,16 +165,18 @@ def main():
     ap.add_argument("--grad-accum", type=int, default=1)
     ap.add_argument(
         "--dataset",
-        default="Roudranil/shakespearean-and-modern-english-conversational-dataset",
-        help="HF dataset id. Default is a Shakespeare style-transfer set.",
+        default="superdrew100/UwU_Alpaca_data",
+        help="HF dataset id. Default is the UwU-furry Alpaca style set.",
     )
     ap.add_argument("--dataset-split", default="train")
-    ap.add_argument("--instruction-key", default="translated_dialog",
-                    help="Column holding the prompt/instruction (Dolly: 'instruction')")
-    ap.add_argument("--context-key", default="context",
-                    help="Optional extra-context column; absent columns are ignored")
-    ap.add_argument("--response-key", default="og_response",
-                    help="Column holding the target response (Dolly: 'response')")
+    ap.add_argument("--instruction-key", default="instruction",
+                    help="Column holding the prompt/instruction")
+    ap.add_argument("--context-key", default="input",
+                    help="Optional extra-context column; absent columns are ignored "
+                         "(Alpaca uses 'input', Dolly uses 'context')")
+    ap.add_argument("--response-key", default="output",
+                    help="Column holding the target response (Alpaca: 'output', "
+                         "Dolly: 'response')")
     ap.add_argument("--no-clean-text", action="store_true",
                     help="Disable stripping of [stage directions]/*actions* and "
                          "whitespace normalization (on by default; helps play-script "
