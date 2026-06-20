@@ -194,8 +194,14 @@ def main():
             for i in range(0, len(order) - args.batch + 1, args.batch):
                 yield [examples[j] for j in order[i:i + args.batch]]
 
+    def adapter_b_norm():
+        with torch.no_grad():
+            return sum(w.lora_b.float().pow(2).sum() for w in net._wrappers
+                       if w.r > 0).sqrt().item()
+
     bgen = batches()
     opt.zero_grad(set_to_none=True)
+    ema = None
     for step in range(1, args.steps + 1):
         accum_loss = 0.0
         for _ in range(args.grad_accum):
@@ -206,12 +212,17 @@ def main():
             (loss / args.grad_accum).backward()
             accum_loss += loss.item() / args.grad_accum
 
-        if args.max_grad_norm:
-            torch.nn.utils.clip_grad_norm_(net.lora_parameters(), args.max_grad_norm)
+        # grad norm BEFORE clipping is a direct check that gradients reach the
+        # adapters (a flat ~0 here would mean the backward graph is broken).
+        gnorm = torch.nn.utils.clip_grad_norm_(
+            net.lora_parameters(), args.max_grad_norm or float("inf")
+        ).item()
         opt.step()
         opt.zero_grad(set_to_none=True)
 
-        print(f"  step {step:>5}/{args.steps} | loss {accum_loss:.4f}")
+        ema = accum_loss if ema is None else 0.9 * ema + 0.1 * accum_loss
+        print(f"  step {step:>5}/{args.steps} | loss {accum_loss:6.4f} | "
+              f"ema {ema:6.4f} | grad {gnorm:7.4f} | |B| {adapter_b_norm():7.3f}")
 
         if args.sample_every and step % args.sample_every == 0:
             net.eval()
