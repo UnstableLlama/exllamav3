@@ -120,42 +120,62 @@ must be allocated before `model.load()`; exact prompt/response label masking. Th
 
 ---
 
-## 0c. Next run — stronger funny dataset (Shakespeare) + higher rank
+## 0c. Dataset iteration — what works for a strong, coherent style
 
-> Branch `claude/zen-franklin-g5hedw`.
+> Branch `claude/zen-franklin-g5hedw`. Several runs on Llama-3.2-1B 4bpw.
 
-The pirate demo's only weakness was the *dataset* (light, inconsistent `arrr`
-substitutions; §0 caveat). Swapped the default in `examples/qlora_train_native.py`
-to a **strong, consistent comedic style**:
+**The lesson:** for a visible style adapter, *dataset structure matters more than
+rank or steps*. What works is **clean instruction→on-topic-answer Q&A with a
+strong, consistent style** (like pirate, but stronger). What fails is
+**play-script / dialogue-pair data**, whose responses are tangential monologues
+with stage directions.
 
-- **Dataset:** `Roudranil/shakespearean-and-modern-english-conversational-dataset`
-  (CC, ~5.3K train pairs). Modern-English line → original Early-Modern-English
-  play line. Mapped `translated_dialog → instruction`, `og_response → response`
-  (no `context`). An assistant trained on it answers everyday questions in florid
-  Shakespearean — funny and unmistakable, expected to land at `--lora-scaling 1.0`
-  (no cranking needed, unlike pirate).
-- **Loader is now dataset-agnostic:** `build_sft_examples` takes
-  `--instruction-key / --context-key / --response-key` (+ `--dataset-split`).
-  Defaults match the Shakespeare columns; for the old pirate set pass
-  `--dataset TeeZee/dolly-15k-pirate-speech --instruction-key instruction
-  --context-key context --response-key response` (Dolly schema).
-- **Higher rank:** defaults bumped `r=16→32`, `alpha=32→64` (kept `alpha=2r`, so
-  effective scale unchanged; just more adapter capacity for a strong style).
-- `examples/qlora_infer_native.py` default prompts made style-neutral (everyday
-  questions) so the Shakespearean voice shows on plain answers.
+**Tried and rejected — Shakespeare** (`Roudranil/shakespearean-...`): strong
+register, but it's a *play script*. Results: at strength it degenerated
+(repetition, `*blank stare*` non-answers — the model parroting stage
+directions); tamed down it went bland (style washed out). No setting gave
+coherent-and-clearly-styled. Structural ceiling of the data, not the method.
+
+**Chosen — `superdrew100/UwU_Alpaca_data`** (MIT, 10.6K): Alpaca-cleaned with
+every `output` rewritten in over-the-top UwU furry speak (caps/emoji/OwO).
+Keeps clean Q&A structure → coherent + on-topic, with an unmistakable style at
+scale 1.0. Alpaca schema, so defaults are now `instruction-key=instruction`,
+`context-key=input`, `response-key=output`. Caveat: mild PG-13 furry innuendo in
+some rows. Use `--no-clean-text` to keep the `*action*` flavor (the default
+cleaner strips `*...*`/`[...]`, which is wanted for play scripts but optional
+here).
+
+**Code added during this iteration (all on the branch):**
+- Dataset-agnostic loader: `--instruction-key/--context-key/--response-key`,
+  `--dataset-split`. For pirate: `--dataset TeeZee/dolly-15k-pirate-speech
+  --instruction-key instruction --context-key context --response-key response`.
+- `--save-every N` + save-on-Ctrl-C (the adapter used to only save at the end, so
+  early-stopping at the plateau discarded everything).
+- `clean_style_text`: strips `[stage directions]`/`*actions*` + normalizes
+  whitespace (default on; `--no-clean-text` to disable), and `--min-response-words`
+  drops junk-short rows.
+- `--r 32 --alpha 64` defaults. NOTE: `alpha/r = 2.0` means `--lora-scaling 1.0`
+  is *effective 2.0* — aggressive. For a gentler knob use `--alpha 32` (ratio 1.0).
+
+**Tuning lessons (1B + narrow style data):**
+- EMA plateaus fast (~50–150 steps); that's diminishing *loss* returns, but style
+  can keep firming up past it (watch `|B|`). Stop when samples look right AND no
+  overfit (loss diverging low while samples repeat/parrot).
+- Overtraining + high effective scale → degeneration (repetition loops). Less is
+  often more here.
 
 **Run command (GPU box):**
 ```
 python examples/qlora_validate_native.py --model /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/   # PASS gate first
 python examples/qlora_train_native.py \
     --model /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/ \
-    --out   /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/shakespeare_r32
+    --out   /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/uwu \
+    --batch 16 --no-grad-ckpt --no-clean-text --steps 200 --save-every 50
 python examples/qlora_infer_native.py \
     --model   /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/ \
-    --adapter /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/shakespeare_r32
+    --adapter /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/uwu --lora-scaling 1.0
 ```
-**Status: wired + committed; NOT yet run on the GPU box.** Expect first loss
-~2–4 dropping, `|B|` climbing, live samples turning Shakespearean.
+**Status: UwU wired + committed; NOT yet run on the GPU box.**
 
 ---
 
