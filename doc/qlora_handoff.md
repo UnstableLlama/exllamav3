@@ -7,7 +7,55 @@
 
 ---
 
-## 0. UPDATE — transformers-free native path implemented (option 2)
+## 0. RESOLVED — QLoRA-on-EXL3 works end-to-end (transformers-free)
+
+> Completed on branch `claude/determined-gauss-suq9gx`. The original question
+> ("is QLoRA fine-tuning on EXL3-quantized weights possible?") is **answered:
+> yes**, demonstrated end-to-end on the GPU box with the real model, with **no
+> `transformers` dependency in the path at all**.
+
+**What was run and confirmed (Llama-3.2-1B-Instruct, EXL3 4bpw, single GPU):**
+
+1. **Forward validated against native.** `examples/qlora_validate_native.py`
+   PASSED: the differentiable forward's logits match exllamav3's own (correct)
+   inference forward — top-1 next-token identical on every prompt, **100%
+   per-position argmax agreement**, last-token logits `cos ≈ 0.999999`,
+   `max|Δ| ≈ 0.02–0.03` (just fp32-vs-native-fp16 rounding). e.g.
+   "The capital of France is" → ` Paris`. This was the whole ballgame: the
+   backbone that produced garbage under transformers 5.x is correct here on the
+   same quantized weights.
+
+2. **Training works.** `examples/qlora_train_native.py` (plain PyTorch loop, only
+   `pip install datasets`) trained adapters on `TeeZee/dolly-15k-pirate-speech`.
+   Healthy diagnostics throughout: first loss ~2–3 (NOT ~11 random), grad norm
+   20–50 (gradients reaching adapters), `|B|` climbing monotonically 0→13, EMA
+   loss falling 2.78→~2.35 then plateauing at the data's irreducible-loss floor.
+
+3. **Adapter saves + reloads natively + steers generation.**
+   `examples/qlora_infer_native.py` loads the PEFT adapter via the native
+   `LoRA.from_directory` loader (224 tensors = 32 layers × 7 targets) and the
+   output measurably changes vs base. Cranking `--lora-scaling` proved the
+   learned direction is exactly the dataset's pirate transform: at ~5× effective
+   the generation collapses into `"be be be …"` — the arrr library's dominant
+   `is/are/am → be` substitution, over-amplified. Coherent-but-clearly-pirate
+   sweet spot is `--lora-scaling ~1.4` (effective ~2.8×).
+
+**Caveat on the *visible* demo (not a code issue):** the chosen dataset is a
+**light, inconsistent** pirate conversion (the `arrr` library: `the→th'`,
+`is→be`, `you→ye`, `my→me`, occasional canned phrases; responses also lowercased
++ terse; many rows show no pirate markers at all — verified by previewing the
+rows). So at the trained scale (`--lora-scaling 1.0`) the effect is subtle, and
+the most consistently learnable signal is the lowercasing/terseness, not the
+sparse substitutions. For a *naturally* dramatic pirate at scale 1.0, swap in a
+heavier-pirate dataset (the loader only needs instruction/response-style fields);
+nothing about the training path needs to change.
+
+**Recommended workflow now: §0 (next section). The transformers-5.x
+investigation in §4–5 is fully superseded and only of historical interest.**
+
+---
+
+## 0b. Transformers-free native path — implementation details (option 2)
 
 > Added on branch `claude/determined-gauss-suq9gx`.
 
@@ -63,20 +111,20 @@ python examples/qlora_infer_native.py \
     --adapter /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/pirate2
 ```
 
-**Status / what still needs the GPU:** the code is written and CPU-syntax/unit
-checked, but the **end-to-end run on the real EXL3 model has not been executed**
-(the authoring container has no GPU/weights). Step 1 (`validate_native`) is the
-gate: if top-1 matches native, the differentiable backbone is sound and training
-is meaningful. If validation shows a mismatch, the most likely suspects are (a)
-the RMSNorm cast order vs the native CUDA kernel, or (b) a RoPE layout detail —
-diff `NativeLlamaQLoRA._block_forward` per-layer hidden states against the native
-forward (the §5 Step-1 probe pattern) to localize. The §4–5 transformers-5.x
-investigation below is now **optional** (only needed if someone specifically
-wants the HF-Trainer path); the native path supersedes it.
+**Status: RUN AND CONFIRMED on the GPU box** — see §0 for the full results
+(validate PASSED with 100% argmax agreement; training healthy; adapter
+saves/reloads natively and steers generation). Issues found and fixed during the
+real run, all on this branch: CPU-embedding vs GPU-decoder device split; KV cache
+must be allocated before `model.load()`; exact prompt/response label masking. The
+§4–5 transformers-5.x investigation below is fully superseded (historical only).
 
 ---
 
-## 1. TL;DR status
+## 1. TL;DR status (historical — see §0 for the resolved status)
+
+> This section describes the state *before* the transformers-free native path was
+> built and run. The "Blocker" below was resolved by §0/§0b, not by fixing the
+> transformers-5.x forward. Kept for context.
 
 - **The QLoRA-on-EXL3 mechanism is built and verified.** Differentiable EXL3
   linear, fused cross-entropy head, adapter attach/save/load — all gradcheck-
