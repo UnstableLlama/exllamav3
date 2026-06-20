@@ -273,13 +273,14 @@ def qlora_causal_lm_loss(
     head instead).
 
     Works with any model exposing the standard HF ``get_decoder()`` /
-    ``get_output_embeddings()`` interface.
+    ``get_output_embeddings()`` interface. Unwraps DataParallel/DDP.
     """
-    decoder = model.get_decoder()
+    core = model.module if hasattr(model, "module") else model
+    decoder = core.get_decoder()
     out = decoder(input_ids=input_ids, attention_mask=attention_mask, **decoder_kwargs)
     hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
 
-    head = model.get_output_embeddings()
+    head = core.get_output_embeddings()
     weight_fn = _head_weight_fn(head)
     return fused_linear_cross_entropy(
         hidden, weight_fn, labels, chunk=chunk, ignore_index=ignore_index, shift=True
