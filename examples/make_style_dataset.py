@@ -164,6 +164,11 @@ def main():
     ap.add_argument("--cache-tokens", type=int, default=8192)
     args = ap.parse_args()
 
+    # Create the output directory up front, so a missing path fails here rather
+    # than after loading the (large) rewriter model.
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    os.makedirs(out_dir, exist_ok=True)
+
     from datasets import load_dataset
     ds = load_dataset(args.source_dataset, split=args.source_split)
     ds = ds.shuffle(seed=args.seed)
