@@ -87,6 +87,10 @@ def main():
     ap.add_argument("--ce-chunk", type=int, default=1024)
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
     ap.add_argument("--save-every", type=int, default=0)
+    ap.add_argument("--resume", default=None,
+                    help="Adapter dir to resume from (e.g. a single-GPU checkpoint). "
+                         "Loaded on every rank before the broadcast. --r/--targets "
+                         "must match the checkpoint; optimizer state is not restored.")
     args = ap.parse_args()
 
     rank, local_rank, world_size = ddp_setup()
@@ -113,9 +117,15 @@ def main():
         print(f" -- world_size {world_size}, trainable LoRA params: "
               f"{net.num_trainable():,} (r={args.r}, alpha={args.alpha})")
 
-    # 3. Sync initial adapter weights from rank 0 so every rank starts identical
-    #    (lora_a is randomly initialized; lora_b is zero, but broadcast both to be
-    #    safe). Without this, ranks would diverge from step 1.
+    # 3a. Optionally resume from a checkpoint (e.g. stop a single-GPU run, then
+    #     continue on N GPUs). Every rank loads the same file; the broadcast below
+    #     then guarantees bit-identical starting weights regardless.
+    if args.resume:
+        net.load_adapter(args.resume)
+
+    # 3b. Sync initial adapter weights from rank 0 so every rank starts identical
+    #     (lora_a is randomly initialized; lora_b is zero, but broadcast both to be
+    #     safe). Without this, ranks would diverge from step 1.
     for p in net.lora_parameters():
         dist.broadcast(p.data, src=0)
 

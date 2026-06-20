@@ -549,3 +549,48 @@ class NativeLlamaQLoRA(nn.Module):
         with open(os.path.join(directory, "adapter_config.json"), "w", encoding="utf8") as f:
             json.dump(config, f, indent=2)
         print(f" -- saved native QLoRA adapter ({len(target_leaves)} target types) to {directory}")
+
+    def load_adapter(self, directory: str) -> int:
+        """
+        Load adapter weights previously written by :meth:`save_adapter` back into
+        the trainable wrappers, to *continue* training from a checkpoint. Inverts
+        the save transpose (PEFT ``lora_A=[r, in]`` / ``lora_B=[out, r]`` ->
+        internal ``a=[in, r]`` / ``b=[r, out]``).
+
+        Only the adapter weights are restored, NOT optimizer state -- AdamW
+        resumes cold (a brief, harmless re-warmup for LoRA). The target modules /
+        rank must match the current model (a shape mismatch raises). Returns the
+        number of wrappers loaded.
+        """
+        from safetensors.torch import load_file
+        path = os.path.join(directory, "adapter_model.safetensors")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"No adapter_model.safetensors in {directory}")
+        state = load_file(path)
+
+        loaded = 0
+        for w in self._wrappers:
+            if w.r <= 0:
+                continue
+            key = f"base_model.model.{w.key}"
+            ak, bk = f"{key}.lora_A.weight", f"{key}.lora_B.weight"
+            if ak not in state or bk not in state:
+                raise KeyError(f"checkpoint missing tensors for {w.key} ({ak})")
+            a = state[ak].t()  # [r, in] -> [in, r]
+            b = state[bk].t()  # [out, r] -> [r, out]
+            if a.shape != w.lora_a.shape or b.shape != w.lora_b.shape:
+                raise ValueError(
+                    f"adapter shape mismatch for {w.key}: checkpoint "
+                    f"a{tuple(a.shape)}/b{tuple(b.shape)} vs model "
+                    f"a{tuple(w.lora_a.shape)}/b{tuple(w.lora_b.shape)} "
+                    f"-- do --r/--targets match the checkpoint?"
+                )
+            with torch.no_grad():
+                w.lora_a.copy_(a.to(w.lora_a.dtype).to(w.lora_a.device))
+                w.lora_b.copy_(b.to(w.lora_b.dtype).to(w.lora_b.device))
+            loaded += 1
+
+        if loaded == 0:
+            raise ValueError("No trainable LoRA adapters matched the checkpoint.")
+        print(f" -- resumed {loaded} adapters from {directory} (optimizer state not restored)")
+        return loaded

@@ -198,6 +198,10 @@ def main():
     ap.add_argument("--save-every", type=int, default=0,
                     help="Checkpoint the adapter to --out every N steps (0 = only "
                          "at the end). The adapter is also saved on Ctrl-C.")
+    ap.add_argument("--resume", default=None,
+                    help="Adapter dir to resume from (continues training those "
+                         "weights; optimizer state is NOT restored). --r/--targets "
+                         "must match the checkpoint.")
     args = ap.parse_args()
 
     cdt = {"float32": torch.float32, "float16": torch.float16,
@@ -227,6 +231,8 @@ def main():
         compute_dtype=cdt, gradient_checkpointing=not args.no_grad_ckpt,
     )
     net.train()
+    if args.resume:
+        net.load_adapter(args.resume)
     print(f" -- trainable LoRA params: {net.num_trainable():,} "
           f"(r={args.r}, alpha={args.alpha}, targets={net.target_modules})")
 
