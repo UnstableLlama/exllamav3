@@ -26,10 +26,12 @@ PROMPTS = [
 
 def generate(model, tokenizer, prompt: str, max_new_tokens: int) -> str:
     if getattr(tokenizer, "chat_template", None):
-        input_ids = tokenizer.apply_chat_template(
+        text = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
-            tokenize=True, add_generation_prompt=True, return_tensors="pt",
-        ).to(model.device)
+            tokenize=False, add_generation_prompt=True,
+        )
+        input_ids = tokenizer(text, return_tensors="pt",
+                              add_special_tokens=False).input_ids.to(model.device)
     else:
         text = f"### Instruction:\n{prompt}\n\n### Response:\n"
         input_ids = tokenizer(text, return_tensors="pt").input_ids.to(model.device)
