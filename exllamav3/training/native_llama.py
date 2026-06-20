@@ -262,6 +262,10 @@ class NativeLlamaQLoRA(nn.Module):
 
         self._wrappers = wrappers
         self.final_eps = self.final_norm.rms_norm_eps
+        # The decoder device (norms / linears / RoPE). May differ from the
+        # embedding's device, which is loaded on CPU (prefer_cpu). Assumes the
+        # whole decoder sits on one device (true for single-GPU loads).
+        self.device = self.final_norm.weight.device
 
         # Sanity: every requested target name actually matched something.
         matched = {w.key.split(".")[-1] for w in wrappers if w.r > 0}
@@ -382,24 +386,28 @@ class NativeLlamaQLoRA(nn.Module):
     ) -> torch.Tensor:
         """Return final-norm hidden states ``[b, t, d]`` in fp32."""
         bsz, t = input_ids.shape
-        device = self.embed.embedding.weight.device
-        input_ids = input_ids.to(device)
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device)
+        # The embedding may live on CPU (it has prefer_cpu=True and is loaded on
+        # CPU even for a single-device model), while the decoder lives on the GPU.
+        # Run the lookup on the embedding's device, then move to the decoder.
+        dec_device = self.device
+        emb_device = self.embed.embedding.weight.device
 
+        hidden = self.embed.embedding(input_ids.to(emb_device))
+        if getattr(self.embed, "multiplier", 1.0) != 1.0:
+            hidden = hidden * self.embed.multiplier
+        if getattr(self.embed, "normalize", False):
+            hidden = hidden * (hidden.shape[-1] ** 0.5)
+        hidden = hidden.to(dec_device).float()
+
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(dec_device)
         if position_ids is None:
             if attention_mask is not None:
                 position_ids = attention_mask.long().cumsum(-1) - 1
                 position_ids = position_ids.clamp_min(0)
             else:
-                position_ids = torch.arange(t, device=device).unsqueeze(0).expand(bsz, t)
-        position_ids = position_ids.to(device)
-
-        hidden = self.embed.embedding(input_ids).float()
-        if getattr(self.embed, "multiplier", 1.0) != 1.0:
-            hidden = hidden * self.embed.multiplier
-        if getattr(self.embed, "normalize", False):
-            hidden = hidden * (hidden.shape[-1] ** 0.5)
+                position_ids = torch.arange(t, device=dec_device).unsqueeze(0).expand(bsz, t)
+        position_ids = position_ids.to(dec_device)
 
         # Gradient checkpointing needs at least one input that requires grad, but
         # the base embedding is frozen. Detach to a leaf and flag it so the
@@ -409,7 +417,7 @@ class NativeLlamaQLoRA(nn.Module):
         if ckpt:
             hidden = hidden.detach().requires_grad_(True)
 
-        attn_bias = self._attn_bias(attention_mask, t, device, torch.float32)
+        attn_bias = self._attn_bias(attention_mask, t, dec_device, torch.float32)
 
         for meta, entry in zip(self._block_meta, self.blocks):
             if ckpt:
