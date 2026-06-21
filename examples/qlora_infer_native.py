@@ -71,6 +71,13 @@ def main():
     tokenizer = Tokenizer.from_config(config)
     generator = Generator(model=model, cache=cache, tokenizer=tokenizer)
 
+    # Stop at end-of-turn so the demo shows one clean answer instead of running
+    # past <|eot_id|> into hallucinated new assistant turns.
+    stop = list(getattr(config, "eos_token_id_list", None) or [])
+    if tokenizer.eos_token_id is not None and tokenizer.eos_token_id not in stop:
+        stop.append(tokenizer.eos_token_id)
+    stop += ["<|eot_id|>", "<|start_header_id|>", "</s>", "<|im_end|>"]
+
     def run(label: str):
         print("=" * 70)
         print(label)
@@ -83,6 +90,7 @@ def main():
                 seed=args.seed,
                 add_bos=False,
                 completion_only=True,
+                stop_conditions=stop,
             )
             print(f"\n> {p}\n{resp}")
         print()
