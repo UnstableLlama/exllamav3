@@ -47,10 +47,36 @@ AUX = {
 }
 PRON = {"i", "you", "he", "she", "it", "we", "they",
         "me", "him", "her", "us", "them"}
+SUBJ_PRON = {"i", "you", "he", "she", "it", "we", "they"}
 YODA_FINAL = AUX | PRON | {"not"}
 
-_SENT_SPLIT = re.compile(r"[.!?]+")
+# Split on sentence punctuation, but NOT a period between digits (so "1.7" and
+# "U.S" style decimals don't create spurious sentence breaks).
+_SENT_SPLIT = re.compile(r"(?<!\d)[.!?]+(?!\d)")
 _WORD = re.compile(r"[A-Za-z']+")
+
+
+def _is_inverted(words):
+    """A sentence counts as Yoda-inverted if EITHER:
+      (a) it ends on a verb/auxiliary/pronoun  ("...it is", "...you have"), or
+      (b) a subject pronoun + auxiliary cluster appears NON-initially -- a
+          displaced subject, the tell of front-loaded inversion like
+          "Feel I do, ..." or "..., they do".  Requiring the cluster to be
+          non-initial avoids matching normal SVO openers ("It is...", "I have...").
+    """
+    if words[-1] in YODA_FINAL:
+        return True
+    # Front-loaded inversion: a subject pronoun + auxiliary with NO subject
+    # pronoun before it (the subject is displaced rightward, after a fronted
+    # predicate). The "no subject before" guard rejects normal subordinate
+    # clauses like "I think it is good" / "we know that they are here".
+    seen_subj = False
+    for i in range(len(words) - 1):
+        if i >= 1 and not seen_subj and words[i] in SUBJ_PRON and words[i + 1] in AUX:
+            return True
+        if words[i] in SUBJ_PRON:
+            seen_subj = True
+    return False
 
 
 def yoda_score(text, min_sentence_words=3):
@@ -61,7 +87,7 @@ def yoda_score(text, min_sentence_words=3):
             sents.append(words)
     if not sents:
         return 0.0, 0
-    hits = sum(1 for w in sents if w[-1] in YODA_FINAL)
+    hits = sum(1 for w in sents if _is_inverted(w))
     return hits / len(sents), len(sents)
 
 

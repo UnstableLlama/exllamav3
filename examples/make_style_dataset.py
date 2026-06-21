@@ -203,7 +203,19 @@ def clean_output(s):
         if key:
             seen.add(key)
         out.append(ln)
-    return "\n".join(out).strip()
+    s = "\n".join(out).strip()
+    # 5) Reject prompt echoes / refusals: instead of rewriting, the model
+    #    sometimes parrots the instruction ("[Rewrite the passage in Yoda's
+    #    style...]") or refuses. Return "" so the row is skipped, not written.
+    low = s.lower()
+    reject = (
+        "rewrite the passage", "inverting clause order", "the rewritten passage",
+        "yoda's distinctive", "object or predicate comes first",
+        "i cannot rewrite", "i can't rewrite", "as it contains code",
+    )
+    if s.startswith("[") or any(r in low for r in reject):
+        return ""
+    return s
 
 
 def main():
