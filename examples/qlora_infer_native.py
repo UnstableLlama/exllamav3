@@ -56,6 +56,10 @@ def main():
     ap.add_argument("--top-k", type=int, default=0)
     ap.add_argument("--seed", type=int, default=None,
                     help="Sampling seed for reproducible before/after comparison")
+    ap.add_argument("--gen-out", default=None,
+                    help="Write the ADAPTED generations to this jsonl ('output' "
+                         "field) for score_style_density.py (symmetric with the "
+                         "BNB arm's --gen-out). Use --temperature 0 for greedy.")
     args = ap.parse_args()
 
     prompts = args.prompts or PROMPTS
@@ -78,7 +82,7 @@ def main():
         stop.append(tokenizer.eos_token_id)
     stop += ["<|eot_id|>", "<|start_header_id|>", "</s>", "<|im_end|>"]
 
-    def run(label: str):
+    def run(label: str, dump=None):
         print("=" * 70)
         print(label)
         print("=" * 70)
@@ -93,12 +97,22 @@ def main():
                 stop_conditions=stop,
             )
             print(f"\n> {p}\n{resp}")
+            if dump is not None:
+                dump.append({"instruction": p, "input": "", "output": resp})
         print()
 
     run("BASE MODEL (native exllamav3)")
 
     lora = LoRA.from_directory(model, args.adapter, lora_scaling=args.lora_scaling)
-    run("ADAPTED MODEL (native exllamav3 + QLoRA)")
+    dump = [] if args.gen_out else None
+    run("ADAPTED MODEL (native exllamav3 + QLoRA)", dump=dump)
+    if args.gen_out:
+        import json
+        with open(args.gen_out, "w", encoding="utf-8") as f:
+            for r in dump:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        print(f"Adapted generations written to {args.gen_out} "
+              f"(score with examples/score_style_density.py)")
 
 
 if __name__ == "__main__":

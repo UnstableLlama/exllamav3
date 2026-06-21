@@ -40,6 +40,7 @@ The adapter is saved in PEFT format, loadable by exllamav3.model.lora.LoRA
 import argparse
 import random
 import re
+import time
 import torch
 
 from exllamav3 import Config, Model, Tokenizer
@@ -223,6 +224,10 @@ def main():
                     help="Adapter dir to resume from (continues training those "
                          "weights; optimizer state is NOT restored). --r/--targets "
                          "must match the checkpoint.")
+    ap.add_argument("--val-frac", type=float, default=0.0,
+                    help="Hold out this fraction of examples for held-out eval "
+                         "loss (deterministic; the SAME split as qlora_train_bnb.py "
+                         "given the same dataset/seed). 0 = no eval.")
     args = ap.parse_args()
 
     cdt = {"float32": torch.float32, "float16": torch.float16,
@@ -269,6 +274,18 @@ def main():
     print(f" -- {len(examples)} SFT examples")
     assert examples, "no usable training examples"
 
+    # Deterministic held-out val split (examples are already in a fixed order:
+    # datasets shuffle(seed=0)+select, then build order). Taking the first
+    # val_frac as val gives the SAME rows as qlora_train_bnb.py, so the two arms'
+    # eval losses are directly comparable.
+    val_examples = []
+    if args.val_frac > 0:
+        n_val = max(1, int(len(examples) * args.val_frac))
+        val_examples, examples = examples[:n_val], examples[n_val:]
+        print(f" -- held out {len(val_examples)} val examples; "
+              f"{len(examples)} for training")
+        assert examples, "val_frac too large; no training examples left"
+
     # 4. Optional generator for live samples (KV-cache inference path). The cache
     #    was allocated before load() above.
     generator = None
@@ -301,10 +318,30 @@ def main():
         net.save_adapter(args.out, base_model_name_or_path=args.model)
         print(f"{tag} Adapter written to {args.out}")
 
+    def evaluate():
+        # Mean per-example completion-loss over the val split, one example at a
+        # time (no padding effects). qlora_train_bnb.py computes this identically.
+        if not val_examples:
+            return None
+        net.eval()
+        total, n = 0.0, 0
+        with torch.no_grad():
+            for ex in val_examples:
+                input_ids, labels, attn = collate([ex], pad_id)
+                l = net.compute_loss(input_ids, labels, attention_mask=attn,
+                                     chunk=args.ce_chunk)
+                total += l.item()
+                n += 1
+        net.train()
+        return total / n
+
     bgen = batches()
     opt.zero_grad(set_to_none=True)
     ema = None
     step = 0
+    tok_seen, t0 = 0, time.time()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     try:
         for step in range(1, args.steps + 1):
             accum_loss = 0.0
@@ -315,6 +352,7 @@ def main():
                                         chunk=args.ce_chunk)
                 (loss / args.grad_accum).backward()
                 accum_loss += loss.item() / args.grad_accum
+                tok_seen += int((labels != -100).sum())
 
             # grad norm BEFORE clipping is a direct check that gradients reach the
             # adapters (a flat ~0 here would mean the backward graph is broken).
@@ -349,6 +387,15 @@ def main():
 
     # 6. Save adapter (PEFT format; loadable by exllamav3.model.lora.LoRA).
     save("Done.")
+    dt = time.time() - t0
+    val_loss = evaluate()
+    if val_loss is not None:
+        print(f"\n[EVAL] held-out loss (EXL3 arm): {val_loss:.4f} "
+              f"over {len(val_examples)} examples")
+    peak_gb = (torch.cuda.max_memory_allocated() / 1e9
+               if torch.cuda.is_available() else 0.0)
+    print(f"[PERF] {tok_seen / dt if dt else 0:,.0f} supervised tok/s | "
+          f"peak VRAM {peak_gb:.2f} GB | {dt:.0f}s for {step} steps")
     print("Verify with: python examples/qlora_infer_native.py "
           f"--model {args.model} --adapter {args.out}")
 
