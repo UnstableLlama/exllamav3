@@ -228,6 +228,9 @@ def main():
                     help="Hold out this fraction of examples for held-out eval "
                          "loss (deterministic; the SAME split as qlora_train_bnb.py "
                          "given the same dataset/seed). 0 = no eval.")
+    ap.add_argument("--eval-every", type=int, default=0,
+                    help="Also report held-out loss every N steps (needs "
+                         "--val-frac > 0). 0 = only at the end.")
     args = ap.parse_args()
 
     cdt = {"float32": torch.float32, "float16": torch.float16,
@@ -365,6 +368,9 @@ def main():
             ema = accum_loss if ema is None else 0.9 * ema + 0.1 * accum_loss
             print(f"  step {step:>5}/{args.steps} | loss {accum_loss:6.4f} | "
                   f"ema {ema:6.4f} | grad {gnorm:7.4f} | |B| {adapter_b_norm():7.3f}")
+
+            if args.eval_every and val_examples and step % args.eval_every == 0:
+                print(f"    [eval] step {step}: held-out loss {evaluate():.4f}")
 
             if args.sample_every and step % args.sample_every == 0:
                 net.eval()

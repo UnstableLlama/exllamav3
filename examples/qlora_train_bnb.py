@@ -134,6 +134,9 @@ def main():
     ap.add_argument("--seq-len", type=int, default=512)
     ap.add_argument("--max-samples", type=int, default=4000)
     ap.add_argument("--val-frac", type=float, default=0.0)
+    ap.add_argument("--eval-every", type=int, default=0,
+                    help="Also report held-out loss every N steps (needs "
+                         "--val-frac > 0). 0 = only at the end.")
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
     ap.add_argument("--no-grad-ckpt", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
@@ -228,6 +231,8 @@ def main():
         ema = accum if ema is None else 0.9 * ema + 0.1 * accum
         print(f"  step {step:>5}/{args.steps} | loss {accum:6.4f} | "
               f"ema {ema:6.4f} | grad {gnorm:7.4f}")
+        if args.eval_every and val_examples and step % args.eval_every == 0:
+            print(f"    [eval] step {step}: held-out loss {evaluate():.4f}")
 
     dt = time.time() - t0
     tok_per_s = tok_seen / dt if dt > 0 else 0.0
