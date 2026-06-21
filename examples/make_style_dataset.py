@@ -125,6 +125,43 @@ def build_rewrite_prompt(model, style_key, text):
     return model.default_chat_prompt(user, system_prompt=system)
 
 
+# Second-pass instructions per style. The first pass often leaves some sentences
+# in normal order (esp. for syntactic styles like Yoda, where the signal is
+# token-sparse); this pass pushes EVERY sentence into the style so the per-token
+# signal is dense enough to surface at lora_scaling 1.0 (no amplification).
+REFINE_INSTRUCTIONS = {
+    "yoda": (
+        "The passage below is ALREADY in Yoda's style, but some sentences may "
+        "still be in normal English order. Rewrite it so EVERY sentence is "
+        "inverted (object/predicate first) and MOST sentences END on a verb or "
+        "auxiliary, e.g. '...you have', '...it is', '...learn you will', "
+        "'...help you I can'. Leave NO sentence in plain subject-verb-object "
+        "order. Preserve the meaning exactly. Output only the rewritten passage:"
+    ),
+    "archaic": (
+        "The passage below is ALREADY in archaic English, but some sentences may "
+        "lack the markers. Rewrite so EVERY sentence uses thee/thou/thy and "
+        "-est/-eth verb endings. Preserve meaning. Output only the passage:"
+    ),
+    "pirate": (
+        "The passage below is ALREADY pirate-styled, but some sentences are "
+        "weak. Rewrite so EVERY sentence has dense pirate diction. Preserve "
+        "meaning. Output only the passage:"
+    ),
+    "corporate": (
+        "The passage below is ALREADY corporate-speak, but some sentences are "
+        "plain. Rewrite so EVERY sentence carries buzzwords. Preserve meaning. "
+        "Output only the passage:"
+    ),
+}
+
+
+def build_refine_prompt(model, style_key, text):
+    system, _ = STYLES[style_key]
+    user = REFINE_INSTRUCTIONS[style_key] + "\n\n" + text
+    return model.default_chat_prompt(user, system_prompt=system)
+
+
 def clean_output(s):
     s = s.strip()
     # 1) Hard-cut at any turn/sequence marker. RP-tuned models (e.g. Rocinante,
@@ -179,6 +216,10 @@ def main():
     ap.add_argument("--source-dataset", default="yahma/alpaca-cleaned",
                     help="Source instruction set (Alpaca schema by default)")
     ap.add_argument("--source-split", default="train")
+    ap.add_argument("--refine-from", default=None,
+                    help="Second pass: read an existing styled .jsonl and "
+                         "re-style each response with a stricter prompt to push "
+                         "EVERY sentence into the style (ignores --source-dataset).")
     ap.add_argument("--instruction-key", default="instruction")
     ap.add_argument("--context-key", default="input")
     ap.add_argument("--response-key", default="output")
@@ -200,9 +241,21 @@ def main():
     out_dir = os.path.dirname(os.path.abspath(args.out))
     os.makedirs(out_dir, exist_ok=True)
 
-    from datasets import load_dataset
-    ds = load_dataset(args.source_dataset, split=args.source_split)
-    ds = ds.shuffle(seed=args.seed)
+    refine = args.refine_from is not None
+    if refine:
+        if os.path.abspath(args.refine_from) == os.path.abspath(args.out):
+            raise SystemExit("--refine-from and --out must differ (don't "
+                             "overwrite the source while reading it).")
+        src_rows = []
+        with open(args.refine_from, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    src_rows.append(json.loads(line))
+    else:
+        from datasets import load_dataset
+        ds = load_dataset(args.source_dataset, split=args.source_split)
+        src_rows = ds.shuffle(seed=args.seed)
 
     # Resume: count rows already written so a crashed/interrupted run continues.
     done = 0
@@ -212,9 +265,10 @@ def main():
         print(f"[resume] {done} rows already in {args.out}; continuing.")
 
     # Collect the source rows we intend to keep (after length filtering), so the
-    # resume offset lines up with positions in this filtered stream.
+    # resume offset lines up with positions in this filtered stream. In refine
+    # mode the text to re-style is the existing (already-styled) response.
     kept = []
-    for ex in ds:
+    for ex in src_rows:
         instr = (ex.get(args.instruction_key) or "").strip()
         ctx = (ex.get(args.context_key) or "").strip()
         resp = (ex.get(args.response_key) or "").strip()
@@ -224,7 +278,8 @@ def main():
         kept.append((instr, ctx, resp))
         if len(kept) >= args.max_rows:
             break
-    print(f"[plan] {len(kept)} rows selected; {len(kept) - done} to generate.")
+    mode = "refine" if refine else "generate"
+    print(f"[plan] {mode}: {len(kept)} rows selected; {len(kept) - done} to do.")
 
     config = Config.from_directory(args.gen_model)
     model = Model.from_config(config)
@@ -246,7 +301,8 @@ def main():
     todo = kept[done:]
     for start in range(0, len(todo), args.batch):
         batch = todo[start:start + args.batch]
-        prompts = [build_rewrite_prompt(model, args.style, resp)
+        builder = build_refine_prompt if refine else build_rewrite_prompt
+        prompts = [builder(model, args.style, resp)
                    for (_, _, resp) in batch]
         outs = generator.generate(
             prompt=prompts, max_new_tokens=args.max_new_tokens,
