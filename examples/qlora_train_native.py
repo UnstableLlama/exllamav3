@@ -40,6 +40,7 @@ The adapter is saved in PEFT format, loadable by exllamav3.model.lora.LoRA
 import argparse
 import random
 import re
+import time
 import torch
 
 from exllamav3 import Config, Model, Tokenizer
@@ -338,6 +339,9 @@ def main():
     opt.zero_grad(set_to_none=True)
     ema = None
     step = 0
+    tok_seen, t0 = 0, time.time()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     try:
         for step in range(1, args.steps + 1):
             accum_loss = 0.0
@@ -348,6 +352,7 @@ def main():
                                         chunk=args.ce_chunk)
                 (loss / args.grad_accum).backward()
                 accum_loss += loss.item() / args.grad_accum
+                tok_seen += int((labels != -100).sum())
 
             # grad norm BEFORE clipping is a direct check that gradients reach the
             # adapters (a flat ~0 here would mean the backward graph is broken).
@@ -382,10 +387,15 @@ def main():
 
     # 6. Save adapter (PEFT format; loadable by exllamav3.model.lora.LoRA).
     save("Done.")
+    dt = time.time() - t0
     val_loss = evaluate()
     if val_loss is not None:
         print(f"\n[EVAL] held-out loss (EXL3 arm): {val_loss:.4f} "
               f"over {len(val_examples)} examples")
+    peak_gb = (torch.cuda.max_memory_allocated() / 1e9
+               if torch.cuda.is_available() else 0.0)
+    print(f"[PERF] {tok_seen / dt if dt else 0:,.0f} supervised tok/s | "
+          f"peak VRAM {peak_gb:.2f} GB | {dt:.0f}s for {step} steps")
     print("Verify with: python examples/qlora_infer_native.py "
           f"--model {args.model} --adapter {args.out}")
 
