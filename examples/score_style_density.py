@@ -56,6 +56,11 @@ _SENT_SPLIT = re.compile(r"(?<!\d)[.!?]+(?!\d)")
 _WORD = re.compile(r"[A-Za-z']+")
 
 
+def _is_aux(w):
+    # Auxiliaries incl. negated contractions ("doesn't", "won't", "isn't").
+    return w in AUX or w.endswith("n't")
+
+
 def _is_inverted(words):
     """A sentence counts as Yoda-inverted if EITHER:
       (a) it ends on a verb/auxiliary/pronoun  ("...it is", "...you have"), or
@@ -63,16 +68,17 @@ def _is_inverted(words):
           displaced subject, the tell of front-loaded inversion like
           "Feel I do, ..." or "..., they do".  Requiring the cluster to be
           non-initial avoids matching normal SVO openers ("It is...", "I have...").
+
+    KNOWN BLIND SPOT: noun-subject fronting ("Ended the war did") and main-verb
+    endings ("...three roots exist") are real Yoda this lexical rule cannot see
+    (it would need POS/parsing). So the score is a conservative LOWER BOUND --
+    use it to find confidently-dense rows, not to condemn score-0 rows as junk.
     """
-    if words[-1] in YODA_FINAL:
+    if words[-1] in YODA_FINAL or words[-1].endswith("n't"):
         return True
-    # Front-loaded inversion: a subject pronoun + auxiliary with NO subject
-    # pronoun before it (the subject is displaced rightward, after a fronted
-    # predicate). The "no subject before" guard rejects normal subordinate
-    # clauses like "I think it is good" / "we know that they are here".
     seen_subj = False
     for i in range(len(words) - 1):
-        if i >= 1 and not seen_subj and words[i] in SUBJ_PRON and words[i + 1] in AUX:
+        if i >= 1 and not seen_subj and words[i] in SUBJ_PRON and _is_aux(words[i + 1]):
             return True
         if words[i] in SUBJ_PRON:
             seen_subj = True
