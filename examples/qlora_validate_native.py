@@ -100,7 +100,10 @@ def main():
     print("RESULT:", "PASS -- differentiable forward matches native"
           if all_ok else "FAIL -- top-1 mismatch (see above)")
     print("=" * 78)
+    # Exit non-zero on failure so a `validate && train` kickoff aborts the run
+    # instead of training against a broken forward (e.g. a new architecture).
+    return 0 if all_ok else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

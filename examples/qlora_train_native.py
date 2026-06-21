@@ -47,7 +47,23 @@ from exllamav3 import Config, Model, Tokenizer
 from exllamav3.training.native_llama import NativeLlamaQLoRA
 
 
-EOT = "<|eot_id|>"
+def turn_end_token(tokenizer):
+    """End-of-assistant-turn marker for completion-only SFT, per chat format.
+
+    The model must learn to emit a stop token after the response or generation
+    never terminates. The right token is architecture-specific: the Llama-3
+    family ends a turn with ``<|eot_id|>``; Mistral/Tekken and most others use
+    their EOS (``</s>``). We pick ``<|eot_id|>`` only when it actually exists as
+    a special token (preserving the proven Llama path), otherwise the tokenizer's
+    EOS. Encoded with ``encode_special_tokens=True`` it maps to the single
+    special id, matching the generator's stop condition.
+    """
+    if "<|eot_id|>" in tokenizer.extended_piece_to_id:
+        return "<|eot_id|>"
+    if tokenizer.eos_token:
+        return tokenizer.eos_token
+    return ""
+
 
 # Stage directions / inline actions, e.g. "[as CAMBIO]", "[TRINCULO grabs ...]",
 # "*stares at the ceiling*". Style datasets built from play scripts carry these,
@@ -70,8 +86,11 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
                        uppercase_response=False):
     """
     Load an instruction dataset and tokenize for completion-only SFT using the
-    model's native Llama-3 chat template. Prompt tokens are masked with -100 so
-    loss is computed only over the (styled) response.
+    model's native chat template (Llama-3, Mistral, etc. -- whatever
+    ``model.default_chat_prompt`` emits for this architecture). Prompt tokens are
+    masked with -100 so loss is computed only over the (styled) response, which
+    is terminated with the architecture-correct turn-end token (see
+    :func:`turn_end_token`) so the model learns to stop.
 
     Columns are addressed by name (instruction_key / context_key / response_key)
     so the loader is not tied to the Dolly schema; context_key may be absent in
@@ -99,6 +118,8 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
         ds = load_dataset(dataset_name, split=split)
     if max_samples and max_samples < len(ds):
         ds = ds.shuffle(seed=0).select(range(max_samples))
+
+    eot = turn_end_token(tokenizer)
 
     examples = []
     for ex in ds:
@@ -128,7 +149,7 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
             prompt_text, add_bos=False, encode_special_tokens=True
         )[0].tolist()
         resp_ids = tokenizer.encode(
-            resp + EOT, add_bos=False, encode_special_tokens=True
+            resp + eot, add_bos=False, encode_special_tokens=True
         )[0].tolist()
 
         input_ids = (prompt_ids + resp_ids)[:seq_len]
