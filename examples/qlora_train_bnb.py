@@ -140,7 +140,9 @@ def main():
     ap.add_argument("--batch", type=int, default=8, help="Per-GPU micro-batch")
     ap.add_argument("--grad-accum", type=int, default=1)
     ap.add_argument("--seq-len", type=int, default=512)
-    ap.add_argument("--max-samples", type=int, default=4000)
+    ap.add_argument("--max-samples", type=int, default=0,
+                    help="Cap source rows (0 = use all). Match this to the EXL3 "
+                         "arm so both train/eval on the same split.")
     ap.add_argument("--val-frac", type=float, default=0.0)
     ap.add_argument("--eval-every", type=int, default=0,
                     help="Also report held-out loss every N steps (needs "
