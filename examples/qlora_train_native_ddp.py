@@ -55,7 +55,10 @@ def ddp_setup():
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl")
+    # Pass device_id so NCCL collectives/barriers know this rank's device --
+    # without it, barrier() warns and can HANG at teardown.
+    dist.init_process_group(backend="nccl",
+                            device_id=torch.device("cuda", local_rank))
     return rank, local_rank, world_size
 
 

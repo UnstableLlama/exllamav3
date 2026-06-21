@@ -171,7 +171,10 @@ def main():
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl")
+        # device_id so NCCL barriers/collectives use this rank's GPU (without it
+        # barrier() warns and can hang at teardown).
+        dist.init_process_group(backend="nccl",
+                                device_id=torch.device("cuda", local_rank))
     else:
         rank, local_rank, world_size = 0, 0, 1
     is_main = rank == 0
