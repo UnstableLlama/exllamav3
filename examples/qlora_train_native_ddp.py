@@ -36,6 +36,7 @@ import argparse
 import os
 import random
 import sys
+import time
 
 import torch
 import torch.distributed as dist
@@ -94,6 +95,12 @@ def main():
     ap.add_argument("--ce-chunk", type=int, default=1024)
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
     ap.add_argument("--save-every", type=int, default=0)
+    ap.add_argument("--val-frac", type=float, default=0.0,
+                    help="Hold out this fraction for held-out eval loss; the SAME "
+                         "deterministic split as the single-GPU / BNB arms. Held "
+                         "out before sharding so it never leaks into training.")
+    ap.add_argument("--eval-every", type=int, default=0,
+                    help="Report held-out loss every N steps (needs --val-frac>0).")
     ap.add_argument("--resume", default=None,
                     help="Adapter dir to resume from (e.g. a single-GPU checkpoint). "
                          "Loaded on every rank before the broadcast. --r/--targets "
@@ -146,10 +153,17 @@ def main():
         min_response_words=args.min_response_words,
         uppercase_response=args.uppercase_response,
     )
+    # Hold out the val split (first val_frac) on every rank BEFORE sharding, so
+    # those rows are excluded from all training shards and match the other arms.
+    val_examples = []
+    if args.val_frac > 0:
+        n_val = max(1, int(len(examples) * args.val_frac))
+        val_examples, examples = examples[:n_val], examples[n_val:]
     shard = examples[rank::world_size]
     assert shard, "no training examples on this rank"
     if is_main(rank):
-        print(f" -- {len(examples)} examples total, ~{len(shard)} per rank")
+        print(f" -- {len(examples)} train examples total, ~{len(shard)} per rank; "
+              f"{len(val_examples)} held out for eval")
 
     opt = torch.optim.AdamW(net.lora_parameters(), lr=args.lr)
 
@@ -177,10 +191,28 @@ def main():
             print(f"{tag} adapter -> {args.out}")
         dist.barrier()
 
+    def evaluate():
+        # All ranks compute the same val loss (replicated, synced adapters) so
+        # they stay in lockstep; only rank 0 prints. Mean per-example loss,
+        # batch 1 -- identical to the single-GPU and BNB arms.
+        if not val_examples:
+            return None
+        net.eval()
+        total = 0.0
+        with torch.no_grad():
+            for ex in val_examples:
+                ii, ll, aa = collate([ex], pad_id)
+                total += net.compute_loss(ii, ll, attention_mask=aa,
+                                          chunk=args.ce_chunk).item()
+        net.train()
+        return total / len(val_examples)
+
     bgen = batches()
     opt.zero_grad(set_to_none=True)
     ema = None
     step = 0
+    tok_seen, t0 = 0, time.time()
+    torch.cuda.reset_peak_memory_stats(device)
     try:
         for step in range(1, args.steps + 1):
             accum_loss = 0.0
@@ -191,6 +223,7 @@ def main():
                                         chunk=args.ce_chunk)
                 (loss / args.grad_accum).backward()
                 accum_loss += loss.item() / args.grad_accum
+                tok_seen += int((labels != -100).sum())
 
             allreduce_grads()
             gnorm = torch.nn.utils.clip_grad_norm_(
@@ -208,6 +241,11 @@ def main():
                 print(f"  step {step:>5}/{args.steps} | loss {global_loss:6.4f} | "
                       f"ema {ema:6.4f} | grad {gnorm:7.4f}")
 
+            if args.eval_every and val_examples and step % args.eval_every == 0:
+                vl = evaluate()
+                if is_main(rank):
+                    print(f"    [eval] step {step}: held-out loss {vl:.4f}")
+
             if args.save_every and step % args.save_every == 0:
                 save(f"[checkpoint step {step}]")
     except KeyboardInterrupt:
@@ -217,6 +255,21 @@ def main():
             save("[interrupted]")
 
     save("Done.")
+
+    # Held-out loss (all ranks compute identically; rank 0 reports) + global
+    # throughput (sum supervised tokens across ranks) + this rank's peak VRAM.
+    dt = time.time() - t0
+    val_loss = evaluate()
+    tok_t = torch.tensor(float(tok_seen), device=device)
+    dist.all_reduce(tok_t, op=dist.ReduceOp.SUM)
+    if is_main(rank):
+        if val_loss is not None:
+            print(f"\n[EVAL] held-out loss (EXL3 arm, DDP): {val_loss:.4f} "
+                  f"over {len(val_examples)} examples")
+        peak_gb = torch.cuda.max_memory_allocated(device) / 1e9
+        print(f"[PERF] {tok_t.item() / dt if dt else 0:,.0f} supervised tok/s "
+              f"(all ranks) | peak VRAM/GPU {peak_gb:.2f} GB | {dt:.0f}s, "
+              f"{step} steps, world_size {world_size}")
     dist.destroy_process_group()
 
 
