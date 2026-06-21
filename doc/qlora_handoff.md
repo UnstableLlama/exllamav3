@@ -250,33 +250,122 @@ styled; it'll then behave like the caps demo. OR move to the flagship: low-bpw
 (2.5–3) bigger-model fine-tune on a real task with a metric, benchmarked vs what
 BNB NF4 can fit (the actually-valuable result — see §0d / implications).
 
-### Session 3 — chose the dense-style path; Yoda generator built (tooling only)
+### Session 3 — Yoda generated demo + EXL3-vs-BNB parity + the LoRA-on-quant finding
 
-Picked option 1 above (dense funny style on clean Q&A) with **Yoda-speak** as the
-style. Rationale tied to the density lesson: Yoda is a *syntactic* transform
-(clause/word-order inversion over COMMON tokens), so unlike pirate/UwU it should
-surface at greedy/low-temp decode — the same property that made uppercase work,
-but actually funny. The off-the-shelf search came up dry: the only style-transfer
-Q&A sets on the Hub are the three we already burned (pirate=sparse, UwU=rare-token
-even in the denser V2, Shakespeare=play-script); the lone Yoda set
-(`dvgodoy/yoda_sentences`) is 720 translation pairs, not instruction Q&A. So we
-*generate* instead.
+Long session. Three arcs: (A) build a dense Yoda dataset and prove the visible
+demo; (B) stand up a controlled EXL3-vs-bitsandbytes QLoRA comparison; (C) a real
+finding about why LoRAs look weak on EXL3-quantized bases at inference.
 
-New tooling (not yet run on hardware):
+#### A. Yoda dataset + the density nuance
+
+Picked **Yoda-speak** as the dense style (syntactic clause inversion over COMMON
+tokens — unlike pirate/UwU). Off-the-shelf search was dry (only `dvgodoy/
+yoda_sentences`, 720 translation pairs), so we **generate**.
+
 - `examples/make_style_dataset.py` — rewrites ONLY the response of a normal
   instruction set (default `yahma/alpaca-cleaned`) into a target style via a LOCAL
-  exllamav3 model; writes Alpaca-schema JSONL. Built-in styles: `yoda` (default),
-  `archaic`, `pirate`, `corporate` (each a system prompt + few-shot anchor).
-  Batched, resumable. **Use your largest instruct model as `--gen-model`** — a 1B
-  is too weak to invert sentences; keep it separate from the eventual training
-  target `--model`.
-- `qlora_train_native.py` loader now accepts a **local file path** for `--dataset`
-  (json/jsonl/parquet/csv), so the generated set drops straight in. DDP variant
-  inherits it (reuses `build_sft_examples`).
+  exllamav3 model; Alpaca-schema JSONL. Styles: `yoda`/`archaic`/`pirate`/
+  `corporate`; `--refine-from` does a stricter second pass over an existing set.
+  Use a strong instruct model as `--gen-model` (we used `TheDrummer_Rocinante-XL-
+  16B-v1` 4bpw). Gotchas fixed live: create out-dir up front; stop at EOT (RP
+  finetunes role-play a whole convo past the answer); drop `min_new_tokens` (it
+  triggered a sampler cuda/cpu mask bug); reject prompt-echo/refusal rows.
+- `examples/score_style_density.py` — Yoda-ness metric = clause-final inversion
+  rate (sentences ending in aux/pronoun/contraction, plus a front-loaded
+  "displaced subject" signal). **Known blind spot: noun-subject fronting ("Ended
+  the war did") and main-verb endings — needs POS to catch — so the score is a
+  conservative LOWER BOUND. Do NOT hard-filter on it** (it can't tell good
+  noun-subject Yoda from junk; both score ~0).
+- `qlora_train_native.py` loader now also reads a **local file path** for
+  `--dataset` (json/jsonl/parquet/csv); DDP inherits it.
 
-Next: run the generator on the GPU box, eyeball style density on the JSONL, then
-train Llama-3.2-1B/3B on it (NO `--uppercase-response`) and verify with the infer
-sweep. Expect it to behave like the caps demo if every row is densely inverted.
+**THE density nuance (correction to S0c):** Yoda is dense at the SENTENCE level
+but **sparse at the TOKEN level** — most words within an inverted sentence are
+still normal order, so teacher-forced loss got low (~0.4) without the model
+committing to inversions at greedy decode. So on the quantized base it needed
+`--lora-scaling ~3` to surface (1B collapsed there; 3B held coherence and gave
+clean Yoda). A density audit confirmed bimodality (~27% of rows barely inverted);
+a Rocinante **refine pass** improved quality but the metric undercounted the gain
+(it produces noun-subject Yoda the metric can't see). Dataset density was NOT the
+bottleneck — see arc C for the real reason the 4bpw demo looked weak.
+
+#### B. EXL3-vs-BNB QLoRA comparison harness (the flagship, parity check)
+
+Goal: same model / data / LoRA / optimizer, only the frozen-weight format differs
+(EXL3-4bpw vs bitsandbytes NF4), on Llama-3.2-3B, Yoda data. **Chose NOT to use
+Axolotl** (it can't train EXL3 at all; mixing frameworks confounds; its dep tree
+threatens the pinned torch/EXL3 `.so`). Instead a minimal matched loop:
+
+- `examples/qlora_train_bnb.py` (NEW) — transformers 4-bit NF4 + PEFT LoRA in a
+  hand loop mirroring `qlora_train_native.py` byte-for-byte (same Llama-3 chat
+  prompt, completion-only masking, `datasets` shuffle(seed=0)+select, val split,
+  LoRA targets/r/alpha, AdamW/lr/clip, bf16). Optional DDP (manual LoRA-grad
+  all-reduce, same as the EXL3 DDP arm). Runs in the same venv (just
+  `pip install bitsandbytes peft accelerate`) or an isolated one.
+- Added to all three trainers: `--val-frac` + **identical held-out eval loss**
+  (mean per-example, batch 1), `--eval-every`, `--save-best` (keep the best-val
+  checkpoint; Ctrl-C won't clobber it), `[PERF]` tok/s + peak VRAM. `--gen-out`
+  on the BNB trainer and `qlora_infer_native.py` dump samples for the scorer.
+- Fixes found running it: NCCL teardown hang → pass `device_id` to
+  `init_process_group`; `--r` eaten by torchrun → use `--lora-r`; **default
+  `--max-samples` mismatch (bnb 4000 vs ddp 0) silently trained the arms on
+  different data** → aligned to 0 (use all); match EFFECTIVE batch across arms
+  (`--batch` is per-GPU under DDP).
+
+**Overfitting caught by the eval curve:** at `lr 2e-4`, r=64, ~4 epochs, train
+loss hit 0.09 while **held-out loss rose to 3.11** — the endpoint adapter was
+memorized garbage (this, not the dataset, is why scale-3 gens degenerated). Fix:
+`--lr 1e-4` + all data + `--save-best` → clean minimum ~2.0.
+
+**Results (matched, 5329 train / 280 val, lr 1e-4, r64/a64, eff-batch 32):**
+- **Held-out loss: near-identical (~2.0 both arms) — 4-bit PARITY confirmed.**
+  EXL3 was a hair lower at matched steps.
+- **EXL3 is more memory-efficient:** it ships fused-CE (never materializes the
+  `[tokens×128k]` logits), so it fit `--batch 16`; the stock BNB/PEFT loss OOM'd
+  at 16 on a 24GB card and needed `--batch 8 --grad-accum 2`.
+- **EXL3 converged in ~⅓ the steps** — but that's an effective-LR/init difference
+  between our `EXL3LoRAFunction` and PEFT (grad norms ~2.5 vs ~0.6 at the same
+  nominal lr), NOT a quant property. Compare loss FLOORS, not steps.
+- **The visible demo WORKS:** QLoRA-on-EXL3 Yoda, applied to bf16, gives clean
+  coherent inversion ("Dinner for tonight, what should you? Many options, there
+  are."). Both arms produce strong Yoda → quality parity too.
+
+#### C. FINDING — LoRAs are attenuated on EXL3-quantized bases at inference
+
+Controlled test (user's `ezexl3` frontend, correct Llama-3 templates, 0%/100%
+scaling, BOTH the EXL3- and BNB-trained adapters, applied to BOTH the bf16 and the
+4bpw base): **only the bf16 base produced strong steering; the 4bpw base
+attenuated every adapter.** Correlated with LOW rank/alpha.
+
+`Linear.apply_lora` is **base-agnostic** (`delta = x@a@b` added identically for
+EXL3 and bf16; the `alpha/r` scale is folded into `B` at load) — so this is NOT an
+application bug. Mechanism: the EXL3 trellis adds a per-output quantization
+perturbation `x·ε`; a low-rank/low-alpha LoRA's delta is small and gets **buried
+in `ε` on the quantized base**, while on bf16 (no `ε`) the same delta dominates and
+the style shows. Higher rank/alpha grows the delta past the quant floor — exactly
+the observed rank/alpha correlation. This is why our earlier "weak Yoda on 4bpw"
+looked like a dataset/training problem when it was really a **signal-to-quant-noise
+ratio at inference**; the adapter was good all along (loss + bf16 gens prove it).
+
+**Implications:**
+- Evaluate adapters on bf16 for a fair comparison (sidesteps a confound that hits
+  both arms) — done; parity holds.
+- Deploying a swappable low-rank adapter ON the EXL3 base is attenuated. Options:
+  **(a) higher rank/alpha** so the delta clears the quant floor, or **(b) merge the
+  adapter into bf16 and re-quantize** (delta becomes part of `W`; no small signal
+  to bury — the clean deploy path, loses hot-swap).
+- **This gets WORSE at 2.5–3bpw (bigger `ε`)** — so for the low-bitrate prize,
+  merge-and-requantize is likely the right deployment story. Flagged before that
+  experiment.
+
+#### Recommended next steps
+1. **Merge-and-requantize test** (chosen, arc C option b): merge the EXL3 Yoda
+   adapter into bf16, re-quantize to 4bpw, confirm the style survives on the
+   quantized base. Validates the real deployment path.
+2. Optional: rank/alpha sweep on the 4bpw base to map the quant-floor threshold
+   (turns the qualitative finding into a curve — useful to the exllamav3 community).
+3. Then the headline low-bitrate run: EXL3-2.5/3bpw (where NF4 can't follow),
+   deployed via merge-requantize, on a real metric.
 
 ---
 
