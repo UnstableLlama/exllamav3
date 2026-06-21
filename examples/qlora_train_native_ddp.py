@@ -55,7 +55,10 @@ def ddp_setup():
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl")
+    # Pass device_id so NCCL collectives/barriers know this rank's device --
+    # without it, barrier() warns and can HANG at teardown.
+    dist.init_process_group(backend="nccl",
+                            device_id=torch.device("cuda", local_rank))
     return rank, local_rank, world_size
 
 
@@ -101,6 +104,10 @@ def main():
                          "out before sharding so it never leaks into training.")
     ap.add_argument("--eval-every", type=int, default=0,
                     help="Report held-out loss every N steps (needs --val-frac>0).")
+    ap.add_argument("--save-best", action="store_true",
+                    help="Save only when held-out loss improves (needs "
+                         "--val-frac + --eval-every); keeps the best checkpoint "
+                         "instead of an overfit endpoint.")
     ap.add_argument("--resume", default=None,
                     help="Adapter dir to resume from (e.g. a single-GPU checkpoint). "
                          "Loaded on every rank before the broadcast. --r/--targets "
@@ -211,6 +218,7 @@ def main():
     opt.zero_grad(set_to_none=True)
     ema = None
     step = 0
+    best_val = float("inf")
     tok_seen, t0 = 0, time.time()
     torch.cuda.reset_peak_memory_stats(device)
     try:
@@ -245,6 +253,9 @@ def main():
                 vl = evaluate()
                 if is_main(rank):
                     print(f"    [eval] step {step}: held-out loss {vl:.4f}")
+                if args.save_best and vl < best_val:
+                    best_val = vl
+                    save(f"[best step {step}, val {vl:.4f}]")
 
             if args.save_every and step % args.save_every == 0:
                 save(f"[checkpoint step {step}]")
@@ -254,7 +265,9 @@ def main():
         if step > 0:
             save("[interrupted]")
 
-    save("Done.")
+    # With --save-best the best-val checkpoint is already saved; don't clobber it.
+    if not (args.save_best and val_examples):
+        save("Done.")
 
     # Held-out loss (all ranks compute identically; rank 0 reports) + global
     # throughput (sum supervised tokens across ranks) + this rank's peak VRAM.
@@ -264,7 +277,8 @@ def main():
     dist.all_reduce(tok_t, op=dist.ReduceOp.SUM)
     if is_main(rank):
         if val_loss is not None:
-            print(f"\n[EVAL] held-out loss (EXL3 arm, DDP): {val_loss:.4f} "
+            tag = f" (best kept: {best_val:.4f})" if args.save_best else ""
+            print(f"\n[EVAL] held-out loss (EXL3 arm, DDP): {val_loss:.4f}{tag} "
                   f"over {len(val_examples)} examples")
         peak_gb = torch.cuda.max_memory_allocated(device) / 1e9
         print(f"[PERF] {tok_t.item() / dt if dt else 0:,.0f} supervised tok/s "

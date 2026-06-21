@@ -231,6 +231,10 @@ def main():
     ap.add_argument("--eval-every", type=int, default=0,
                     help="Also report held-out loss every N steps (needs "
                          "--val-frac > 0). 0 = only at the end.")
+    ap.add_argument("--save-best", action="store_true",
+                    help="Save the adapter only when held-out loss improves "
+                         "(needs --val-frac + --eval-every), so a long run keeps "
+                         "the best checkpoint instead of an overfit endpoint.")
     args = ap.parse_args()
 
     cdt = {"float32": torch.float32, "float16": torch.float16,
@@ -342,6 +346,7 @@ def main():
     opt.zero_grad(set_to_none=True)
     ema = None
     step = 0
+    best_val = float("inf")
     tok_seen, t0 = 0, time.time()
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -370,7 +375,11 @@ def main():
                   f"ema {ema:6.4f} | grad {gnorm:7.4f} | |B| {adapter_b_norm():7.3f}")
 
             if args.eval_every and val_examples and step % args.eval_every == 0:
-                print(f"    [eval] step {step}: held-out loss {evaluate():.4f}")
+                vl = evaluate()
+                print(f"    [eval] step {step}: held-out loss {vl:.4f}")
+                if args.save_best and vl < best_val:
+                    best_val = vl
+                    save(f"[best step {step}, val {vl:.4f}]")
 
             if args.sample_every and step % args.sample_every == 0:
                 net.eval()
@@ -392,11 +401,15 @@ def main():
         raise SystemExit(0)
 
     # 6. Save adapter (PEFT format; loadable by exllamav3.model.lora.LoRA).
-    save("Done.")
+    #    With --save-best we already kept the best-val checkpoint; don't clobber
+    #    it with the (likely overfit) final-step weights.
     dt = time.time() - t0
+    if not (args.save_best and val_examples):
+        save("Done.")
     val_loss = evaluate()
     if val_loss is not None:
-        print(f"\n[EVAL] held-out loss (EXL3 arm): {val_loss:.4f} "
+        tag = f" (best kept: {best_val:.4f})" if args.save_best else ""
+        print(f"\n[EVAL] held-out loss (EXL3 arm): {val_loss:.4f}{tag} "
               f"over {len(val_examples)} examples")
     peak_gb = (torch.cuda.max_memory_allocated() / 1e9
                if torch.cuda.is_available() else 0.0)
