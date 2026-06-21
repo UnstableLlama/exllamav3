@@ -131,7 +131,9 @@ def main():
     ap.add_argument("--no-clean-text", action="store_true")
     ap.add_argument("--min-response-words", type=int, default=3)
     ap.add_argument("--uppercase-response", action="store_true")
-    ap.add_argument("--r", type=int, default=64)
+    # --lora-r (not --r): under torchrun, argparse abbrev-matches "--r" to
+    # torchrun's own --rdzv-*/--role options. dest stays "r".
+    ap.add_argument("--lora-r", dest="r", type=int, default=64)
     ap.add_argument("--alpha", type=float, default=64.0)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--steps", type=int, default=500)
