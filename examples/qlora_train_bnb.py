@@ -1,10 +1,10 @@
 """
 BNB-NF4 QLoRA baseline arm — the comparison point for QLoRA-on-EXL3.
 
-This trains the SAME model / data / LoRA config as examples/qlora_train_native.py
-(the EXL3 arm), with the ONLY difference being the frozen base-weight format:
-bitsandbytes NF4 here vs the EXL3 trellis there. Everything else is matched so
-the comparison isolates the quantization format:
+Trains the SAME model / data / LoRA config as examples/qlora_train_native.py and
+qlora_train_native_ddp.py (the EXL3 arms); the ONLY difference is the frozen
+base-weight format (bitsandbytes NF4 here vs the EXL3 trellis there). Everything
+else is matched so the comparison isolates the quantization format:
 
   - same Llama-3 chat prompt + completion-only masking (prompt tokens = -100)
   - same `datasets` shuffle(seed=0)+select and the same deterministic val split
@@ -16,12 +16,17 @@ Runs in a SEPARATE venv (transformers + bitsandbytes + peft + accelerate +
 datasets) so it cannot disturb the pinned torch/EXL3 extension in qlora-venv.
 Point --model at the bf16/fp16 HF safetensors (bnb quantizes to NF4 on load).
 
+Single GPU:
     ~/exl3/bnb-venv/bin/python examples/qlora_train_bnb.py \
-        --model /path/to/Llama-3.1-8B-Instruct-bf16 \
-        --out   /mnt/two/adapters/yoda_bnb \
-        --dataset /mnt/two/data/yoda_refined.jsonl \
-        --r 64 --alpha 64 --batch 8 --steps 500 --val-frac 0.05 \
-        --gen-out /mnt/two/data/yoda_bnb_samples.jsonl
+        --model /path/to/Llama-3.2-3B-Instruct-bf16 \
+        --out /mnt/two/adapters/yoda_bnb --dataset /mnt/two/data/yoda_refined.jsonl \
+        --r 64 --alpha 64 --batch 16 --grad-accum 2 --steps 500 --val-frac 0.05 \
+        --eval-every 25 --gen-out /mnt/two/data/yoda_bnb_samples.jsonl
+
+Multi-GPU (DDP; --batch is PER-GPU, effective = batch * nproc * grad-accum):
+    ~/exl3/bnb-venv/bin/torchrun --standalone --nproc_per_node=2 \
+        examples/qlora_train_bnb.py --model ... --out ... --dataset ... \
+        --r 64 --alpha 64 --batch 16 --steps 500 --val-frac 0.05 --eval-every 25
 """
 
 import argparse
@@ -32,6 +37,7 @@ import re
 import time
 
 import torch
+import torch.distributed as dist
 
 EOT = "<|eot_id|>"
 TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
@@ -129,7 +135,7 @@ def main():
     ap.add_argument("--alpha", type=float, default=64.0)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--steps", type=int, default=500)
-    ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--batch", type=int, default=8, help="Per-GPU micro-batch")
     ap.add_argument("--grad-accum", type=int, default=1)
     ap.add_argument("--seq-len", type=int, default=512)
     ap.add_argument("--max-samples", type=int, default=4000)
@@ -137,6 +143,10 @@ def main():
     ap.add_argument("--eval-every", type=int, default=0,
                     help="Also report held-out loss every N steps (needs "
                          "--val-frac > 0). 0 = only at the end.")
+    ap.add_argument("--save-best", action="store_true",
+                    help="Save the adapter only when held-out loss improves "
+                         "(needs --val-frac + --eval-every). Avoids keeping an "
+                         "overfit endpoint.")
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
     ap.add_argument("--no-grad-ckpt", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
@@ -149,6 +159,21 @@ def main():
     from transformers import (AutoModelForCausalLM, AutoTokenizer,
                               BitsAndBytesConfig)
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+    # DDP: same manual pattern as qlora_train_native_ddp.py (replicate the small
+    # NF4 model per GPU, shard the batch, all-reduce only the LoRA grads). No
+    # torch-DDP wrapper, so bitsandbytes' 4-bit params don't trip its bucketing.
+    ddp = "RANK" in os.environ
+    if ddp:
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+    else:
+        rank, local_rank, world_size = 0, 0, 1
+    is_main = rank == 0
+    device = f"cuda:{local_rank}"
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -164,7 +189,7 @@ def main():
     )
     model = AutoModelForCausalLM.from_pretrained(
         args.model, quantization_config=bnb, torch_dtype=torch.bfloat16,
-        device_map={"": 0},
+        device_map={"": local_rank},
     )
     model.config.use_cache = False
     model = prepare_model_for_kbit_training(
@@ -174,28 +199,41 @@ def main():
         lora_dropout=0.0, bias="none", task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lcfg)
-    model.print_trainable_parameters()
+    if is_main:
+        model.print_trainable_parameters()
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    # Start every rank from identical adapters.
+    if ddp:
+        for p in params:
+            dist.broadcast(p.data, src=0)
 
     examples = build_sft_examples(tok, args)
     assert examples, "no usable training examples"
-    print(f" -- {len(examples)} SFT examples")
+    # Hold out the val split BEFORE sharding so it never leaks into any rank's
+    # training data and matches the other arms exactly.
     val_examples = []
     if args.val_frac > 0:
         n_val = max(1, int(len(examples) * args.val_frac))
         val_examples, examples = examples[:n_val], examples[n_val:]
-        print(f" -- held out {len(val_examples)} val; {len(examples)} train")
+    shard = examples[rank::world_size] if ddp else examples
+    if is_main:
+        print(f" -- {len(examples)} train examples ({len(shard)}/rank), "
+              f"{len(val_examples)} val")
 
-    params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=args.lr)  # no weight decay, constant LR
 
     def batches():
-        order = list(range(len(examples)))
+        order = list(range(len(shard)))
+        rng = random.Random(1234 + rank if ddp else 0)
         while True:
-            random.Random(0).shuffle(order)
+            rng.shuffle(order)
             for i in range(0, len(order) - args.batch + 1, args.batch):
-                yield [examples[j] for j in order[i:i + args.batch]]
+                yield [shard[j] for j in order[i:i + args.batch]]
 
     def evaluate():
+        # All ranks compute the same val loss (replicated, synced adapters) so
+        # they stay in lockstep; mean per-example loss, batch 1.
         if not val_examples:
             return None
         model.eval()
@@ -203,59 +241,81 @@ def main():
         with torch.no_grad():
             for ex in val_examples:
                 ii, ll, aa = collate([ex], pad_id)
-                out = model(input_ids=ii.cuda(), attention_mask=aa.cuda(),
-                            labels=ll.cuda())
+                out = model(input_ids=ii.to(device), attention_mask=aa.to(device),
+                            labels=ll.to(device))
                 total += out.loss.item()
         model.train()
         return total / len(val_examples)
 
+    def save(tag):
+        if is_main:
+            os.makedirs(args.out, exist_ok=True)
+            model.save_pretrained(args.out)
+            print(f"{tag} adapter -> {args.out}")
+        if ddp:
+            dist.barrier()
+
     bgen = batches()
     model.train()
     opt.zero_grad(set_to_none=True)
-    torch.cuda.reset_peak_memory_stats()
-    ema, tok_seen, t0 = None, 0, time.time()
+    torch.cuda.reset_peak_memory_stats(device)
+    ema, tok_seen, t0, best_val = None, 0, time.time(), float("inf")
     for step in range(1, args.steps + 1):
         accum = 0.0
         for _ in range(args.grad_accum):
             batch = next(bgen)
             ii, ll, aa = collate(batch, pad_id)
-            out = model(input_ids=ii.cuda(), attention_mask=aa.cuda(),
-                        labels=ll.cuda())
+            out = model(input_ids=ii.to(device), attention_mask=aa.to(device),
+                        labels=ll.to(device))
             (out.loss / args.grad_accum).backward()
             accum += out.loss.item() / args.grad_accum
             tok_seen += int((ll != -100).sum())
+        if ddp:
+            for p in params:
+                if p.grad is not None:
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                    p.grad /= world_size
         gnorm = torch.nn.utils.clip_grad_norm_(params, args.max_grad_norm
                                                or float("inf")).item()
         opt.step()
         opt.zero_grad(set_to_none=True)
         ema = accum if ema is None else 0.9 * ema + 0.1 * accum
-        print(f"  step {step:>5}/{args.steps} | loss {accum:6.4f} | "
-              f"ema {ema:6.4f} | grad {gnorm:7.4f}")
+        if is_main:
+            print(f"  step {step:>5}/{args.steps} | loss {accum:6.4f} | "
+                  f"ema {ema:6.4f} | grad {gnorm:7.4f}")
         if args.eval_every and val_examples and step % args.eval_every == 0:
-            print(f"    [eval] step {step}: held-out loss {evaluate():.4f}")
+            vl = evaluate()
+            if is_main:
+                print(f"    [eval] step {step}: held-out loss {vl:.4f}")
+            if args.save_best and vl < best_val:
+                best_val = vl
+                save(f"[best step {step}, val {vl:.4f}]")
 
     dt = time.time() - t0
-    tok_per_s = tok_seen / dt if dt > 0 else 0.0
-    peak_gb = torch.cuda.max_memory_allocated() / 1e9
-
-    os.makedirs(args.out, exist_ok=True)
-    model.save_pretrained(args.out)
-    print(f"Adapter written to {args.out}")
+    if not (args.save_best and val_examples):
+        save("Done.")
 
     val_loss = evaluate()
-    if val_loss is not None:
-        print(f"\n[EVAL] held-out loss (BNB-NF4 arm): {val_loss:.4f} "
-              f"over {len(val_examples)} examples")
-    print(f"[PERF] {tok_per_s:,.0f} supervised tok/s | "
-          f"peak VRAM {peak_gb:.2f} GB | {dt:.0f}s for {args.steps} steps")
+    tok_t = torch.tensor(float(tok_seen), device=device)
+    if ddp:
+        dist.all_reduce(tok_t, op=dist.ReduceOp.SUM)
+    if is_main:
+        if val_loss is not None:
+            tag = f" (best kept: {best_val:.4f})" if args.save_best else ""
+            print(f"\n[EVAL] held-out loss (BNB-NF4 arm): {val_loss:.4f}{tag} "
+                  f"over {len(val_examples)} examples")
+        peak_gb = torch.cuda.max_memory_allocated(device) / 1e9
+        print(f"[PERF] {tok_t.item() / dt if dt else 0:,.0f} supervised tok/s "
+              f"({'all ranks' if ddp else '1 GPU'}) | peak VRAM/GPU {peak_gb:.2f} "
+              f"GB | {dt:.0f}s, {args.steps} steps, world_size {world_size}")
 
-    if args.gen_out:
+    if args.gen_out and is_main:
         model.eval()
         recs = []
         with torch.no_grad():
             for p in EVAL_PROMPTS:
                 ids = tok(llama3_prompt(p), add_special_tokens=False,
-                          return_tensors="pt")["input_ids"].cuda()
+                          return_tensors="pt")["input_ids"].to(device)
                 out = model.generate(ids, max_new_tokens=args.gen_max_new_tokens,
                                      do_sample=False,
                                      eos_token_id=tok.convert_tokens_to_ids(EOT),
@@ -268,6 +328,10 @@ def main():
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
         print(f"\nGenerations written to {args.gen_out} "
               f"(score with examples/score_style_density.py)")
+
+    if ddp:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
