@@ -394,10 +394,15 @@ def main():
                 save(f"[checkpoint step {step}]")
     except KeyboardInterrupt:
         # Stopping early at the loss plateau is a normal workflow; don't discard
-        # the adapter trained so far.
-        print(f"\nInterrupted at step {step}; saving adapter before exit.")
-        if step > 0:
-            save("[interrupted]")
+        # the adapter trained so far -- unless --save-best already kept the
+        # best-val checkpoint, in which case saving now would clobber it with
+        # later (likely overfit) weights.
+        if args.save_best and val_examples:
+            print(f"\nInterrupted at step {step}; keeping best-val adapter.")
+        else:
+            print(f"\nInterrupted at step {step}; saving adapter before exit.")
+            if step > 0:
+                save("[interrupted]")
         raise SystemExit(0)
 
     # 6. Save adapter (PEFT format; loadable by exllamav3.model.lora.LoRA).

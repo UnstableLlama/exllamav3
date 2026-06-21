@@ -260,10 +260,16 @@ def main():
             if args.save_every and step % args.save_every == 0:
                 save(f"[checkpoint step {step}]")
     except KeyboardInterrupt:
-        if is_main(rank):
-            print(f"\nInterrupted at step {step}; saving.")
-        if step > 0:
-            save("[interrupted]")
+        # Don't clobber the best-val checkpoint with the current (later, likely
+        # worse) weights when --save-best is on; it's already saved.
+        if args.save_best and val_examples:
+            if is_main(rank):
+                print(f"\nInterrupted at step {step}; keeping best-val adapter.")
+        else:
+            if is_main(rank):
+                print(f"\nInterrupted at step {step}; saving.")
+            if step > 0:
+                save("[interrupted]")
 
     # With --save-best the best-val checkpoint is already saved; don't clobber it.
     if not (args.save_best and val_examples):
