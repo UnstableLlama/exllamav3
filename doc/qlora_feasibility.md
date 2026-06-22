@@ -5,6 +5,14 @@
 > built on top of EXL3-quantized weights, and provides a minimal,
 > gradient-checked building block to prove the foundation is sound.
 
+> **Update (2026-06):** the HF-Trainer integration this doc sketches
+> (`hf_qlora.py` + `examples/qlora_train.py`) has been **removed**; it was
+> superseded by a transformers-free native forward (`training/native_llama.py`,
+> driven by `examples/qlora_train_native.py`). The autograd building blocks
+> below (`EXL3LoRAFunction`, fused cross-entropy) are unchanged and still
+> underpin the native path. Mentions of `attach_qlora` / HF `Trainer` are
+> historical.
+
 ## The question
 
 Can we fine-tune an EXL3 (QTIP-style trellis) quantized model with QLoRA —

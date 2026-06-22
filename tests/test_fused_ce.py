@@ -151,64 +151,12 @@ def test_convenience_shift():
     print("[fce] convenience shift PASSED")
 
 
-def test_causal_lm_loss_wiring():
-    """
-    qlora_causal_lm_loss must reproduce HF-style shifted CausalLM loss, using
-    the standard get_decoder()/get_output_embeddings() interface and a plain
-    Linear head (orientation check).
-    """
-    import torch.nn as nn
-    _hfq = _load("hf_qlora")
-
-    b, t, d, v = 2, 10, 16, 30
-    torch.manual_seed(5)
-
-    class MockDecoderOut:
-        def __init__(self, h): self.last_hidden_state = h
-
-    class MockDecoder(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.proj = nn.Linear(d, d)
-        def forward(self, input_ids=None, attention_mask=None, **kw):
-            # input_ids here are float embeddings for the mock
-            return MockDecoderOut(self.proj(input_ids))
-
-    class MockCausalLM(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.decoder = MockDecoder()
-            self.lm_head = nn.Linear(d, v, bias=False)
-        def get_decoder(self): return self.decoder
-        def get_output_embeddings(self): return self.lm_head
-
-    model = MockCausalLM().double()
-    emb = torch.randn(b, t, d, dtype=torch.float64)        # stand-in for token embeddings
-    labels = torch.randint(0, v, (b, t))
-
-    loss_fused = _hfq.qlora_causal_lm_loss(model, emb, labels, chunk=4)
-
-    # Reference: full forward + HF-style shifted CE.
-    hidden = model.decoder(input_ids=emb).last_hidden_state
-    logits = model.lm_head(hidden)
-    loss_ref = F.cross_entropy(
-        logits[:, :-1].reshape(-1, v), labels[:, 1:].reshape(-1))
-
-    assert torch.allclose(loss_ref, loss_fused, atol=1e-9), \
-        f"causal LM loss mismatch: {loss_ref.item()} vs {loss_fused.item()}"
-    # And gradient must flow back into the decoder params.
-    loss_fused.backward()
-    assert model.decoder.proj.weight.grad is not None, "no grad into decoder"
-    print("[fce] causal LM loss wiring PASSED")
-
-
 def main():
     test_loss_and_grad_parity()
     test_ignore_index()
     test_chunk_invariance()
     test_gradcheck()
     test_convenience_shift()
-    test_causal_lm_loss_wiring()
     print("\nAll fused cross-entropy checks passed.")
 
 
