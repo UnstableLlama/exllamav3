@@ -5,6 +5,15 @@
 > weights** is possible, and get a visible end-to-end demo (fine-tune a small
 > model to talk like a pirate).
 
+> **Maintenance note (2026-06):** the superseded HF-Trainer training path
+> (`exllamav3/training/hf_qlora.py`, `examples/qlora_train.py`,
+> `examples/qlora_infer.py`, and `tests/test_qlora_train_loop.py`) has been
+> **removed**. The transformers-free native path (§0/§0b) is the only supported
+> route. Sections §3–§6 below describe the removed code and the abandoned
+> transformers-5.x investigation; they are kept for historical context only.
+> All exllamav3-internal reach-through used by the native forward now lives in
+> the single seam `exllamav3/training/backbone.py`.
+
 ---
 
 ## 0. RESOLVED — QLoRA-on-EXL3 works end-to-end (transformers-free)

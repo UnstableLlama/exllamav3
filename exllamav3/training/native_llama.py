@@ -40,6 +40,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from . import backbone
 from .qlora_linear import EXL3LoRAFunction
 from .fused_ce import fused_linear_cross_entropy, DEFAULT_CHUNK, IGNORE_INDEX
 
@@ -86,7 +87,7 @@ class DiffLinear(nn.Module):
         compute_dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
-        assert getattr(linear, "inner", None) is not None, \
+        assert backbone.is_loaded(linear), \
             "native Linear must be loaded (have .inner) before wrapping"
         self.linear = linear                 # frozen; holds trellis / fp16 weight
         self.key = linear.key
@@ -100,7 +101,7 @@ class DiffLinear(nn.Module):
         if r > 0:
             denom = (r ** 0.5) if use_rslora else r
             self.scale = float(alpha) / float(denom)
-            dev = self._infer_device()
+            dev = backbone.linear_device(self.linear)
             # B starts at zero so the adapter is a no-op at init (training begins
             # from the exact base model); A uses the PEFT kaiming init.
             self.lora_a = nn.Parameter(torch.empty(self.in_features, r, dtype=torch.float32, device=dev))
@@ -115,28 +116,13 @@ class DiffLinear(nn.Module):
         # holds its weights as plain tensors / buffers, never nn.Parameters, so
         # there is nothing to freeze: no gradient can ever reach the base.
 
-    def _infer_device(self):
-        try:
-            return self.linear.inner.trellis.device
-        except Exception:
-            return getattr(self.linear, "device", None)
-
-    def _weight_fn(self) -> Callable[[], torch.Tensor]:
-        inner = self.linear.inner
-        cdt = self.compute_dtype
-        return lambda: inner.get_weight_tensor().to(cdt)
-
-    def _bias(self) -> Optional[torch.Tensor]:
-        get_bias = getattr(self.linear.inner, "get_bias_tensor", None)
-        if get_bias is None:
-            return None
-        b = get_bias()
-        return b.to(self.compute_dtype) if b is not None else None
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         xc = x.to(self.compute_dtype)
         return EXL3LoRAFunction.apply(
-            xc, self.lora_a, self.lora_b, self._bias(), self.scale, self._weight_fn()
+            xc, self.lora_a, self.lora_b,
+            backbone.frozen_bias(self.linear, self.compute_dtype),
+            self.scale,
+            backbone.frozen_weight_closure(self.linear, self.compute_dtype),
         )
 
     def extra_repr(self) -> str:
@@ -179,11 +165,6 @@ class NativeLlamaQLoRA(nn.Module):
         gradient_checkpointing: bool = True,
     ):
         super().__init__()
-        # Import here so the module is importable without a CUDA build present.
-        from ..modules import (
-            Embedding, TransformerBlock, RMSNorm, Attention, GatedMLP, Linear,
-        )
-
         self.model = model
         self.compute_dtype = compute_dtype
         self.gradient_checkpointing = gradient_checkpointing
@@ -193,21 +174,9 @@ class NativeLlamaQLoRA(nn.Module):
         self.lora_alpha = float(alpha)
         self.use_rslora = use_rslora
 
-        mods = list(model.modules)
-
-        # Embedding is the first module; final RMSNorm + LM head are the last two.
-        assert isinstance(mods[0], Embedding), \
-            f"expected Embedding as first module, got {type(mods[0]).__name__}"
-        self.embed = mods[0]
-        assert isinstance(mods[-2], RMSNorm), \
-            f"expected final RMSNorm as penultimate module, got {type(mods[-2]).__name__}"
-        self.final_norm = mods[-2]
-        assert isinstance(mods[-1], Linear), \
-            f"expected Linear LM head as last module, got {type(mods[-1]).__name__}"
-        self.lm_head = mods[-1]
-
-        blocks = [m for m in mods if isinstance(m, TransformerBlock)]
-        assert blocks, "no TransformerBlock modules found; unsupported architecture"
+        # All reach into exllamav3's internal module layout goes through backbone:
+        # embedding first, final RMSNorm + LM head last, transformer blocks between.
+        self.embed, blocks, self.final_norm, self.lm_head = backbone.split_decoder(model)
 
         self.blocks = nn.ModuleList()
         self._block_meta = []
@@ -226,42 +195,33 @@ class NativeLlamaQLoRA(nn.Module):
             return w
 
         for blk in blocks:
-            attn: Attention = blk.attn
-            mlp: GatedMLP = blk.mlp
-            self._assert_supported(blk, attn, mlp)
+            backbone.assert_block_supported(blk)
+            q_proj, k_proj, v_proj, o_proj = backbone.attn_projections(blk)
+            gate_lins, up_lins, down_lins = backbone.mlp_projections(blk)
+            attn_norm, mlp_norm = backbone.block_norms(blk)
 
             # MLP may be sliced across intermediate dim for very wide models;
             # wrap every slice and sum the down-projections (mirrors GatedMLP).
-            gates = [wrap(g, "gate_proj") for g in mlp.gates]
-            ups = [wrap(u, "up_proj") for u in mlp.ups]
-            downs = [wrap(d, "down_proj") for d in mlp.downs]
+            gates = [wrap(g, "gate_proj") for g in gate_lins]
+            ups = [wrap(u, "up_proj") for u in up_lins]
+            downs = [wrap(d, "down_proj") for d in down_lins]
 
             entry = nn.Module()
-            entry.attn_norm = blk.attn_norm
-            entry.mlp_norm = blk.mlp_norm
-            entry.q_proj = wrap(attn.q_proj, "q_proj")
-            entry.k_proj = wrap(attn.k_proj, "k_proj")
-            entry.v_proj = wrap(attn.v_proj, "v_proj")
-            entry.o_proj = wrap(attn.o_proj, "o_proj")
+            entry.attn_norm = attn_norm
+            entry.mlp_norm = mlp_norm
+            entry.q_proj = wrap(q_proj, "q_proj")
+            entry.k_proj = wrap(k_proj, "k_proj")
+            entry.v_proj = wrap(v_proj, "v_proj")
+            entry.o_proj = wrap(o_proj, "o_proj")
             entry.gates = nn.ModuleList(gates)
             entry.ups = nn.ModuleList(ups)
             entry.downs = nn.ModuleList(downs)
             self.blocks.append(entry)
 
-            self._block_meta.append({
-                "num_q_heads": attn.num_q_heads,
-                "num_kv_heads": attn.num_kv_heads,
-                "head_dim": attn.head_dim,
-                "sm_scale": attn.sm_scale,
-                "attn_eps": blk.attn_norm.rms_norm_eps,
-                "mlp_eps": blk.mlp_norm.rms_norm_eps,
-                # RoPE (llama3-scaled inv_freq lives on the loaded RoPE object).
-                "inv_freq": attn.rope.inv_freq,
-                "attn_factor": attn.rope.attn_factor,
-            })
+            self._block_meta.append(backbone.block_metadata(blk))
 
         self._wrappers = wrappers
-        self.final_eps = self.final_norm.rms_norm_eps
+        self.final_eps = backbone.rms_norm_eps(self.final_norm)
         # The decoder device (norms / linears / RoPE). May differ from the
         # embedding's device, which is loaded on CPU (prefer_cpu). Assumes the
         # whole decoder sits on one device (true for single-GPU loads).
@@ -275,37 +235,6 @@ class NativeLlamaQLoRA(nn.Module):
                 f"target_modules {sorted(missing)} matched no linear in the model "
                 f"(available leaves: {sorted({w.key.split('.')[-1] for w in wrappers})})"
             )
-
-    # --- architecture guard ------------------------------------------------
-
-    @staticmethod
-    def _assert_supported(blk, attn, mlp):
-        from ..modules import GatedMLP
-        key = getattr(blk, "key", "?")
-        assert attn is not None and mlp is not None, \
-            f"{key}: block must have both attention and MLP (parallel/no-op blocks unsupported)"
-        assert isinstance(mlp, GatedMLP), \
-            f"{key}: only GatedMLP (SiLU/GeLU gated) MLPs are supported, got {type(mlp).__name__}"
-        assert mlp.activation_fn in ("silu",), \
-            f"{key}: only SiLU gated MLP is supported, got activation {mlp.activation_fn!r}"
-        assert getattr(mlp, "act_limit", 0.0) in (0.0, None), \
-            f"{key}: gated-MLP act_limit is not supported"
-        assert attn.q_norm is None and attn.k_norm is None, \
-            f"{key}: attention q/k norms are not supported by the native QLoRA forward"
-        assert getattr(attn, "v_norm", None) is None, f"{key}: attention v_norm unsupported"
-        assert getattr(attn, "g_proj", None) is None and not getattr(attn, "interleaved_gate", False), \
-            f"{key}: attention output gating is not supported"
-        assert getattr(attn, "sliding_window", -1) in (-1, 0, None), \
-            f"{key}: sliding-window attention is not supported"
-        assert not getattr(attn, "logit_softcapping", 0.0), \
-            f"{key}: attention logit softcapping is not supported"
-        assert attn.rope is not None and attn.rope.inv_freq is not None, \
-            f"{key}: model loaded without a RoPE table; cannot build positional encoding"
-        assert attn.rope.mrope_section is None, f"{key}: mRoPE is not supported"
-        assert attn.rope.rope_settings.rope_style.name == "NEOX", \
-            f"{key}: only NeoX-style RoPE is supported, got {attn.rope.rope_settings.rope_style.name}"
-        assert attn.rope.inv_freq.numel() * 2 == attn.head_dim, \
-            f"{key}: partial-rotary RoPE is not supported (rotary_dim != head_dim)"
 
     # --- forward -----------------------------------------------------------
 
@@ -388,16 +317,10 @@ class NativeLlamaQLoRA(nn.Module):
         bsz, t = input_ids.shape
         # The embedding may live on CPU (it has prefer_cpu=True and is loaded on
         # CPU even for a single-device model), while the decoder lives on the GPU.
-        # Run the lookup on the embedding's device, then move to the decoder.
+        # backbone.embed_tokens runs the lookup on the embedding's device; move
+        # the result to the decoder.
         dec_device = self.device
-        emb_device = self.embed.embedding.weight.device
-
-        hidden = self.embed.embedding(input_ids.to(emb_device))
-        if getattr(self.embed, "multiplier", 1.0) != 1.0:
-            hidden = hidden * self.embed.multiplier
-        if getattr(self.embed, "normalize", False):
-            hidden = hidden * (hidden.shape[-1] ** 0.5)
-        hidden = hidden.to(dec_device).float()
+        hidden = backbone.embed_tokens(self.embed, input_ids).to(dec_device).float()
 
         if attention_mask is not None:
             attention_mask = attention_mask.to(dec_device)
@@ -435,8 +358,7 @@ class NativeLlamaQLoRA(nn.Module):
 
     def lm_head_weight_fn(self) -> Callable[[], torch.Tensor]:
         """Frozen LM-head weight closure in ``[hidden, vocab]`` orientation."""
-        inner = self.lm_head.inner
-        return lambda: inner.get_weight_tensor()
+        return backbone.head_weight_closure(self.lm_head)
 
     def logits(self, input_ids: torch.Tensor,
                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -488,11 +410,9 @@ class NativeLlamaQLoRA(nn.Module):
         for w in self._wrappers:
             if w.r <= 0:
                 continue
-            lin = w.linear
             a = w.lora_a.detach().to(torch.float16)
             b = (w.lora_b.detach() * (w.scale * scaling)).to(torch.float16)
-            lin.lora_a_tensors[self] = a.to(lin.device)
-            lin.lora_b_tensors[self] = b.to(lin.device)
+            backbone.set_runtime_lora(w.linear, self, a, b)
 
     @torch.no_grad()
     def remove_from_native(self) -> None:
@@ -500,8 +420,7 @@ class NativeLlamaQLoRA(nn.Module):
         for w in self._wrappers:
             if w.r <= 0:
                 continue
-            w.linear.lora_a_tensors.pop(self, None)
-            w.linear.lora_b_tensors.pop(self, None)
+            backbone.clear_runtime_lora(w.linear, self)
 
     def save_adapter(self, directory: str,
                      base_model_name_or_path: Optional[str] = None) -> None:
