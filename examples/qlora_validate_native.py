@@ -12,11 +12,22 @@ Unlike the HuggingFace integration, nothing here depends on a ``transformers``
 version -- it reuses exllamav3's loaded weights and RoPE table directly.
 
 Usage:
-    python examples/qlora_validate_native.py \
-        --model /path/to/exl3_model
+    # single device
+    python examples/qlora_validate_native.py --model /path/to/exl3_model
+
+    # layer-autosplit across all visible GPUs (smoke-test the device-aware
+    # forward); --check-backward also exercises cross-device gradient flow
+    python examples/qlora_validate_native.py --model /path/to/exl3_model \
+        --parallel split --check-backward
+
+On a small model that fits one card, force a real split boundary by capping the
+per-device budget, e.g. ``--use-per-device 1 8`` (≈1 GB on cuda:0 spills the rest
+to cuda:1). On a model too big for one card, plain ``--parallel split`` balances
+naturally. The printed block-device distribution shows where the boundary landed.
 """
 
 import argparse
+from collections import Counter
 import torch
 
 from exllamav3 import Config, Model, Tokenizer
@@ -30,14 +41,64 @@ DEFAULT_PROMPTS = [
 ]
 
 
+def check_backward(model, tokenizer, prompt, device, cdt):
+    """
+    Smoke-test cross-device gradient flow: attach a tiny adapter, run one
+    loss.backward() with gradient checkpointing, and assert that gradients
+    reached adapters on *every* device the decoder is split across. This is the
+    part of the device-aware forward that the forward-only gate can't cover --
+    autograd flowing back through the cross-device hidden-state migrations.
+    """
+    print("\n" + "-" * 78)
+    print("backward smoke: cross-device gradient flow through the split")
+    net = NativeLlamaQLoRA(model, r=4, alpha=8.0,
+                           target_modules=["q_proj", "down_proj"],
+                           compute_dtype=cdt, gradient_checkpointing=True)
+    net.train()
+    ids = tokenizer.encode(prompt, add_bos=True).to(device)
+    loss = net.compute_loss(ids, ids.clone())
+    loss.backward()
+
+    expected = sorted({str(d) for d in net._block_devices})
+    have = set()
+    missing = []
+    for w in net._wrappers:
+        if w.r <= 0:
+            continue
+        # B inits to zero, so on the first step the gradient flows to B (grad_A
+        # is exactly zero while B == 0); check B to confirm the adapter was hit.
+        g = w.lora_b.grad
+        if g is not None and g.abs().sum().item() > 0:
+            have.add(str(w.lora_b.device))
+        else:
+            missing.append(w.key)
+    ok = (set(expected) <= have) and not missing
+    print(f"  loss = {loss.item():.4f}")
+    print(f"  adapters received grad on : {sorted(have)}")
+    print(f"  decoder split devices     : {expected}")
+    if missing:
+        print(f"  MISSING grad on {len(missing)} adapters, e.g. {missing[:3]}")
+    print("  backward smoke:", "PASS" if ok else "FAIL")
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
-    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--device", default="cuda:0",
+                    help="single-device load target (ignored when --parallel split)")
+    ap.add_argument("--parallel", choices=["single", "split"], default="single",
+                    help="single: load to --device; split: layer-autosplit across visible GPUs")
+    ap.add_argument("--reserve-per-device", nargs="*", type=float, default=None, metavar="GB",
+                    help="(split) GB to reserve per device; negative excludes a device")
+    ap.add_argument("--use-per-device", nargs="*", type=float, default=None, metavar="GB",
+                    help="(split) GB budget per device; caps a card to force a split on a small model")
     ap.add_argument("--compute-dtype", default="float32",
                     choices=["float32", "float16", "bfloat16"],
                     help="dtype for the differentiable linears (float32 = closest to true math)")
     ap.add_argument("--prompts", nargs="*", default=None)
+    ap.add_argument("--check-backward", action="store_true",
+                    help="also smoke-test cross-device gradient flow (tiny adapter + backward)")
     args = ap.parse_args()
 
     cdt = {"float32": torch.float32, "float16": torch.float16,
@@ -46,13 +107,26 @@ def main():
 
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
-    model.load(device=args.device, progressbar=True)
+    if args.parallel == "split":
+        load_kwargs = {}
+        if args.reserve_per_device is not None:
+            load_kwargs["reserve_per_device"] = args.reserve_per_device
+        if args.use_per_device is not None:
+            load_kwargs["use_per_device"] = args.use_per_device
+        model.load(progressbar=True, **load_kwargs)
+        print(f" -- layer-autosplit: active devices {model.active_devices}, "
+              f"output device {model.output_device}")
+    else:
+        model.load(device=args.device, progressbar=True)
     tokenizer = Tokenizer.from_config(config)
 
     # No adapters: a pure frozen forward, directly comparable to native inference.
     net = NativeLlamaQLoRA(model, target_modules=[], compute_dtype=cdt,
                            gradient_checkpointing=False)
     net.eval()
+
+    dist = Counter(str(d) for d in net._block_devices)
+    print(f" -- decoder block devices: {dict(dist)}  (final norm + head on {net.device})")
 
     print("=" * 78)
     print(f"Validating differentiable forward (compute_dtype={args.compute_dtype}) "
@@ -70,6 +144,9 @@ def main():
         # Differentiable forward.
         with torch.no_grad():
             logits_diff = net.logits(ids).float()            # [1, t, V]
+
+        # Native output lands on the model's output device; co-locate for compare.
+        logits_diff = logits_diff.to(logits_native.device)
 
         ln = logits_native[0, -1]
         ld = logits_diff[0, -1]
@@ -96,9 +173,12 @@ def main():
         print(f"  per-position argmax agreement: {agree*100:.1f}%")
         print(f"  last-token logits: max|Δ|={max_abs:.4f}  cos={cos:.6f}")
 
+    if args.check_backward:
+        all_ok &= check_backward(model, tokenizer, prompts[0], args.device, cdt)
+
     print("\n" + "=" * 78)
     print("RESULT:", "PASS -- differentiable forward matches native"
-          if all_ok else "FAIL -- top-1 mismatch (see above)")
+          if all_ok else "FAIL -- see above")
     print("=" * 78)
     # Exit non-zero on failure so a `validate && train` kickoff aborts the run
     # instead of training against a broken forward (e.g. a new architecture).
