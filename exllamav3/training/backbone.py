@@ -106,6 +106,35 @@ def block_norms(block):
     return block.attn_norm, block.mlp_norm
 
 
+def block_device(block):
+    """
+    The device a block's weights live on (set at load; differs per block under a
+    layer-autosplit load, identical for a single-device load).
+    """
+    return block.device
+
+
+def to_device(x: torch.Tensor, device) -> torch.Tensor:
+    """
+    Migrate ``x`` to ``device`` the way exllamav3's own layer-split forward does
+    (``Module.prepare_for_device``, ``modules/module.py``): a direct copy, or a
+    bounce through CPU when ``no_p2p_copy`` is set (env ``EXLLAMA_NO_P2P_COPY``),
+    for rigs without GPU peer access. A no-op when already on ``device``.
+
+    Unlike the native forward (``@torch.inference_mode``), this runs inside the
+    training graph; ``.to`` / ``.cpu`` are autograd-friendly, so gradients flow
+    back across the boundary.
+    """
+    if x.device == device:
+        return x
+    # Lazy import: only reached at runtime on a real multi-device model, never in
+    # the single-device CPU tests (which return above).
+    from ..modules import module as _module
+    if _module.no_p2p_copy:
+        return x.cpu().to(device)
+    return x.to(device)
+
+
 def attn_projections(block):
     """Return the ``(q_proj, k_proj, v_proj, o_proj)`` linears of one block."""
     a = block.attn
