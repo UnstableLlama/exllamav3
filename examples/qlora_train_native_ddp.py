@@ -44,7 +44,8 @@ import torch.distributed as dist
 # Reuse the single-GPU example's data helpers (same dir on sys.path under torchrun).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qlora_train_native import (  # noqa: E402
-    build_sft_examples, collate, make_lr_scheduler, resolve_steps_and_warmup,
+    build_sft_examples, build_lm_examples, collate, make_lr_scheduler,
+    resolve_steps_and_warmup, ThroughputMeter,
 )
 
 from exllamav3 import Config, Model, Tokenizer  # noqa: E402
@@ -118,6 +119,14 @@ def main():
                     help="Smoke test: train to RESPOND IN ALL CAPS (dense, "
                          "unambiguous proof the training path works).")
     ap.add_argument("--max-samples", type=int, default=0)
+    ap.add_argument("--shuffle", action="store_true",
+                    help="Shuffle the training rows once (deterministically, same "
+                         "order on every rank) before the --val-frac carve and "
+                         "sharding, so the held-out split is random and shards are "
+                         "well mixed. Matched with the single-GPU/BNB arms by seed.")
+    ap.add_argument("--shuffle-seed", type=int, default=0,
+                    help="Seed for --shuffle (also the random-subset seed when "
+                         "--max-samples caps the rows). Default 0.")
     ap.add_argument("--seq-len", type=int, default=512)
     ap.add_argument("--targets", nargs="*", default=None)
     ap.add_argument("--train-embeddings", action="store_true",
@@ -142,6 +151,19 @@ def main():
                          "--val-frac. Built identically on every rank.")
     ap.add_argument("--eval-dataset", default=None,
                     help="Dataset id/path for --eval-split (defaults to --dataset).")
+    ap.add_argument("--eval2-dataset", default=None,
+                    help="A SECOND held-out eval set, reported alongside the "
+                         "primary one each --eval-every and at the end (e.g. your "
+                         "test set vs wikitext). --save-best stays keyed on the "
+                         "PRIMARY eval. Built identically on every rank.")
+    ap.add_argument("--eval2-split", default="test",
+                    help="Split for --eval2-dataset (default 'test').")
+    ap.add_argument("--eval2-text-key", default=None,
+                    help="If set, treat --eval2-dataset as PLAIN TEXT and compute "
+                         "an LM loss over packed --seq-len blocks (e.g. 'text' for "
+                         "wikitext). If unset, built as a second SFT eval.")
+    ap.add_argument("--eval2-max-samples", type=int, default=0,
+                    help="Cap source rows for --eval2-dataset (0 = all).")
     ap.add_argument("--val-frac", type=float, default=0.0,
                     help="Hold out this fraction of train for held-out eval loss; "
                          "the SAME deterministic split as the single-GPU / BNB "
@@ -210,6 +232,7 @@ def main():
         uppercase_response=args.uppercase_response,
         messages_key=args.messages_key,
         prompt_format=args.prompt_format,
+        shuffle=args.shuffle, shuffle_seed=args.shuffle_seed,
     )
     # Held-out eval set, built identically on every rank. Prefer the dataset's own
     # eval split (real held-out data); otherwise carve the first val_frac off
@@ -229,6 +252,26 @@ def main():
     elif args.val_frac > 0:
         n_val = max(1, int(len(examples) * args.val_frac))
         val_examples, examples = examples[:n_val], examples[n_val:]
+
+    # Optional SECOND held-out eval set (e.g. wikitext LM), built identically on
+    # every rank so all ranks stay in lockstep when evaluating it.
+    val2_examples = []
+    eval2_label = ""
+    if args.eval2_dataset:
+        eval2_label = args.eval2_dataset.split("/")[-1]
+        if args.eval2_text_key:
+            val2_examples = build_lm_examples(
+                tokenizer, args.eval2_dataset, args.eval2_split, args.seq_len,
+                text_key=args.eval2_text_key, max_samples=args.eval2_max_samples)
+        else:
+            val2_examples = build_sft_examples(
+                model, tokenizer, args.eval2_dataset, args.eval2_max_samples,
+                args.seq_len, instruction_key=args.instruction_key,
+                context_key=args.context_key, response_key=args.response_key,
+                split=args.eval2_split, clean_text=not args.no_clean_text,
+                min_response_words=args.min_response_words,
+                uppercase_response=args.uppercase_response,
+                messages_key=args.messages_key, prompt_format=args.prompt_format)
     shard = examples[rank::world_size]
     assert shard, "no training examples on this rank"
 
@@ -272,32 +315,39 @@ def main():
             print(f"{tag} adapter -> {args.out}")
         dist.barrier()
 
-    def evaluate():
-        # All ranks compute the same val loss (replicated, synced adapters) so
-        # they stay in lockstep; only rank 0 prints. Mean per-example loss,
-        # batch 1 -- identical to the single-GPU and BNB arms.
-        if not val_examples:
+    def eval_loss(exs):
+        # All ranks compute the same loss (replicated, synced adapters) so they
+        # stay in lockstep; only rank 0 prints. Mean per-example loss, batch 1 --
+        # identical to the single-GPU and BNB arms. Works for SFT and plain-LM
+        # eval sets alike.
+        if not exs:
             return None
         net.eval()
         total = 0.0
         with torch.no_grad():
-            for ex in val_examples:
+            for ex in exs:
                 ii, ll, aa = collate([ex], pad_id)
                 total += net.compute_loss(ii, ll, attention_mask=aa,
                                           chunk=args.ce_chunk).item()
         net.train()
-        return total / len(val_examples)
+        return total / len(exs)
+
+    def evaluate():
+        return eval_loss(val_examples)
 
     bgen = batches()
     opt.zero_grad(set_to_none=True)
     ema = None
     step = 0
     best_val = float("inf")
-    tok_seen, t0 = 0, time.time()
+    tok_seen, tot_seen, t0 = 0, 0, time.time()
+    meter = ThroughputMeter()
     torch.cuda.reset_peak_memory_stats(device)
     try:
         for step in range(1, args.steps + 1):
+            step_t0 = time.time()
             accum_loss = 0.0
+            step_sup = step_tot = 0
             for _ in range(args.grad_accum):
                 batch = next(bgen)
                 input_ids, labels, attn = collate(batch, pad_id)
@@ -305,7 +355,8 @@ def main():
                                         chunk=args.ce_chunk)
                 (loss / args.grad_accum).backward()
                 accum_loss += loss.item() / args.grad_accum
-                tok_seen += int((labels != -100).sum())
+                step_sup += int((labels != -100).sum())
+                step_tot += int(attn.sum())
 
             allreduce_grads()
             gnorm = torch.nn.utils.clip_grad_norm_(
@@ -319,17 +370,32 @@ def main():
             lt = torch.tensor(accum_loss, device=device)
             dist.all_reduce(lt, op=dist.ReduceOp.SUM)
             global_loss = lt.item() / world_size
+            # Live tok/s is this rank's only (no per-step collective); shards are
+            # balanced so multiply by world_size for an aggregate estimate. The
+            # final [PERF] line all-reduces the true total.
+            tok_seen += step_sup
+            tot_seen += step_tot
+            meter.update(time.time() - step_t0, step_sup, step_tot)
+            _, tot_tps = meter.rates()
             ema = global_loss if ema is None else 0.9 * ema + 0.1 * global_loss
             if is_main(rank):
                 print(f"  step {step:>5}/{args.steps} | loss {global_loss:6.4f} | "
                       f"ema {ema:6.4f} | grad {gnorm:7.4f} | "
-                      f"lr {sched.get_last_lr()[0]:.2e}")
+                      f"lr {sched.get_last_lr()[0]:.2e} | "
+                      f"~{tot_tps * world_size:,.0f} tok/s")
 
-            if args.eval_every and val_examples and step % args.eval_every == 0:
+            if (args.eval_every and step % args.eval_every == 0
+                    and (val_examples or val2_examples)):
                 vl = evaluate()
+                v2 = eval_loss(val2_examples)
                 if is_main(rank):
-                    print(f"    [eval] step {step}: held-out loss {vl:.4f}")
-                if args.save_best and vl < best_val:
+                    parts = []
+                    if vl is not None:
+                        parts.append(f"held-out {vl:.4f}")
+                    if v2 is not None:
+                        parts.append(f"{eval2_label} {v2:.4f}")
+                    print(f"    [eval] step {step}: " + " | ".join(parts))
+                if args.save_best and vl is not None and vl < best_val:
                     best_val = vl
                     save(f"[best step {step}, val {vl:.4f}]")
 
@@ -355,16 +421,21 @@ def main():
     # throughput (sum supervised tokens across ranks) + this rank's peak VRAM.
     dt = time.time() - t0
     val_loss = evaluate()
-    tok_t = torch.tensor(float(tok_seen), device=device)
+    val2_loss = eval_loss(val2_examples)
+    tok_t = torch.tensor([float(tok_seen), float(tot_seen)], device=device)
     dist.all_reduce(tok_t, op=dist.ReduceOp.SUM)
     if is_main(rank):
         if val_loss is not None:
             tag = f" (best kept: {best_val:.4f})" if args.save_best else ""
             print(f"\n[EVAL] held-out loss (EXL3 arm, DDP): {val_loss:.4f}{tag} "
                   f"over {len(val_examples)} examples")
+        if val2_loss is not None:
+            print(f"[EVAL] eval2 ({eval2_label}) loss: {val2_loss:.4f} "
+                  f"over {len(val2_examples)} examples")
         peak_gb = torch.cuda.max_memory_allocated(device) / 1e9
-        print(f"[PERF] {tok_t.item() / dt if dt else 0:,.0f} supervised tok/s "
-              f"(all ranks) | peak VRAM/GPU {peak_gb:.2f} GB | {dt:.0f}s, "
+        print(f"[PERF] {tok_t[0].item() / dt if dt else 0:,.0f} sup tok/s, "
+              f"{tok_t[1].item() / dt if dt else 0:,.0f} tot tok/s (all ranks) | "
+              f"peak VRAM/GPU {peak_gb:.2f} GB | {dt:.0f}s, "
               f"{step} steps, world_size {world_size}")
     dist.destroy_process_group()
 

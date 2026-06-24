@@ -628,6 +628,72 @@ a metharme EXL3-vs-NF4 comparison is wanted.
   epochs (the ~3.09 floor looks capacity-bound); judge style on bf16 / merge per
   finding C, not on the attenuated 4bpw base.
 
+### Session 5 — broader architectures: Gemma3/4 + Qwen3 dense in the native forward
+
+> Goal: train current dense models (Gemma4, Qwen3.x) on the EXL3 native path.
+> The native forward was scoped to one block shape (pre-norm GQA + NeoX-RoPE
+> softmax attention + pre-norm SiLU GatedMLP) and `assert_block_supported`
+> rejected everything else. This session **generalizes** that forward instead of
+> forking a per-arch one.
+
+**The triage (read the arch files, not memory — exllamav3 already has inference
+support for all of these):**
+- **Qwen3.5 / 3.6 are hybrid linear-attention** (`architecture/qwen3_5.py`): even
+  the non-MoE `Qwen3_5ForCausalLM` builds ~3/4 of layers as **`GatedDeltaNet`**
+  (delta rule + exp gating + causal Conv1D + L2 q/k-norm) and the rest as gated
+  full-attention. Training them needs a **differentiable Gated DeltaNet** (its own
+  recurrent forward+backward) — a separate research-grade project, **not done**.
+  This is the hard blocker; "dense" ≠ standard transformer for Qwen3.5/3.6.
+- **Gemma4 dense text** (`architecture/gemma4.py`) is **softmax** attention — no
+  linear-attn blocker — but adds: q/k/v-norm, **sandwich post-norms**, **GeGLU**,
+  alternating **sliding/full** layers with **per-layer head dims**, Gemma `(1+w)`
+  RMSNorm, embedding scaling, optional logit softcapping. All differentiable.
+- **Qwen3 (3.0) dense** = standard transformer + **q/k-norm** only (falls out for
+  free from the generalization).
+
+**What was changed (all write-confirmed; compiles + CPU logic checks pass; NOT yet
+run on the GPU box):**
+- `training/backbone.py`: `assert_block_supported` relaxed to allow q/k/v-norm,
+  GeGLU, sliding window, sandwich post-norms and softcap, while still rejecting
+  GatedDeltaNet (linear attn), MoE, attention output gating, mRoPE, partial
+  rotary and non-NeoX RoPE. New `norm_spec()` (reproduces `RMSNorm.forward_torch`:
+  `y = x/rms(x) * constant_scale * (weight + constant_bias)`, so Gemma's `(1+w)`
+  and unweighted v-norm are read from the module, not hardcoded), `block_post_norms()`,
+  `attn_qkv_norms()`, `head_softcap()`; `block_metadata` gains `sliding_window`,
+  `softcap`, `activation`, `use_k_as_v`.
+- `training/native_llama.py`: `_rmsnorm` → spec-driven `_norm`; `_block_forward`
+  now does per-head q/k/v-norm (pre-RoPE), attn softcap, sandwich post-norms
+  (`x = x + post_norm(sublayer_out)` — confirmed against the fused `rms_norm` CUDA
+  kernel, `norm.cu:205`), GeGLU, and `use_k_as_v` (V = raw K projection); `_attn_bias`
+  gains a sliding-window band; `forward` builds an attention bias per
+  (window, device); final norm uses `_norm`; final-logit softcapping handled in
+  `logits()`/`compute_loss()` (the fused-CE path can't softcap, so it falls back
+  to a supervised-position CE when a final cap is present). **Reduces
+  bit-identically to the old Llama/Mistral/Qwen2 path when all features are off.**
+- `tests/test_native_llama.py`: updated to the new entry/meta interface and added
+  `test_gemma_block_matches_reference` (q/k/v-norm + sandwich + GeGLU + sliding +
+  softcap + `(1+w)`) vs an independent reference.
+
+**Loading:** `Model.from_config` defaults to `component="text"`, so a multimodal
+`Gemma4ForConditionalGeneration` checkpoint loads its **text decoder** only; the
+`split_decoder` embedding-first/head-last layout holds. Use `--sample-every 0` for
+a first Gemma4 run (live generation would exercise the SWA/recurrent cache path,
+irrelevant to training).
+
+**MUST DO before trusting a Gemma4 run (the correctness gate):**
+```
+# CPU first (torch only): the differentiable block vs an independent reference.
+python tests/test_native_llama.py
+# Then on the box: logits parity vs exllamav3's own forward on a real Gemma4 dense:
+python examples/qlora_validate_native.py --model /path/to/Gemma4-dense-exl3
+#   Expect high per-position argmax agreement + tiny last-token max|Δ|.
+# Only then: python examples/qlora_train_native.py --model ... --sample-every 0 ...
+```
+Open: q/k-norm is folded into exllamav3's RoPE kernel in the native path (we apply
+norm-then-RoPE, mathematically equal) — the validate gate is what confirms it on
+real weights. Gemma4's `sm_scale=1.0` (vs Gemma2/3 `query_pre_attn_scalar**-0.5`)
+is read from the module, so no special-casing — but eyeball it in validation.
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)

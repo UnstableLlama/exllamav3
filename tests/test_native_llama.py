@@ -138,7 +138,79 @@ def _ref_block(meta, weights, hidden, positions):
     return hidden
 
 
-def _build_block(d, nq, nkv, hd, inter, dtype=torch.float64, r=0):
+def _spec(weight, eps=1e-5, bias=0.0, scale=1.0):
+    # Mirror of backbone.norm_spec (weight None = unweighted).
+    return {"weight": weight, "eps": eps, "bias": bias, "scale": scale}
+
+
+def _ref_rmsnorm_b(x, w, eps, bias):
+    # RMSNorm with optional (weight + bias); w=None => unweighted (Gemma v-norm).
+    var = x.float().pow(2).mean(-1, keepdim=True) + eps
+    xn = x.float() * torch.rsqrt(var)
+    if w is None:
+        return xn
+    return xn * (w.float() + bias) if bias != 0.0 else xn * w.float()
+
+
+def _ref_block_gemma(meta, weights, hidden, positions, feats):
+    """Independent reference for a block with the Gemma/Qwen3 features enabled:
+    (1+w) norms, per-head q/k/v norm, sliding-window mask, attn softcap, GeGLU,
+    and sandwich post-norms (x = x + post_norm(sublayer_out))."""
+    eps_a, eps_m = meta["attn_eps"], meta["mlp_eps"]
+    nq, nkv, hd = meta["num_q_heads"], meta["num_kv_heads"], meta["head_dim"]
+    sm, inv_freq = meta["sm_scale"], meta["inv_freq"]
+    window, softcap = meta["sliding_window"], meta["softcap"]
+    bias = weights["norm_bias"]
+    b, t, _ = hidden.shape
+
+    normed = _ref_rmsnorm_b(hidden, weights["attn_norm"], eps_a, bias)
+    q = (normed @ weights["q"]).view(b, t, nq, hd)
+    k = (normed @ weights["k"]).view(b, t, nkv, hd)
+    v = (normed @ weights["v"]).view(b, t, nkv, hd)
+    if feats.get("qk_norm"):
+        q = _ref_rmsnorm_b(q, weights["q_norm"], eps_a, bias)
+        k = _ref_rmsnorm_b(k, weights["k_norm"], eps_a, bias)
+    if feats.get("v_norm"):
+        v = _ref_rmsnorm_b(v, None, eps_a, 0.0)
+    q = _ref_rope(q, inv_freq, positions)
+    k = _ref_rope(k, inv_freq, positions)
+    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    rep = nq // nkv
+    k = k.repeat_interleave(rep, 1)
+    v = v.repeat_interleave(rep, 1)
+    scores = (q @ k.transpose(-1, -2)) * sm
+    if softcap:
+        scores = softcap * torch.tanh(scores / softcap)
+    mask = torch.zeros(t, t, dtype=scores.dtype)
+    mask.masked_fill_(torch.triu(torch.ones(t, t, dtype=torch.bool), 1), float("-inf"))
+    if window and window > 0:
+        mask.masked_fill_(torch.tril(torch.ones(t, t, dtype=torch.bool), -window), float("-inf"))
+    scores = scores + mask
+    ctx = torch.softmax(scores, -1) @ v
+    ctx = ctx.transpose(1, 2).reshape(b, t, nq * hd)
+    attn_out = ctx @ weights["o"]
+    if feats.get("post_norm"):
+        hidden = hidden + _ref_rmsnorm_b(attn_out, weights["attn_post"], eps_a, bias)
+    else:
+        hidden = hidden + attn_out
+
+    normed2 = _ref_rmsnorm_b(hidden, weights["mlp_norm"], eps_m, bias)
+    actfn = F.silu if meta["activation"] == "silu" \
+        else (lambda z: F.gelu(z, approximate="tanh"))
+    a = actfn(normed2 @ weights["gate"]) * (normed2 @ weights["up"])
+    mlp_out = a @ weights["down"]
+    if feats.get("post_norm"):
+        hidden = hidden + _ref_rmsnorm_b(mlp_out, weights["mlp_post"], eps_m, bias)
+    else:
+        hidden = hidden + mlp_out
+    return hidden
+
+
+def _build_block(d, nq, nkv, hd, inter, dtype=torch.float64, r=0, *,
+                 qk_norm=False, v_norm=False, post_norm=False,
+                 activation="silu", window=-1, softcap=0.0, norm_bias=0.0):
+    """Build a synthetic block + matching reference weights. Flags toggle the
+    Gemma/Qwen3 features so one builder covers the plain and extended paths."""
     norm_a = _ns_norm(d, dtype)
     norm_m = _ns_norm(d, dtype)
     lins = {
@@ -151,8 +223,19 @@ def _build_block(d, nq, nkv, hd, inter, dtype=torch.float64, r=0):
         "down": MockLinear(inter, d, "blk.mlp.down_proj", dtype=dtype),
     }
     entry = types.SimpleNamespace()
-    entry.attn_norm = norm_a
-    entry.mlp_norm = norm_m
+    entry.attn_norm_spec = _spec(norm_a.weight, bias=norm_bias)
+    entry.mlp_norm_spec = _spec(norm_m.weight, bias=norm_bias)
+    # Optional per-head q/k/v norms (q/k weighted; v unweighted, as in Gemma).
+    qn = nn.Parameter(1.0 + 0.02 * torch.randn(hd, dtype=dtype), requires_grad=False)
+    kn = nn.Parameter(1.0 + 0.02 * torch.randn(hd, dtype=dtype), requires_grad=False)
+    entry.q_norm_spec = _spec(qn, bias=norm_bias) if qk_norm else None
+    entry.k_norm_spec = _spec(kn, bias=norm_bias) if qk_norm else None
+    entry.v_norm_spec = _spec(None) if v_norm else None
+    # Optional sandwich post-norms.
+    pa = _ns_norm(d, dtype)
+    pm = _ns_norm(d, dtype)
+    entry.attn_post_spec = _spec(pa.weight, bias=norm_bias) if post_norm else None
+    entry.mlp_post_spec = _spec(pm.weight, bias=norm_bias) if post_norm else None
     entry.q_proj = DiffLinear(lins["q"], r=r, compute_dtype=dtype)
     entry.k_proj = DiffLinear(lins["k"], r=r, compute_dtype=dtype)
     entry.v_proj = DiffLinear(lins["v"], r=r, compute_dtype=dtype)
@@ -166,6 +249,8 @@ def _build_block(d, nq, nkv, hd, inter, dtype=torch.float64, r=0):
         "num_q_heads": nq, "num_kv_heads": nkv, "head_dim": hd,
         "sm_scale": hd ** -0.5, "attn_eps": 1e-5, "mlp_eps": 1e-5,
         "inv_freq": inv_freq, "attn_factor": 1.0,
+        "sliding_window": window, "softcap": softcap, "activation": activation,
+        "use_k_as_v": False,
     }
     ref_weights = {
         "attn_norm": norm_a.weight, "mlp_norm": norm_m.weight,
@@ -173,6 +258,8 @@ def _build_block(d, nq, nkv, hd, inter, dtype=torch.float64, r=0):
         "v": lins["v"].frozen_weight, "o": lins["o"].frozen_weight,
         "gate": lins["gate"].frozen_weight, "up": lins["up"].frozen_weight,
         "down": lins["down"].frozen_weight,
+        "q_norm": qn, "k_norm": kn, "attn_post": pa.weight, "mlp_post": pm.weight,
+        "norm_bias": norm_bias,
     }
     return entry, meta, ref_weights, lins
 
@@ -231,6 +318,32 @@ def test_block_matches_reference():
     err = (out - ref).abs().max().item()
     assert err < 1e-4, f"block forward mismatch vs reference: max|Δ|={err}"
     print(f"[block] forward matches plain-torch reference (max|Δ|={err:.2e}) PASSED")
+
+
+def test_gemma_block_matches_reference():
+    # The Gemma/Qwen3 feature path: (1+w) norms, per-head q/k/v norm, alternating
+    # sliding window, attn softcap, GeGLU, and sandwich post-norms -- all at once.
+    torch.manual_seed(3)
+    d, nq, nkv, hd, inter = 16, 4, 2, 8, 32
+    feats = {"qk_norm": True, "v_norm": True, "post_norm": True}
+    entry, meta, refw, lins = _build_block(
+        d, nq, nkv, hd, inter, dtype=torch.float32, r=0,
+        qk_norm=True, v_norm=True, post_norm=True,
+        activation="gelu", window=3, softcap=50.0, norm_bias=1.0,
+    )
+    net = _headless_net()
+
+    b, t = 2, 7
+    hidden = torch.randn(b, t, d, dtype=torch.float32)
+    positions = torch.arange(t).unsqueeze(0).expand(b, t)
+    attn_bias = net._attn_bias(None, t, hidden.device, torch.float32, window=3)
+
+    out = net._block_forward(meta, entry, hidden, positions, attn_bias)
+    ref = _ref_block_gemma(meta, refw, hidden, positions, feats)
+    err = (out - ref).abs().max().item()
+    assert err < 1e-4, f"gemma block forward mismatch vs reference: max|Δ|={err}"
+    print(f"[block-gemma] q/k/v-norm + sandwich + GeGLU + sliding + softcap "
+          f"matches reference (max|Δ|={err:.2e}) PASSED")
 
 
 def test_block_backward_reaches_adapters_only():
@@ -311,6 +424,7 @@ def test_modules_to_save_param_groups():
 def main():
     test_difflinear_matches_reference_and_gradchecks()
     test_block_matches_reference()
+    test_gemma_block_matches_reference()
     test_block_backward_reaches_adapters_only()
     test_modules_to_save_param_groups()
     print("\nAll native-Llama differentiable-forward checks passed.")

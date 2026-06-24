@@ -25,11 +25,14 @@ through the gradchecked :class:`EXL3LoRAFunction`. The LM head is handled by the
 streaming :func:`fused_linear_cross_entropy`, so the ``[tokens, vocab]`` logit
 tensor is never materialized during training.
 
-Scope: Llama-family decoders (``LlamaModel`` and architectures that reuse the
-same ``TransformerBlock`` = pre-norm attention (GQA + NeoX RoPE) + pre-norm
-gated-SiLU MLP, e.g. Mistral/Qwen2). Models with q/k norms, sliding windows,
-logit softcapping, MoE or interleaved/headwise gates are rejected explicitly so
-failures are loud rather than silently wrong.
+Scope: pre-norm softmax-attention decoders. Every norm / activation / scale is
+read from the loaded modules (see ``backbone.norm_spec``), so one block forward
+covers Llama/Mistral/Qwen2 (plain), Qwen3 (q/k-norm), and Gemma3/4 (q/k/v-norm +
+sandwich post-norms + GeGLU + alternating sliding/full window + per-layer head
+dims + logit softcapping). It reduces bit-identically to the original Llama path
+when those features are absent. Still rejected loudly (``assert_block_supported``):
+linear/recurrent attention (GatedDeltaNet -> Qwen3.5/3.6), MoE, attention output
+gating, mRoPE, partial rotary and non-NeoX RoPE.
 """
 
 from __future__ import annotations
@@ -202,6 +205,8 @@ class NativeLlamaQLoRA(nn.Module):
             q_proj, k_proj, v_proj, o_proj = backbone.attn_projections(blk)
             gate_lins, up_lins, down_lins = backbone.mlp_projections(blk)
             attn_norm, mlp_norm = backbone.block_norms(blk)
+            attn_post, mlp_post = backbone.block_post_norms(blk)        # Gemma sandwich
+            q_norm, k_norm, v_norm = backbone.attn_qkv_norms(blk)       # Qwen3 / Gemma
 
             # MLP may be sliced across intermediate dim for very wide models;
             # wrap every slice and sum the down-projections (mirrors GatedMLP).
@@ -210,11 +215,21 @@ class NativeLlamaQLoRA(nn.Module):
             downs = [wrap(d, "down_proj") for d in down_lins]
 
             entry = nn.Module()
-            entry.attn_norm = attn_norm
-            entry.mlp_norm = mlp_norm
+            # Norm specs (plain dicts read from the modules; see backbone.norm_spec),
+            # so the block forward reproduces each arch's exact RMSNorm without
+            # reaching into module internals. None means "no such norm here".
+            entry.attn_norm_spec = backbone.norm_spec(attn_norm)
+            entry.mlp_norm_spec = backbone.norm_spec(mlp_norm)
+            entry.attn_post_spec = backbone.norm_spec(attn_post)
+            entry.mlp_post_spec = backbone.norm_spec(mlp_post)
+            entry.q_norm_spec = backbone.norm_spec(q_norm)
+            entry.k_norm_spec = backbone.norm_spec(k_norm)
+            entry.v_norm_spec = backbone.norm_spec(v_norm)
             entry.q_proj = wrap(q_proj, "q_proj")
             entry.k_proj = wrap(k_proj, "k_proj")
-            entry.v_proj = wrap(v_proj, "v_proj")
+            # Some Gemma layers reuse K as V (no v_proj); the block forward then
+            # takes V from the raw K projection.
+            entry.v_proj = wrap(v_proj, "v_proj") if v_proj is not None else None
             entry.o_proj = wrap(o_proj, "o_proj")
             entry.gates = nn.ModuleList(gates)
             entry.ups = nn.ModuleList(ups)
@@ -225,7 +240,10 @@ class NativeLlamaQLoRA(nn.Module):
             self._block_devices.append(backbone.block_device(blk))
 
         self._wrappers = wrappers
-        self.final_eps = backbone.rms_norm_eps(self.final_norm)
+        self.final_norm_spec = backbone.norm_spec(self.final_norm)
+        # Final-logit tanh softcapping (Gemma2; 0 = none). Materialized-logit path
+        # applies it; the fused-CE training path can't, so compute_loss guards.
+        self.final_softcap = backbone.head_softcap(self.lm_head)
         # Output device = where the final norm + LM head live. Under a single
         # load this is the one decoder device; under layer-autosplit it is the
         # last device in the split (modules[-1].device). The embedding is loaded
@@ -272,11 +290,20 @@ class NativeLlamaQLoRA(nn.Module):
 
     # --- forward -----------------------------------------------------------
 
-    def _rmsnorm(self, x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-        # Matches RMSNorm.forward_torch: normalize in fp32, then apply weight.
-        var = x.float().pow(2).mean(dim=-1, keepdim=True) + eps
-        xn = x.float() * torch.rsqrt(var)
-        return xn * weight.float()
+    def _norm(self, x: torch.Tensor, spec: dict) -> torch.Tensor:
+        # Reproduces RMSNorm.forward_torch exactly for any arch: normalize in fp32,
+        # scale by constant_scale, then multiply by (weight + constant_bias). spec
+        # comes from backbone.norm_spec; weight None = unweighted (Gemma v-norm).
+        # Gemma's (1 + weight) convention is just bias = 1.0 read from the module.
+        xf = x.float()
+        var = xf.pow(2).mean(dim=-1, keepdim=True) + spec["eps"]
+        xn = xf * torch.rsqrt(var) * spec["scale"]
+        w = spec["weight"]
+        if w is None:
+            return xn
+        w = w.float()
+        b = spec["bias"]
+        return xn * (w + b) if b != 0.0 else xn * w
 
     def _apply_rope(self, x: torch.Tensor, inv_freq: torch.Tensor, attn_factor: float,
                     position_ids: torch.Tensor) -> torch.Tensor:
@@ -288,14 +315,21 @@ class NativeLlamaQLoRA(nn.Module):
         return x * cos + _rotate_half_neox(x) * sin
 
     def _attn_bias(self, attention_mask: Optional[torch.Tensor], t: int,
-                   device, dtype) -> torch.Tensor:
+                   device, dtype, window: int = -1) -> torch.Tensor:
         # Additive attention bias: causal (upper triangle masked) AND, if given, a
         # [b, t] key-padding mask. Assumes right-padding (pads at the end), so no
         # real-token query row is ever fully masked -> softmax can't produce NaN.
+        # When window > 0, also mask keys older than the sliding window (query i
+        # attends only to j with i - window < j <= i), matching Gemma's local
+        # layers; window <= 0 is full causal.
         neg = float("-inf")
         causal = torch.triu(torch.ones(t, t, dtype=torch.bool, device=device), diagonal=1)
         bias = torch.zeros(1, 1, t, t, dtype=dtype, device=device)
         bias = bias.masked_fill(causal[None, None], neg)
+        if window and window > 0:
+            too_old = torch.tril(torch.ones(t, t, dtype=torch.bool, device=device),
+                                 diagonal=-window)
+            bias = bias.masked_fill(too_old[None, None], neg)
         if attention_mask is not None:
             key_pad = (attention_mask == 0)[:, None, None, :]    # [b,1,1,t]
             bias = bias.masked_fill(key_pad, neg)
@@ -306,10 +340,20 @@ class NativeLlamaQLoRA(nn.Module):
         nq, nkv, hd = meta["num_q_heads"], meta["num_kv_heads"], meta["head_dim"]
 
         # --- attention ---
-        normed = self._rmsnorm(hidden, entry.attn_norm.weight, meta["attn_eps"])
+        normed = self._norm(hidden, entry.attn_norm_spec)
         q = entry.q_proj(normed).view(bsz, t, nq, hd).float()
         k = entry.k_proj(normed).view(bsz, t, nkv, hd).float()
-        v = entry.v_proj(normed).view(bsz, t, nkv, hd).float()
+        # use_k_as_v: V is the raw K projection (taken before k-norm/RoPE).
+        v = k if entry.v_proj is None else entry.v_proj(normed).view(bsz, t, nkv, hd).float()
+
+        # Per-head q/k/v RMSNorm, applied to the raw projections before RoPE
+        # (Qwen3: q/k; Gemma: q/k/v unweighted). No-ops when the spec is None.
+        if entry.q_norm_spec is not None:
+            q = self._norm(q, entry.q_norm_spec)
+        if entry.k_norm_spec is not None:
+            k = self._norm(k, entry.k_norm_spec)
+        if entry.v_norm_spec is not None:
+            v = self._norm(v, entry.v_norm_spec)
 
         q = self._apply_rope(q, meta["inv_freq"], meta["attn_factor"], position_ids)
         k = self._apply_rope(k, meta["inv_freq"], meta["attn_factor"], position_ids)
@@ -324,21 +368,34 @@ class NativeLlamaQLoRA(nn.Module):
             v = v.repeat_interleave(rep, dim=1)
 
         scores = torch.matmul(q, k.transpose(-1, -2)) * meta["sm_scale"]  # [b,nq,t,t]
+        softcap = meta["softcap"]
+        if softcap:                                              # tanh logit softcap (Gemma2)
+            scores = softcap * torch.tanh(scores / softcap)
         scores = scores + attn_bias.to(scores.dtype)
         probs = torch.softmax(scores, dim=-1)
         ctx = torch.matmul(probs, v)                            # [b,nq,t,hd]
         ctx = ctx.transpose(1, 2).reshape(bsz, t, nq * hd)
         attn_out = entry.o_proj(ctx).float()
-        hidden = hidden + attn_out
+        # Sandwich post-norm (Gemma): x = x + post_norm(attn_out). Plain pre-norm
+        # archs have no post-norm -> straight residual add.
+        if entry.attn_post_spec is not None:
+            hidden = hidden + self._norm(attn_out, entry.attn_post_spec)
+        else:
+            hidden = hidden + attn_out
 
-        # --- gated MLP ---
-        normed2 = self._rmsnorm(hidden, entry.mlp_norm.weight, meta["mlp_eps"])
+        # --- gated MLP (SwiGLU / GeGLU) ---
+        normed2 = self._norm(hidden, entry.mlp_norm_spec)
+        act = F.silu if meta["activation"] == "silu" \
+            else (lambda z: F.gelu(z, approximate="tanh"))
         mlp_out = None
         for gate, up, down in zip(entry.gates, entry.ups, entry.downs):
-            a = F.silu(gate(normed2)) * up(normed2)
+            a = act(gate(normed2)) * up(normed2)
             d = down(a).float()
             mlp_out = d if mlp_out is None else mlp_out + d
-        hidden = hidden + mlp_out
+        if entry.mlp_post_spec is not None:
+            hidden = hidden + self._norm(mlp_out, entry.mlp_post_spec)
+        else:
+            hidden = hidden + mlp_out
         return hidden
 
     def forward(
@@ -382,7 +439,20 @@ class NativeLlamaQLoRA(nn.Module):
         if ckpt and not hidden.requires_grad:
             hidden = hidden.detach().requires_grad_(True)
 
-        attn_bias = self._attn_bias(attention_mask, t, first_device, torch.float32)
+        # Attention bias per (window, device): Gemma alternates sliding-window and
+        # full-causal layers, so each distinct window needs its own mask; plain
+        # archs have a single window (-1) and this builds one bias per device,
+        # same as before. Cached so it is built at most once per (window, device).
+        bias_cache: dict = {}
+
+        def get_bias(window, dev):
+            key = (int(window), str(dev))
+            b = bias_cache.get(key)
+            if b is None:
+                am = attention_mask.to(dev) if attention_mask is not None else None
+                b = self._attn_bias(am, t, dev, torch.float32, window)
+                bias_cache[key] = b
+            return b
 
         cur_device = first_device
         for meta, entry, dev in zip(self._block_meta, self.blocks, self._block_devices):
@@ -391,8 +461,8 @@ class NativeLlamaQLoRA(nn.Module):
             if dev != cur_device:
                 hidden = backbone.to_device(hidden, dev)
                 position_ids = backbone.to_device(position_ids, dev)
-                attn_bias = backbone.to_device(attn_bias, dev)
                 cur_device = dev
+            attn_bias = get_bias(meta["sliding_window"], dev)
             if ckpt:
                 hidden = torch.utils.checkpoint.checkpoint(
                     self._block_forward, meta, entry, hidden, position_ids, attn_bias,
@@ -403,7 +473,7 @@ class NativeLlamaQLoRA(nn.Module):
 
         # Final norm + head live on the output device (the last split device).
         hidden = backbone.to_device(hidden, self.device)
-        hidden = self._rmsnorm(hidden, self.final_norm.weight, self.final_eps)
+        hidden = self._norm(hidden, self.final_norm_spec)
         return hidden
 
     # --- heads -------------------------------------------------------------
@@ -417,7 +487,10 @@ class NativeLlamaQLoRA(nn.Module):
         """Materialize full logits ``[b, t, vocab]`` (validation / small batches)."""
         hidden = self.forward(input_ids, attention_mask)
         w = self.lm_head_weight_fn()()
-        return backbone.to_device(hidden, w.device).to(w.dtype) @ w
+        logits = backbone.to_device(hidden, w.device).to(w.dtype) @ w
+        if self.final_softcap:
+            logits = self.final_softcap * torch.tanh(logits / self.final_softcap)
+        return logits
 
     def compute_loss(
         self,
@@ -433,19 +506,27 @@ class NativeLlamaQLoRA(nn.Module):
         vocab]``). Trainable head (``train_head``): standard autograd so the head
         weight gets a gradient -- but logits are computed only at the *supervised*
         positions (labels != ignore_index), so memory scales with the number of
-        supervised tokens, not the full sequence."""
+        supervised tokens, not the full sequence. Final-logit softcapping (Gemma2)
+        also takes the supervised-position path, since the fused head can't apply
+        the tanh cap."""
         hidden = self.forward(input_ids, attention_mask)
-        if self.train_head:
+        # Materialize logits only at supervised positions when the head trains OR
+        # a final softcap must be applied (the fused head supports neither).
+        if self.train_head or self.final_softcap:
             d = hidden.shape[-1]
             hs = hidden[:, :-1, :].reshape(-1, d)                 # shift
             lbl = labels[:, 1:].reshape(-1).to(hs.device)
             valid = lbl != ignore_index
-            w = self.head_weight                                  # [d, V]
+            w = self.head_weight if self.train_head else self.lm_head_weight_fn()()  # [d, V]
             if not bool(valid.any()):
-                # No supervised tokens: keep the head in the graph with a 0 grad.
-                return (hs.sum() * 0.0) + (w.sum() * 0.0)
+                # No supervised tokens: keep the graph alive with a 0 grad (the
+                # head too when it is trainable).
+                z = hs.sum() * 0.0
+                return z + (w.sum() * 0.0) if self.train_head else z
             hs = backbone.to_device(hs[valid], w.device).to(w.dtype)
             logits = hs @ w
+            if self.final_softcap:
+                logits = self.final_softcap * torch.tanh(logits / self.final_softcap)
             return F.cross_entropy(logits, lbl[valid].to(w.device))
         # The fused head matmuls hidden against the frozen head weight, which
         # lives on the head's device; co-locate them (no-op single-device).
