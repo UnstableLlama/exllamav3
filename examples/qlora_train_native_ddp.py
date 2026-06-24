@@ -105,10 +105,13 @@ def main():
                          "'messages' for UnstableLlama/semancy). When set, the user "
                          "turn is the prompt and the assistant turn the supervised "
                          "response; the flat instruction/response keys are ignored.")
-    ap.add_argument("--prompt-format", choices=["auto", "metharme"], default="auto",
+    ap.add_argument("--prompt-format", choices=["auto", "mistral", "metharme"],
+                    default="auto",
                     help="Chat format. auto: the model's native template "
-                         "(Llama-3, Mistral [INST], ...). metharme: Pygmalion "
-                         "<|user|>{q}<|model|>{a}</s> (EOS ends the turn).")
+                         "(Llama-3, Mistral [INST], mistral3 [SYSTEM_PROMPT]/[INST]). "
+                         "mistral: explicit <s>[INST]{q}[/INST]{a}</s> (= auto for "
+                         "the mistral3 arch, e.g. Mistral-Medium-3.5). metharme: "
+                         "Pygmalion <|user|>{q}<|model|>{a}</s>.")
     ap.add_argument("--no-clean-text", action="store_true")
     ap.add_argument("--min-response-words", type=int, default=3)
     ap.add_argument("--uppercase-response", action="store_true",
@@ -117,6 +120,15 @@ def main():
     ap.add_argument("--max-samples", type=int, default=0)
     ap.add_argument("--seq-len", type=int, default=512)
     ap.add_argument("--targets", nargs="*", default=None)
+    ap.add_argument("--train-embeddings", action="store_true",
+                    help="Also FULLY train the input embeddings (modules_to_save). "
+                         "Big (vocab x hidden): raises VRAM AND the per-step LoRA-"
+                         "grad all-reduce by ~that size on every rank. On a tied "
+                         "model this also trains the head.")
+    ap.add_argument("--train-head", action="store_true",
+                    help="Also FULLY train the LM head (modules_to_save); uses a "
+                         "supervised-position CE so the head gets a gradient. Tied "
+                         "model => same as --train-embeddings.")
     ap.add_argument("--compute-dtype", default="bfloat16",
                     choices=["float32", "float16", "bfloat16"])
     ap.add_argument("--no-grad-ckpt", action="store_true")
@@ -165,11 +177,14 @@ def main():
     net = NativeLlamaQLoRA(
         model, r=args.r, alpha=args.alpha, target_modules=args.targets,
         compute_dtype=cdt, gradient_checkpointing=not args.no_grad_ckpt,
+        train_embeddings=args.train_embeddings, train_head=args.train_head,
     )
     net.train()
     if is_main(rank):
-        print(f" -- world_size {world_size}, trainable LoRA params: "
-              f"{net.num_trainable():,} (r={args.r}, alpha={args.alpha})")
+        ms = net.modules_to_save_parameters()
+        print(f" -- world_size {world_size}, trainable params: "
+              f"{net.num_trainable():,} (r={args.r}, alpha={args.alpha}"
+              f"{', +modules_to_save (' + str(sum(p.numel() for p in ms)) + ')' if ms else ''})")
 
     # 3a. Optionally resume from a checkpoint (e.g. stop a single-GPU run, then
     #     continue on N GPUs). Every rank loads the same file; the broadcast below
@@ -177,10 +192,11 @@ def main():
     if args.resume:
         net.load_adapter(args.resume)
 
-    # 3b. Sync initial adapter weights from rank 0 so every rank starts identical
-    #     (lora_a is randomly initialized; lora_b is zero, but broadcast both to be
-    #     safe). Without this, ranks would diverge from step 1.
-    for p in net.lora_parameters():
+    # 3b. Sync initial trainable weights from rank 0 so every rank starts
+    #     identical (lora_a is random, lora_b zero; embed/head copies are
+    #     identical already but broadcast for safety). Without this, ranks would
+    #     diverge from step 1.
+    for p in net.trainable_parameters():
         dist.broadcast(p.data, src=0)
 
     # 4. Data. Build the full set identically on every rank (same seed/order), then
@@ -227,8 +243,7 @@ def main():
               f"scheduler={args.scheduler}, warmup={warmup_steps}, "
               f"weight_decay={args.weight_decay}")
 
-    opt = torch.optim.AdamW(net.lora_parameters(), lr=args.lr,
-                            weight_decay=args.weight_decay)
+    opt = torch.optim.AdamW(net.param_groups(args.weight_decay), lr=args.lr)
     sched = make_lr_scheduler(opt, args.scheduler, args.steps, warmup_steps)
 
     def batches():
@@ -241,9 +256,11 @@ def main():
                 yield [shard[j] for j in order[i:i + args.batch]]
 
     def allreduce_grads():
-        # Average LoRA grads across ranks == DDP. Do it once per optimizer step,
-        # after accumulation, before clipping.
-        for p in net.lora_parameters():
+        # Average trainable grads across ranks == DDP. Once per optimizer step,
+        # after accumulation, before clipping. NB: with --train-embeddings/-head
+        # the embed/head grads (vocab x hidden) are reduced here too -- much
+        # larger than the usual few-MB LoRA grads.
+        for p in net.trainable_parameters():
             if p.grad is not None:
                 dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
                 p.grad /= world_size
@@ -292,7 +309,7 @@ def main():
 
             allreduce_grads()
             gnorm = torch.nn.utils.clip_grad_norm_(
-                net.lora_parameters(), args.max_grad_norm or float("inf")
+                net.trainable_parameters(), args.max_grad_norm or float("inf")
             ).item()
             opt.step()
             sched.step()

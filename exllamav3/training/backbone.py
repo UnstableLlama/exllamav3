@@ -200,6 +200,22 @@ def head_weight_closure(lm_head) -> Callable[[], torch.Tensor]:
 
 # --- token embedding -------------------------------------------------------
 
+def embed_weight(embed) -> torch.Tensor:
+    """The input-embedding weight tensor (``[vocab, hidden]``) of an ``Embedding``
+    module -- the tensor to clone when fully training the embeddings."""
+    return embed.embedding.weight
+
+
+def embed_apply(embed, hidden: torch.Tensor) -> torch.Tensor:
+    """Apply the ``Embedding`` module's optional multiplier / normalization to
+    already-looked-up hidden states (shared by the frozen and trainable paths)."""
+    if getattr(embed, "multiplier", 1.0) != 1.0:
+        hidden = hidden * embed.multiplier
+    if getattr(embed, "normalize", False):
+        hidden = hidden * (hidden.shape[-1] ** 0.5)
+    return hidden
+
+
 def embed_tokens(embed, input_ids: torch.Tensor) -> torch.Tensor:
     """
     Look up token embeddings via exllamav3's ``Embedding`` module, applying its
@@ -208,11 +224,7 @@ def embed_tokens(embed, input_ids: torch.Tensor) -> torch.Tensor:
     """
     table = embed.embedding
     hidden = table(input_ids.to(table.weight.device))
-    if getattr(embed, "multiplier", 1.0) != 1.0:
-        hidden = hidden * embed.multiplier
-    if getattr(embed, "normalize", False):
-        hidden = hidden * (hidden.shape[-1] ** 0.5)
-    return hidden
+    return embed_apply(embed, hidden)
 
 
 # --- runtime LoRA slots (so native generation reflects the adapter) --------
