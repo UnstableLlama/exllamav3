@@ -42,10 +42,35 @@ import math
 import random
 import re
 import time
+from collections import deque
 import torch
 
 from exllamav3 import Config, Model, Tokenizer
 from exllamav3.training.native_llama import NativeLlamaQLoRA
+
+
+class ThroughputMeter:
+    """Rolling tok/s over a sliding window of recent steps, for a live readout.
+
+    Tracks supervised (loss-bearing, labels != -100) and total (non-pad) tokens
+    separately, so the per-step line can show real throughput rather than the
+    run-average the final ``[PERF]`` line reports. Window-based (not cumulative)
+    so the number reflects current steady state, not warmup. Time fed in should
+    be the train-step compute only (exclude eval/sample/save) for a clean rate.
+    """
+
+    def __init__(self, window=20):
+        self.buf = deque(maxlen=window)   # (dt, supervised_tokens, total_tokens)
+
+    def update(self, dt, supervised, total):
+        self.buf.append((float(dt), int(supervised), int(total)))
+
+    def rates(self):
+        """Return (supervised_tok_per_s, total_tok_per_s) over the window."""
+        tt = sum(b[0] for b in self.buf)
+        if tt <= 0:
+            return 0.0, 0.0
+        return sum(b[1] for b in self.buf) / tt, sum(b[2] for b in self.buf) / tt
 
 
 def turn_end_token(tokenizer):
@@ -189,7 +214,7 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
                        response_key="response", split="train",
                        clean_text=True, min_response_words=3,
                        uppercase_response=False, messages_key=None,
-                       prompt_format="auto"):
+                       prompt_format="auto", shuffle=False, shuffle_seed=0):
     """
     Load an instruction dataset and tokenize for completion-only SFT using the
     model's native chat template (Llama-3, Mistral, etc. -- whatever
@@ -211,6 +236,13 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
     raw rows otherwise teach the model to emit "[stage directions]"). Rows whose
     cleaned response has fewer than min_response_words tokens are dropped.
 
+    shuffle (with shuffle_seed) permutes the rows once after loading, BEFORE any
+    --val-frac carve and before training, so the held-out split is a random
+    sample rather than the first N rows and training order is randomized. It is
+    deterministic given the seed, so the EXL3 and BNB arms (which call the same
+    HF datasets shuffle) stay matched. Default off preserves the original order;
+    the existing shuffle-on-cap (random subset when capping) is unchanged.
+
     Returns a list of dicts with python int lists: input_ids / labels.
     """
     import os
@@ -226,8 +258,13 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
         ds = load_dataset(builder, data_files=dataset_name, split=split)
     else:
         ds = load_dataset(dataset_name, split=split)
+    # Shuffle the full set when asked, or (as before) when capping rows so the
+    # subset is random rather than the first max_samples. shuffle_seed defaults to
+    # 0, matching the prior cap behavior exactly when --shuffle is off.
+    if shuffle or (max_samples and max_samples < len(ds)):
+        ds = ds.shuffle(seed=shuffle_seed)
     if max_samples and max_samples < len(ds):
-        ds = ds.shuffle(seed=0).select(range(max_samples))
+        ds = ds.select(range(max_samples))
 
     build_prompt, eot = format_prompt_and_eot(model, tokenizer, prompt_format)
 
@@ -290,6 +327,55 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
             continue  # response got truncated away; skip
         examples.append({"input_ids": input_ids, "labels": labels})
 
+    return examples
+
+
+def build_lm_examples(tokenizer, dataset_name, split, seq_len,
+                      text_key="text", max_samples=0):
+    """Plain-text language-modeling eval set (e.g. wikitext) for a second,
+    task-independent held-out loss.
+
+    Concatenates the dataset's text column and packs it into non-overlapping
+    ``seq_len`` blocks with every token supervised (no completion mask), so the
+    resulting loss is a straight nats/token cross-entropy -- on the same scale as
+    the SFT eval loss, which lets you watch the two move together (does the task
+    fit track or diverge from general LM ability?). Tokenization matches the SFT
+    path's underlying tokenizer, so the EXL3 and BNB arms produce identical
+    blocks and hence a comparable number.
+
+    Returns a list of dicts (input_ids / labels), same shape as
+    :func:`build_sft_examples`, so the same eval loop consumes it.
+    """
+    import os
+    from datasets import load_dataset
+
+    if os.path.exists(dataset_name):
+        ext = os.path.splitext(dataset_name)[1].lower()
+        builder = {".json": "json", ".jsonl": "json",
+                   ".parquet": "parquet", ".csv": "csv"}.get(ext, "json")
+        ds = load_dataset(builder, data_files=dataset_name, split=split)
+    else:
+        ds = load_dataset(dataset_name, split=split)
+    if max_samples and max_samples < len(ds):
+        ds = ds.select(range(max_samples))
+
+    bos = tokenizer.bos_token_id
+    buf, examples = [], []
+    for row in ds:
+        text = row.get(text_key) or ""
+        if not text.strip():
+            continue
+        ids = tokenizer.encode(text, add_bos=False,
+                               encode_special_tokens=False)[0].tolist()
+        # The tokenizer may auto-prepend BOS; drop it so packing doesn't inject a
+        # BOS at every row boundary (mid-stream BOS would distort the LM loss).
+        if bos is not None and ids and ids[0] == bos:
+            ids = ids[1:]
+        buf.extend(ids)
+        while len(buf) >= seq_len:
+            block = buf[:seq_len]
+            buf = buf[seq_len:]
+            examples.append({"input_ids": block, "labels": list(block)})
     return examples
 
 
@@ -396,6 +482,14 @@ def main():
                          "maximally dense/consistent transform that must show in "
                          "generation if the training path works at all.")
     ap.add_argument("--max-samples", type=int, default=4000)
+    ap.add_argument("--shuffle", action="store_true",
+                    help="Shuffle the training rows once (deterministically) "
+                         "before the --val-frac carve and before training, so the "
+                         "held-out split is a random sample and training order is "
+                         "randomized. Matched across arms given the same seed.")
+    ap.add_argument("--shuffle-seed", type=int, default=0,
+                    help="Seed for --shuffle (also the random-subset seed when "
+                         "--max-samples caps the rows). Default 0.")
     ap.add_argument("--seq-len", type=int, default=512)
     ap.add_argument("--inspect", type=int, default=0, metavar="N",
                     help="Tokenization check: decode the first N built examples "
@@ -437,6 +531,21 @@ def main():
                          "--val-frac.")
     ap.add_argument("--eval-dataset", default=None,
                     help="Dataset id/path for --eval-split (defaults to --dataset).")
+    ap.add_argument("--eval2-dataset", default=None,
+                    help="A SECOND held-out eval set, reported alongside the "
+                         "primary one each --eval-every and at the end, so you can "
+                         "watch them move together (e.g. your test set vs "
+                         "wikitext). --save-best stays keyed on the PRIMARY eval.")
+    ap.add_argument("--eval2-split", default="test",
+                    help="Split for --eval2-dataset (default 'test').")
+    ap.add_argument("--eval2-text-key", default=None,
+                    help="If set, treat --eval2-dataset as PLAIN TEXT and compute "
+                         "a language-modeling loss over packed --seq-len blocks "
+                         "(every token supervised) -- e.g. 'text' for wikitext. "
+                         "If unset, --eval2-dataset is built as a second SFT eval "
+                         "using the same instruction/messages keys.")
+    ap.add_argument("--eval2-max-samples", type=int, default=0,
+                    help="Cap source rows for --eval2-dataset (0 = all).")
     ap.add_argument("--val-frac", type=float, default=0.0,
                     help="Hold out this fraction of train for held-out eval loss "
                          "(deterministic; the SAME split as qlora_train_bnb.py "
@@ -512,8 +621,9 @@ def main():
         uppercase_response=args.uppercase_response,
         messages_key=args.messages_key,
         prompt_format=args.prompt_format,
+        shuffle=args.shuffle, shuffle_seed=args.shuffle_seed,
     )
-    print(f" -- {len(examples)} SFT examples")
+    print(f" -- {len(examples)} SFT examples{' (shuffled)' if args.shuffle else ''}")
     assert examples, "no usable training examples"
 
     # Tokenization check: decode the prompt span (labels==-100) and the supervised
@@ -572,6 +682,30 @@ def main():
               f"{len(examples)} for training")
         assert examples, "val_frac too large; no training examples left"
 
+    # Optional SECOND held-out eval set (task-independent monitor, e.g. wikitext).
+    # Plain-text LM loss when --eval2-text-key is given, else a second SFT eval.
+    val2_examples = []
+    eval2_label = ""
+    if args.eval2_dataset:
+        eval2_label = args.eval2_dataset.split("/")[-1]
+        if args.eval2_text_key:
+            val2_examples = build_lm_examples(
+                tokenizer, args.eval2_dataset, args.eval2_split, args.seq_len,
+                text_key=args.eval2_text_key, max_samples=args.eval2_max_samples)
+            kind = f"LM blocks over '{args.eval2_text_key}'"
+        else:
+            val2_examples = build_sft_examples(
+                model, tokenizer, args.eval2_dataset, args.eval2_max_samples,
+                args.seq_len, instruction_key=args.instruction_key,
+                context_key=args.context_key, response_key=args.response_key,
+                split=args.eval2_split, clean_text=not args.no_clean_text,
+                min_response_words=args.min_response_words,
+                uppercase_response=args.uppercase_response,
+                messages_key=args.messages_key, prompt_format=args.prompt_format)
+            kind = "SFT"
+        print(f" -- eval2 ({eval2_label}): {len(val2_examples)} {kind} examples "
+              f"from split '{args.eval2_split}'")
+
     # Finalize step count (from --epochs) and warmup before building the schedule.
     args.steps, warmup_steps = resolve_steps_and_warmup(
         args, len(examples), args.batch * args.grad_accum)
@@ -617,15 +751,16 @@ def main():
         net.save_adapter(args.out, base_model_name_or_path=args.model)
         print(f"{tag} Adapter written to {args.out}")
 
-    def evaluate():
-        # Mean per-example completion-loss over the val split, one example at a
-        # time (no padding effects). qlora_train_bnb.py computes this identically.
-        if not val_examples:
+    def eval_loss(exs):
+        # Mean per-example loss over an eval set, one example at a time (no
+        # padding effects). qlora_train_bnb.py computes this identically. Works
+        # for both SFT (completion-masked) and plain-LM (all-supervised) sets.
+        if not exs:
             return None
         net.eval()
         total, n = 0.0, 0
         with torch.no_grad():
-            for ex in val_examples:
+            for ex in exs:
                 input_ids, labels, attn = collate([ex], pad_id)
                 l = net.compute_loss(input_ids, labels, attention_mask=attn,
                                      chunk=args.ce_chunk)
@@ -634,18 +769,24 @@ def main():
         net.train()
         return total / n
 
+    def evaluate():
+        return eval_loss(val_examples)
+
     bgen = batches()
     opt.zero_grad(set_to_none=True)
     ema = None
     step = 0
     best_val = float("inf")
-    tok_seen, t0 = 0, time.time()
+    tok_seen, tot_seen, t0 = 0, 0, time.time()
+    meter = ThroughputMeter()
     if torch.cuda.is_available():
         for d in active_devices:
             torch.cuda.reset_peak_memory_stats(d)
     try:
         for step in range(1, args.steps + 1):
+            step_t0 = time.time()
             accum_loss = 0.0
+            step_sup = step_tot = 0
             for _ in range(args.grad_accum):
                 batch = next(bgen)
                 input_ids, labels, attn = collate(batch, pad_id)
@@ -653,7 +794,8 @@ def main():
                                         chunk=args.ce_chunk)
                 (loss / args.grad_accum).backward()
                 accum_loss += loss.item() / args.grad_accum
-                tok_seen += int((labels != -100).sum())
+                step_sup += int((labels != -100).sum())   # supervised tokens
+                step_tot += int(attn.sum())                # total (non-pad) tokens
 
             # grad norm BEFORE clipping is a direct check that gradients reach the
             # adapters (a flat ~0 here would mean the backward graph is broken).
@@ -664,17 +806,30 @@ def main():
             sched.step()
             opt.zero_grad(set_to_none=True)
 
+            # Rolling tok/s over the train-step compute only (eval/sample/save
+            # below are excluded so the rate reflects steady-state throughput).
+            tok_seen += step_sup
+            tot_seen += step_tot
+            meter.update(time.time() - step_t0, step_sup, step_tot)
+            _, tot_tps = meter.rates()
+
             ema = accum_loss if ema is None else 0.9 * ema + 0.1 * accum_loss
             print(f"  step {step:>5}/{args.steps} | loss {accum_loss:6.4f} | "
                   f"ema {ema:6.4f} | grad {gnorm:7.4f} | lr {sched.get_last_lr()[0]:.2e} | "
-                  f"|B| {adapter_b_norm():7.3f}")
+                  f"|B| {adapter_b_norm():7.3f} | {tot_tps:,.0f} tok/s")
 
-            if args.eval_every and val_examples and step % args.eval_every == 0:
-                vl = evaluate()
-                print(f"    [eval] step {step}: held-out loss {vl:.4f}")
-                if args.save_best and vl < best_val:
-                    best_val = vl
-                    save(f"[best step {step}, val {vl:.4f}]")
+            if (args.eval_every and step % args.eval_every == 0
+                    and (val_examples or val2_examples)):
+                parts = []
+                if val_examples:
+                    vl = evaluate()
+                    parts.append(f"held-out {vl:.4f}")
+                    if args.save_best and vl < best_val:
+                        best_val = vl
+                        save(f"[best step {step}, val {vl:.4f}]")
+                if val2_examples:
+                    parts.append(f"{eval2_label} {eval_loss(val2_examples):.4f}")
+                print(f"    [eval] step {step}: " + " | ".join(parts))
 
             if args.sample_every and step % args.sample_every == 0:
                 net.eval()
@@ -711,6 +866,9 @@ def main():
         tag = f" (best kept: {best_val:.4f})" if args.save_best else ""
         print(f"\n[EVAL] held-out loss (EXL3 arm): {val_loss:.4f}{tag} "
               f"over {len(val_examples)} examples")
+    if val2_examples:
+        print(f"[EVAL] eval2 ({eval2_label}) loss: {eval_loss(val2_examples):.4f} "
+              f"over {len(val2_examples)} examples")
     if torch.cuda.is_available():
         peak_str = " / ".join(
             f"cuda:{d} {torch.cuda.max_memory_allocated(d) / 1e9:.2f}GB"
@@ -718,7 +876,8 @@ def main():
         )
     else:
         peak_str = "n/a"
-    print(f"[PERF] {tok_seen / dt if dt else 0:,.0f} supervised tok/s | "
+    print(f"[PERF] {tok_seen / dt if dt else 0:,.0f} sup tok/s, "
+          f"{tot_seen / dt if dt else 0:,.0f} tot tok/s | "
           f"peak VRAM {peak_str} | {dt:.0f}s for {step} steps")
     print("Verify with: python examples/qlora_infer_native.py "
           f"--model {args.model} --adapter {args.out}")

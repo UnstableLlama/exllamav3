@@ -39,9 +39,28 @@ import os
 import random
 import re
 import time
+from collections import deque
 
 import torch
 import torch.distributed as dist
+
+
+class ThroughputMeter:  # identical to qlora_train_native.ThroughputMeter
+    """Rolling tok/s over a sliding window of recent steps, for a live readout.
+    Tracks supervised (labels != -100) and total (non-pad) tokens separately."""
+
+    def __init__(self, window=20):
+        self.buf = deque(maxlen=window)   # (dt, supervised_tokens, total_tokens)
+
+    def update(self, dt, supervised, total):
+        self.buf.append((float(dt), int(supervised), int(total)))
+
+    def rates(self):
+        tt = sum(b[0] for b in self.buf)
+        if tt <= 0:
+            return 0.0, 0.0
+        return sum(b[1] for b in self.buf) / tt, sum(b[2] for b in self.buf) / tt
+
 
 EOT = "<|eot_id|>"
 TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
@@ -123,7 +142,8 @@ def resolve_steps_and_warmup(args, num_train_examples, effective_batch):
     return args.steps, max(0, warmup)
 
 
-def build_sft_examples(tok, args, split=None, dataset=None, max_samples=None):
+def build_sft_examples(tok, args, split=None, dataset=None, max_samples=None,
+                       shuffle=False):
     """Mirror of qlora_train_native.build_sft_examples using the HF tokenizer.
     The underlying Llama-3 tokenizer is the same, so token IDs match the EXL3
     arm for identical text; add_special_tokens=False (the chat string already
@@ -143,8 +163,14 @@ def build_sft_examples(tok, args, split=None, dataset=None, max_samples=None):
         ds = load_dataset(builder, data_files=name, split=split)
     else:
         ds = load_dataset(name, split=split)
+    # Match qlora_train_native: shuffle the full set when asked (or, as before,
+    # when capping rows). shuffle_seed defaults to 0, so the cap behavior and the
+    # --val-frac split stay identical to the EXL3 arm for matched runs.
+    seed = getattr(args, "shuffle_seed", 0)
+    if shuffle or (max_samples and max_samples < len(ds)):
+        ds = ds.shuffle(seed=seed)
     if max_samples and max_samples < len(ds):
-        ds = ds.shuffle(seed=0).select(range(max_samples))
+        ds = ds.select(range(max_samples))
 
     messages_key = getattr(args, "messages_key", None)
     examples = []
@@ -173,6 +199,41 @@ def build_sft_examples(tok, args, split=None, dataset=None, max_samples=None):
         if all(l == -100 for l in labels):
             continue
         examples.append({"input_ids": input_ids, "labels": labels})
+    return examples
+
+
+def build_lm_examples(tok, dataset_name, split, seq_len, text_key="text",
+                      max_samples=0):
+    """Plain-text LM eval set (e.g. wikitext), mirror of
+    qlora_train_native.build_lm_examples using the HF tokenizer. Packs the text
+    column into non-overlapping seq_len blocks, every token supervised. Same
+    underlying tokenizer + packing as the EXL3 arm => identical blocks and a
+    comparable nats/token loss."""
+    from datasets import load_dataset
+    if os.path.exists(dataset_name):
+        ext = os.path.splitext(dataset_name)[1].lower()
+        builder = {".json": "json", ".jsonl": "json",
+                   ".parquet": "parquet", ".csv": "csv"}.get(ext, "json")
+        ds = load_dataset(builder, data_files=dataset_name, split=split)
+    else:
+        ds = load_dataset(dataset_name, split=split)
+    if max_samples and max_samples < len(ds):
+        ds = ds.select(range(max_samples))
+
+    bos = tok.bos_token_id
+    buf, examples = [], []
+    for row in ds:
+        text = row.get(text_key) or ""
+        if not text.strip():
+            continue
+        ids = tok(text, add_special_tokens=False)["input_ids"]
+        if bos is not None and ids and ids[0] == bos:
+            ids = ids[1:]
+        buf.extend(ids)
+        while len(buf) >= seq_len:
+            block = buf[:seq_len]
+            buf = buf[seq_len:]
+            examples.append({"input_ids": block, "labels": list(block)})
     return examples
 
 
@@ -234,6 +295,13 @@ def main():
     ap.add_argument("--max-samples", type=int, default=0,
                     help="Cap source rows (0 = use all). Match this to the EXL3 "
                          "arm so both train/eval on the same split.")
+    ap.add_argument("--shuffle", action="store_true",
+                    help="Shuffle the training rows once (deterministically) "
+                         "before the --val-frac carve and training. Matches the "
+                         "EXL3 arm given the same --shuffle-seed.")
+    ap.add_argument("--shuffle-seed", type=int, default=0,
+                    help="Seed for --shuffle (also the random-subset seed when "
+                         "--max-samples caps the rows). Default 0.")
     ap.add_argument("--eval-split", default=None,
                     help="Use this split of the dataset (e.g. 'test') as the "
                          "held-out eval set, instead of carving --val-frac off "
@@ -241,6 +309,19 @@ def main():
                          "--val-frac. Built identically on every rank.")
     ap.add_argument("--eval-dataset", default=None,
                     help="Dataset id/path for --eval-split (defaults to --dataset).")
+    ap.add_argument("--eval2-dataset", default=None,
+                    help="A SECOND held-out eval set, reported alongside the "
+                         "primary one each --eval-every and at the end (e.g. your "
+                         "test set vs wikitext). --save-best stays keyed on the "
+                         "PRIMARY eval. Matches the EXL3 arm's --eval2-*.")
+    ap.add_argument("--eval2-split", default="test",
+                    help="Split for --eval2-dataset (default 'test').")
+    ap.add_argument("--eval2-text-key", default=None,
+                    help="If set, treat --eval2-dataset as PLAIN TEXT and compute "
+                         "an LM loss over packed --seq-len blocks (e.g. 'text' for "
+                         "wikitext). If unset, built as a second SFT eval.")
+    ap.add_argument("--eval2-max-samples", type=int, default=0,
+                    help="Cap source rows for --eval2-dataset (0 = all).")
     ap.add_argument("--val-frac", type=float, default=0.0)
     ap.add_argument("--eval-every", type=int, default=0,
                     help="Also report held-out loss every N steps (needs "
@@ -313,7 +394,7 @@ def main():
         for p in params:
             dist.broadcast(p.data, src=0)
 
-    examples = build_sft_examples(tok, args)
+    examples = build_sft_examples(tok, args, shuffle=args.shuffle)
     assert examples, "no usable training examples"
     # Held-out eval set. Prefer the dataset's own eval split (real held-out data);
     # otherwise carve the first val_frac off train BEFORE sharding so it never
@@ -326,6 +407,20 @@ def main():
     elif args.val_frac > 0:
         n_val = max(1, int(len(examples) * args.val_frac))
         val_examples, examples = examples[:n_val], examples[n_val:]
+
+    # Optional SECOND held-out eval set (e.g. wikitext LM), mirroring the EXL3 arm.
+    val2_examples = []
+    eval2_label = ""
+    if args.eval2_dataset:
+        eval2_label = args.eval2_dataset.split("/")[-1]
+        if args.eval2_text_key:
+            val2_examples = build_lm_examples(
+                tok, args.eval2_dataset, args.eval2_split, args.seq_len,
+                text_key=args.eval2_text_key, max_samples=args.eval2_max_samples)
+        else:
+            val2_examples = build_sft_examples(
+                tok, args, split=args.eval2_split, dataset=args.eval2_dataset,
+                max_samples=args.eval2_max_samples)
     shard = examples[rank::world_size] if ddp else examples
 
     # Finalize step count (from --epochs over the FULL train set) and warmup.
@@ -350,21 +445,25 @@ def main():
             for i in range(0, len(order) - args.batch + 1, args.batch):
                 yield [shard[j] for j in order[i:i + args.batch]]
 
-    def evaluate():
-        # All ranks compute the same val loss (replicated, synced adapters) so
-        # they stay in lockstep; mean per-example loss, batch 1.
-        if not val_examples:
+    def eval_loss(exs):
+        # All ranks compute the same loss (replicated, synced adapters) so they
+        # stay in lockstep; mean per-example loss, batch 1. Works for SFT and
+        # plain-LM eval sets alike.
+        if not exs:
             return None
         model.eval()
         total = 0.0
         with torch.no_grad():
-            for ex in val_examples:
+            for ex in exs:
                 ii, ll, aa = collate([ex], pad_id)
                 out = model(input_ids=ii.to(device), attention_mask=aa.to(device),
                             labels=ll.to(device))
                 total += out.loss.item()
         model.train()
-        return total / len(val_examples)
+        return total / len(exs)
+
+    def evaluate():
+        return eval_loss(val_examples)
 
     def save(tag):
         if is_main:
@@ -378,9 +477,12 @@ def main():
     model.train()
     opt.zero_grad(set_to_none=True)
     torch.cuda.reset_peak_memory_stats(device)
-    ema, tok_seen, t0, best_val = None, 0, time.time(), float("inf")
+    ema, tok_seen, tot_seen, t0, best_val = None, 0, 0, time.time(), float("inf")
+    meter = ThroughputMeter()
     for step in range(1, args.steps + 1):
+        step_t0 = time.time()
         accum = 0.0
+        step_sup = step_tot = 0
         for _ in range(args.grad_accum):
             batch = next(bgen)
             ii, ll, aa = collate(batch, pad_id)
@@ -388,7 +490,8 @@ def main():
                         labels=ll.to(device))
             (out.loss / args.grad_accum).backward()
             accum += out.loss.item() / args.grad_accum
-            tok_seen += int((ll != -100).sum())
+            step_sup += int((ll != -100).sum())
+            step_tot += int(aa.sum())
         if ddp:
             for p in params:
                 if p.grad is not None:
@@ -399,16 +502,30 @@ def main():
         opt.step()
         sched.step()
         opt.zero_grad(set_to_none=True)
+        # Live tok/s (this rank; ×world_size for an aggregate estimate -- the
+        # final [PERF] line all-reduces the true total).
+        tok_seen += step_sup
+        tot_seen += step_tot
+        meter.update(time.time() - step_t0, step_sup, step_tot)
+        _, tot_tps = meter.rates()
         ema = accum if ema is None else 0.9 * ema + 0.1 * accum
         if is_main:
             print(f"  step {step:>5}/{args.steps} | loss {accum:6.4f} | "
                   f"ema {ema:6.4f} | grad {gnorm:7.4f} | "
-                  f"lr {sched.get_last_lr()[0]:.2e}")
-        if args.eval_every and val_examples and step % args.eval_every == 0:
+                  f"lr {sched.get_last_lr()[0]:.2e} | "
+                  f"~{tot_tps * world_size:,.0f} tok/s")
+        if (args.eval_every and step % args.eval_every == 0
+                and (val_examples or val2_examples)):
             vl = evaluate()
+            v2 = eval_loss(val2_examples)
             if is_main:
-                print(f"    [eval] step {step}: held-out loss {vl:.4f}")
-            if args.save_best and vl < best_val:
+                parts = []
+                if vl is not None:
+                    parts.append(f"held-out {vl:.4f}")
+                if v2 is not None:
+                    parts.append(f"{eval2_label} {v2:.4f}")
+                print(f"    [eval] step {step}: " + " | ".join(parts))
+            if args.save_best and vl is not None and vl < best_val:
                 best_val = vl
                 save(f"[best step {step}, val {vl:.4f}]")
 
@@ -417,7 +534,8 @@ def main():
         save("Done.")
 
     val_loss = evaluate()
-    tok_t = torch.tensor(float(tok_seen), device=device)
+    val2_loss = eval_loss(val2_examples)
+    tok_t = torch.tensor([float(tok_seen), float(tot_seen)], device=device)
     if ddp:
         dist.all_reduce(tok_t, op=dist.ReduceOp.SUM)
     if is_main:
@@ -425,8 +543,12 @@ def main():
             tag = f" (best kept: {best_val:.4f})" if args.save_best else ""
             print(f"\n[EVAL] held-out loss (BNB-NF4 arm): {val_loss:.4f}{tag} "
                   f"over {len(val_examples)} examples")
+        if val2_loss is not None:
+            print(f"[EVAL] eval2 ({eval2_label}) loss: {val2_loss:.4f} "
+                  f"over {len(val2_examples)} examples")
         peak_gb = torch.cuda.max_memory_allocated(device) / 1e9
-        print(f"[PERF] {tok_t.item() / dt if dt else 0:,.0f} supervised tok/s "
+        print(f"[PERF] {tok_t[0].item() / dt if dt else 0:,.0f} sup tok/s, "
+              f"{tok_t[1].item() / dt if dt else 0:,.0f} tot tok/s "
               f"({'all ranks' if ddp else '1 GPU'}) | peak VRAM/GPU {peak_gb:.2f} "
               f"GB | {dt:.0f}s, {args.steps} steps, world_size {world_size}")
 
