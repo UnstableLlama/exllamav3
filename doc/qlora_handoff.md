@@ -376,12 +376,38 @@ ratio at inference**; the adapter was good all along (loss + bf16 gens prove it)
 3. Then the headline low-bitrate run: EXL3-2.5/3bpw (where NF4 can't follow),
    deployed via merge-requantize, on a real metric.
 
-### Session 4 — LR schedulers + warmup, OpenAI `messages` loader, real test-split eval (semancy)
+### Session 4 — real-task training: schedulers, `messages`/test-split eval, prompt formats, full embed/head, BOS fix
 
-> Branch `claude/epic-planck-n892gw`. Tooling session to support a real-task run
-> on **UnstableLlama/semancy** (a philosophy fine-tune: 436 train / 116 test,
-> OpenAI-style single-turn `messages`, no system prompts). Code only here; the
-> training run happens on the GPU box.
+> Branch `claude/epic-planck-n892gw`. Turned the proven QLoRA-on-EXL3 path into a
+> real-task trainer, driven by a live run on **UnstableLlama/semancy** (a
+> philosophy fine-tune: 436 train / 116 test, OpenAI-style single-turn `messages`,
+> no system prompts). All code changes; the runs happen on the GPU box (2×3090).
+> Everything below is **run-confirmed** unless noted.
+
+**At a glance — what's new this session (all in `examples/qlora_train_native.py` +
+the DDP variant; the BNB arm mirrors everything except `--prompt-format`,
+`--inspect`, and `--train-embeddings/--train-head`):**
+
+| Flag / change | What it does |
+|---|---|
+| `--messages-key` | Load OpenAI `messages` rows (user→prompt, assistant→supervised response). |
+| `--scheduler {none,linear,cosine}` + `--warmup-ratio`/`--warmup-steps` | Transformers-free LR schedule with warmup (HF-equivalent `LambdaLR`). Default `none` = old constant LR. |
+| `--weight-decay` (def 0.01) | Explicit AdamW weight decay (was torch's implicit 0.01). |
+| `--epochs` | Derive `--steps` from train size × effective batch (folds in `world_size` under DDP). |
+| `--eval-split` / `--eval-dataset` | Held-out eval loss on a **real** split (e.g. `test`) instead of carving `--val-frac` off train. |
+| `--inspect N` | Decode the first N built examples (prompt vs supervised span, turn-end check) and exit. Tokenization gate; also a native-forward feasibility check. |
+| `--prompt-format {auto,mistral,metharme}` | Chat format: model-native, explicit Mistral `[INST]`, or Pygmalion `<|user|>/<|model|>`. |
+| `--train-embeddings` / `--train-head` | Fully train embed_tokens / lm_head (PEFT `modules_to_save`) and save them, not just LoRA. |
+| **BOS fix** | `build_sft_examples` was emitting a **doubled `<|begin_of_text|>`** + a stray BOS on the response; now normalized to exactly one. (Found by `--inspect`.) |
+
+Shared helpers (`build_sft_examples`, `collate`, `make_lr_scheduler`,
+`resolve_steps_and_warmup`, `format_prompt_and_eot`, `extract_single_turn`) live
+in `qlora_train_native.py`; the DDP script imports them. The BNB arm
+(`qlora_train_bnb.py`) inlines byte-identical copies (separate venv, can't import
+the exllamav3 path) for `--messages-key`, scheduler/warmup/`--weight-decay`,
+`--epochs`, and `--eval-split` — so a matched EXL3-vs-NF4 run needs only the same
+flags on both. (`--prompt-format` and `--train-embeddings/--train-head` are
+native-arm only for now.)
 
 **New trainer features (both `qlora_train_native.py` and the DDP variant; shared
 helpers live in `qlora_train_native.py` and are imported by the DDP script):**
@@ -564,6 +590,43 @@ the same metharme template for the adapter to fire (the single-GPU live `sample`
 already does; set it in your own frontend for real inference). The BNB arm still
 uses `[INST]`/native only — mirror `--prompt-format` into `qlora_train_bnb.py` if
 a metharme EXL3-vs-NF4 comparison is wanted.
+
+### Session 4 — status, run-confirmed, and open items
+
+**Run-confirmed on the box (2×3090):**
+- semancy DDP run end-to-end on Llama-3.2-1B 4bpw: cosine schedule, `--epochs`,
+  `--eval-split test`, `--save-best` all working (result above; eval `test` loss
+  ~3.09, 5.26 GB/GPU, 179 s).
+- `--inspect` on the 1B (Llama) and on **Rocinante-XL-16B** (mistral, metharme):
+  both show one BOS / correct spans / `ends with turn-end token? True`. The 16B
+  loaded fine through the native forward (no sliding-window rejection), so
+  mistral-family + metharme works on a real 16B.
+- `--prompt-format metharme` on the 16B produced exactly
+  `<s><|user|>{q}<|model|>{a}</s>`.
+- BOS fix verified (the doubled-BOS dump → single BOS after the fix).
+
+**Not yet run (write-confirmed only — verify before relying on):**
+- `--train-embeddings` / `--train-head` on real hardware (logic + a CPU test pass;
+  the head-grad path and the save/load round-trip haven't run on GPU yet). Smoke
+  it on the 1B first.
+- The 16B **metharme training** run itself (only `--inspect` was run; use DDP
+  `--batch 2 --grad-accum 4` for eff-batch 16, or `--batch 1 --grad-accum 8` if it
+  OOMs on load).
+- Mistral-Medium-3.5: it's the `mistral3` arch and `--prompt-format auto`/`mistral`
+  already emit its V13 `[SYSTEM_PROMPT]`/`[INST]` format, but no EXL3 quant of a
+  128B was trained (needs multi-GPU `--parallel split`).
+
+**Open items / would-be-nice next:**
+- Mirror `--prompt-format` and `--train-embeddings/--train-head` into the BNB arm
+  (PEFT supports `modules_to_save` natively) for matched comparisons.
+- Make live samples / the native infer path reflect a trained embed/head (today
+  only the runtime LoRA slots are wired; trained matrices are for merge/requantize).
+- Tests for the new paths need a GPU/model (CPU tests can't build the full net):
+  only `test_modules_to_save_param_groups` is pure-CPU. Run `tests/test_native_llama.py`
+  + `tests/test_fused_ce.py` + `tests/test_qlora_grad.py` after pulling.
+- For semancy specifically: a bigger base (3B/8B) is the likely win over more 1B
+  epochs (the ~3.09 floor looks capacity-bound); judge style on bf16 / merge per
+  finding C, not on the attenuated 4bpw base.
 
 ---
 
