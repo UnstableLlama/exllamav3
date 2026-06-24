@@ -38,6 +38,7 @@ The adapter is saved in PEFT format, loadable by exllamav3.model.lora.LoRA
 """
 
 import argparse
+import math
 import random
 import re
 import time
@@ -79,11 +80,80 @@ def clean_style_text(s):
     return s.strip()
 
 
+def extract_single_turn(messages):
+    """Pull (user_text, assistant_text) from an OpenAI-style ``messages`` list.
+
+    For single-turn rows (e.g. UnstableLlama/semancy: one user, one assistant,
+    no system message) this is exact. We take the last user turn that precedes
+    the first assistant turn as the prompt and that assistant turn as the
+    target, so the completion-only mask still supervises only the answer. System
+    messages are ignored (the dataset embeds its reasoning style in the answer
+    text rather than a system prompt). Returns ("", "") if either turn is
+    missing so the caller can skip the row.
+    """
+    user_text, asst_text = "", ""
+    for m in messages or []:
+        role = (m.get("role") or "").lower()
+        content = (m.get("content") or "").strip()
+        if role == "user":
+            user_text = content       # remember the most recent user turn
+        elif role == "assistant":
+            asst_text = content
+            break                     # first assistant reply is the target
+    return user_text, asst_text
+
+
+def make_lr_scheduler(optimizer, name, total_steps, warmup_steps):
+    """A transformers-free LR scheduler (none/linear/cosine) with linear warmup.
+
+    Matches HuggingFace's ``get_{linear,cosine}_schedule_with_warmup`` exactly so
+    behavior is well understood: LR ramps 0->1 over ``warmup_steps``, then decays
+    to 0 (linear) or follows a half-cosine to 0 (cosine) over the remaining
+    ``total_steps - warmup_steps``. ``none``/``constant`` holds the base LR after
+    warmup. Driven by one ``scheduler.step()`` per optimizer step.
+    """
+    name = (name or "none").lower()
+    warmup_steps = max(0, int(warmup_steps))
+    total_steps = max(1, int(total_steps))
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        if name in ("none", "constant"):
+            return 1.0
+        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        progress = min(1.0, max(0.0, progress))
+        if name == "linear":
+            return 1.0 - progress
+        if name == "cosine":
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        raise ValueError(f"unknown scheduler '{name}' (expected none/linear/cosine)")
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def resolve_steps_and_warmup(args, num_train_examples, effective_batch):
+    """Finalize args.steps (from --epochs if given) and compute warmup steps.
+
+    ``--epochs`` (when > 0) overrides ``--steps`` so the schedule length matches
+    the requested number of passes over the data: one optimizer step consumes
+    ``effective_batch`` examples, so an epoch is ``ceil(N / effective_batch)``
+    steps. ``--warmup-steps`` (when > 0) wins over ``--warmup-ratio``.
+    """
+    if getattr(args, "epochs", 0) and args.epochs > 0:
+        eff = max(1, int(effective_batch))
+        steps_per_epoch = max(1, math.ceil(num_train_examples / eff))
+        args.steps = max(1, math.ceil(args.epochs * steps_per_epoch))
+    warmup = (args.warmup_steps if getattr(args, "warmup_steps", 0) and args.warmup_steps > 0
+              else int(round(getattr(args, "warmup_ratio", 0.0) * args.steps)))
+    return args.steps, max(0, warmup)
+
+
 def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
                        instruction_key="instruction", context_key="context",
                        response_key="response", split="train",
                        clean_text=True, min_response_words=3,
-                       uppercase_response=False):
+                       uppercase_response=False, messages_key=None):
     """
     Load an instruction dataset and tokenize for completion-only SFT using the
     model's native chat template (Llama-3, Mistral, etc. -- whatever
@@ -92,9 +162,13 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
     is terminated with the architecture-correct turn-end token (see
     :func:`turn_end_token`) so the model learns to stop.
 
-    Columns are addressed by name (instruction_key / context_key / response_key)
-    so the loader is not tied to the Dolly schema; context_key may be absent in
-    the dataset (treated as empty).
+    Two input layouts are supported:
+      * flat columns -- instruction_key / context_key / response_key (Alpaca,
+        Dolly, ...); context_key may be absent in the dataset (treated as empty).
+      * OpenAI ``messages`` -- pass ``messages_key`` (e.g. "messages") for
+        single-turn user/assistant rows (UnstableLlama/semancy); the user turn
+        becomes the prompt and the assistant turn the supervised response. When
+        set it takes precedence over the flat-column keys.
 
     clean_text strips stage directions / inline actions and normalizes
     whitespace (helps play-script style sets like the Shakespeare default, whose
@@ -123,14 +197,20 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
 
     examples = []
     for ex in ds:
-        instr = (ex.get(instruction_key) or "").strip()
-        ctx = (ex.get(context_key) or "").strip()
-        resp = (ex.get(response_key) or "").strip()
+        if messages_key:
+            instr, resp = extract_single_turn(ex.get(messages_key))
+            ctx = ""
+        else:
+            instr = (ex.get(instruction_key) or "").strip()
+            ctx = (ex.get(context_key) or "").strip()
+            resp = (ex.get(response_key) or "").strip()
         if clean_text:
             instr, ctx, resp = (clean_style_text(instr), clean_style_text(ctx),
                                 clean_style_text(resp))
         if not resp or len(resp.split()) < min_response_words:
             continue
+        if messages_key and not instr:
+            continue  # malformed messages row: no user turn to prompt with
         # Smoke test: a maximally dense+consistent transform (every token of every
         # response changes), so there's no low-loss path that ISN'T uppercased and
         # it must surface in generation. Only the response is transformed, so it
@@ -205,9 +285,24 @@ def main():
     ap.add_argument("--r", type=int, default=32)
     ap.add_argument("--alpha", type=float, default=64.0)
     ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--weight-decay", type=float, default=0.01,
+                    help="AdamW weight decay on the LoRA params (default 0.01).")
+    ap.add_argument("--scheduler", choices=["none", "linear", "cosine"],
+                    default="none",
+                    help="LR schedule after warmup: none (constant), linear "
+                         "decay to 0, or cosine decay to 0.")
+    ap.add_argument("--warmup-ratio", type=float, default=0.0,
+                    help="Fraction of total steps spent linearly warming up the "
+                         "LR from 0 (e.g. 0.05-0.1). Ignored if --warmup-steps>0.")
+    ap.add_argument("--warmup-steps", type=int, default=0,
+                    help="Absolute warmup steps; overrides --warmup-ratio when >0.")
+    ap.add_argument("--epochs", type=float, default=0.0,
+                    help="If >0, set --steps to cover this many passes over the "
+                         "training data (one step = batch*grad-accum examples), "
+                         "so the schedule length matches the epoch count.")
     ap.add_argument("--steps", type=int, default=1000,
-                    help="Training steps. ~steps*batch examples seen; aim for >=1 "
-                         "epoch (dataset_size/batch) to pick up a strong style.")
+                    help="Training steps (ignored when --epochs>0). ~steps*batch "
+                         "examples seen; aim for >=1 epoch to pick up a style.")
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--grad-accum", type=int, default=1)
     ap.add_argument(
@@ -224,6 +319,12 @@ def main():
     ap.add_argument("--response-key", default="output",
                     help="Column holding the target response (Alpaca: 'output', "
                          "Dolly: 'response')")
+    ap.add_argument("--messages-key", default=None,
+                    help="Column holding OpenAI-style single-turn messages (e.g. "
+                         "'messages' for UnstableLlama/semancy). When set, the "
+                         "user turn is the prompt and the assistant turn the "
+                         "supervised response; --instruction/context/response-key "
+                         "are ignored.")
     ap.add_argument("--no-clean-text", action="store_true",
                     help="Disable stripping of [stage directions]/*actions* and "
                          "whitespace normalization (on by default; helps play-script "
@@ -236,6 +337,11 @@ def main():
                          "generation if the training path works at all.")
     ap.add_argument("--max-samples", type=int, default=4000)
     ap.add_argument("--seq-len", type=int, default=512)
+    ap.add_argument("--inspect", type=int, default=0, metavar="N",
+                    help="Tokenization check: decode the first N built examples "
+                         "(prompt span vs supervised response span + whether the "
+                         "response was truncated by --seq-len), then exit without "
+                         "training. Run this once to verify a new dataset/schema.")
     ap.add_argument("--targets", nargs="*", default=None,
                     help="Target module leaf names (default: attn+mlp projections)")
     ap.add_argument("--compute-dtype", default="bfloat16",
@@ -253,10 +359,18 @@ def main():
                     help="Adapter dir to resume from (continues training those "
                          "weights; optimizer state is NOT restored). --r/--targets "
                          "must match the checkpoint.")
+    ap.add_argument("--eval-split", default=None,
+                    help="Use this split of the dataset (e.g. 'test') as the "
+                         "held-out eval set, instead of carving --val-frac off "
+                         "train. Real held-out data; takes precedence over "
+                         "--val-frac.")
+    ap.add_argument("--eval-dataset", default=None,
+                    help="Dataset id/path for --eval-split (defaults to --dataset).")
     ap.add_argument("--val-frac", type=float, default=0.0,
-                    help="Hold out this fraction of examples for held-out eval "
-                         "loss (deterministic; the SAME split as qlora_train_bnb.py "
-                         "given the same dataset/seed). 0 = no eval.")
+                    help="Hold out this fraction of train for held-out eval loss "
+                         "(deterministic; the SAME split as qlora_train_bnb.py "
+                         "given the same dataset/seed). Ignored if --eval-split is "
+                         "set. 0 = no eval.")
     ap.add_argument("--eval-every", type=int, default=0,
                     help="Also report held-out loss every N steps (needs "
                          "--val-frac > 0). 0 = only at the end.")
@@ -322,21 +436,66 @@ def main():
         clean_text=not args.no_clean_text,
         min_response_words=args.min_response_words,
         uppercase_response=args.uppercase_response,
+        messages_key=args.messages_key,
     )
     print(f" -- {len(examples)} SFT examples")
     assert examples, "no usable training examples"
 
-    # Deterministic held-out val split (examples are already in a fixed order:
-    # datasets shuffle(seed=0)+select, then build order). Taking the first
-    # val_frac as val gives the SAME rows as qlora_train_bnb.py, so the two arms'
-    # eval losses are directly comparable.
+    # Tokenization check: decode the prompt span (labels==-100) and the supervised
+    # response span (labels!=-100) separately, so the mask boundary and any
+    # --seq-len truncation are visible before committing to a run. Specials are
+    # shown so the chat template / <|eot_id|> stop token can be eyeballed.
+    if args.inspect:
+        eot = turn_end_token(tokenizer)
+        eot_id = tokenizer.encode(eot, add_bos=False,
+                                  encode_special_tokens=True)[0].tolist() if eot else []
+        for i, ex in enumerate(examples[:args.inspect]):
+            ids, labs = ex["input_ids"], ex["labels"]
+            n_prompt = sum(1 for l in labs if l == -100)
+            sup = [t for t, l in zip(ids, labs) if l != -100]
+            prompt_ids = ids[:n_prompt]
+            dec = lambda seq: tokenizer.decode(torch.tensor([seq]),
+                                               decode_special_tokens=True)
+            ends_eot = bool(eot_id) and sup[-len(eot_id):] == eot_id
+            print(f"\n===== example {i} | {len(ids)} tokens "
+                  f"({n_prompt} prompt / {len(sup)} supervised) =====")
+            print(f"  PROMPT  (masked, -100): {dec(prompt_ids)!r}")
+            print(f"  RESPONSE(supervised)  : {dec(sup)!r}")
+            print(f"  ends with turn-end token ({eot!r})? {ends_eot}"
+                  + ("" if ends_eot else
+                     "   <-- WARNING: response truncated by --seq-len; "
+                     "raise --seq-len so the model learns to stop"))
+        print(f"\n -- inspect only ({args.inspect} shown); exiting before training.")
+        return
+
+    # Held-out eval set. Prefer the dataset's own eval split (real held-out data);
+    # otherwise carve a deterministic val_frac off the front of train (same rows
+    # as qlora_train_bnb.py, so the arms' eval losses stay comparable).
     val_examples = []
-    if args.val_frac > 0:
+    if args.eval_split:
+        val_examples = build_sft_examples(
+            model, tokenizer, args.eval_dataset or args.dataset, 0, args.seq_len,
+            instruction_key=args.instruction_key, context_key=args.context_key,
+            response_key=args.response_key, split=args.eval_split,
+            clean_text=not args.no_clean_text,
+            min_response_words=args.min_response_words,
+            uppercase_response=args.uppercase_response,
+            messages_key=args.messages_key,
+        )
+        print(f" -- held-out eval: {len(val_examples)} examples from "
+              f"split '{args.eval_split}'; {len(examples)} for training")
+    elif args.val_frac > 0:
         n_val = max(1, int(len(examples) * args.val_frac))
         val_examples, examples = examples[:n_val], examples[n_val:]
         print(f" -- held out {len(val_examples)} val examples; "
               f"{len(examples)} for training")
         assert examples, "val_frac too large; no training examples left"
+
+    # Finalize step count (from --epochs) and warmup before building the schedule.
+    args.steps, warmup_steps = resolve_steps_and_warmup(
+        args, len(examples), args.batch * args.grad_accum)
+    print(f" -- {args.steps} steps, scheduler={args.scheduler}, "
+          f"warmup={warmup_steps}, weight_decay={args.weight_decay}")
 
     # 4. Optional generator for live samples (KV-cache inference path). The cache
     #    was allocated before load() above.
@@ -350,8 +509,10 @@ def main():
         net.train()
         print(f"\n\U0001f3ad  baseline (step 0): {args.sample_prompt}\n     -> {base}\n")
 
-    # 5. Optimizer over the adapter params only.
-    opt = torch.optim.AdamW(net.lora_parameters(), lr=args.lr)
+    # 5. Optimizer over the adapter params only, plus the LR schedule.
+    opt = torch.optim.AdamW(net.lora_parameters(), lr=args.lr,
+                            weight_decay=args.weight_decay)
+    sched = make_lr_scheduler(opt, args.scheduler, args.steps, warmup_steps)
 
     def batches():
         order = list(range(len(examples)))
@@ -417,11 +578,13 @@ def main():
                 net.lora_parameters(), args.max_grad_norm or float("inf")
             ).item()
             opt.step()
+            sched.step()
             opt.zero_grad(set_to_none=True)
 
             ema = accum_loss if ema is None else 0.9 * ema + 0.1 * accum_loss
             print(f"  step {step:>5}/{args.steps} | loss {accum_loss:6.4f} | "
-                  f"ema {ema:6.4f} | grad {gnorm:7.4f} | |B| {adapter_b_norm():7.3f}")
+                  f"ema {ema:6.4f} | grad {gnorm:7.4f} | lr {sched.get_last_lr()[0]:.2e} | "
+                  f"|B| {adapter_b_norm():7.3f}")
 
             if args.eval_every and val_examples and step % args.eval_every == 0:
                 vl = evaluate()

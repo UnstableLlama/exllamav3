@@ -376,6 +376,78 @@ ratio at inference**; the adapter was good all along (loss + bf16 gens prove it)
 3. Then the headline low-bitrate run: EXL3-2.5/3bpw (where NF4 can't follow),
    deployed via merge-requantize, on a real metric.
 
+### Session 4 — LR schedulers + warmup, OpenAI `messages` loader, real test-split eval (semancy)
+
+> Branch `claude/epic-planck-n892gw`. Tooling session to support a real-task run
+> on **UnstableLlama/semancy** (a philosophy fine-tune: 436 train / 116 test,
+> OpenAI-style single-turn `messages`, no system prompts). Code only here; the
+> training run happens on the GPU box.
+
+**New trainer features (both `qlora_train_native.py` and the DDP variant; shared
+helpers live in `qlora_train_native.py` and are imported by the DDP script):**
+- **`--messages-key`** — OpenAI `messages` loader. For single-turn rows it takes
+  the user turn as the prompt and the assistant turn as the supervised response
+  (system turns ignored; the dataset has none). `extract_single_turn()` does the
+  pull; the rest of the completion-only masking path is unchanged, so the answer
+  (plus `<|eot_id|>`) is supervised and the prompt is `-100`. Takes precedence
+  over the flat `--instruction/context/response-key`.
+- **LR schedulers** — `--scheduler {none,linear,cosine}` + `--warmup-ratio`
+  (fraction of steps) or `--warmup-steps` (absolute). `make_lr_scheduler()` is a
+  transformers-free `LambdaLR` matching HF's `get_{linear,cosine}_schedule_with_warmup`
+  exactly: LR ramps 0→base over warmup, then linear-to-0 or half-cosine-to-0.
+  Default `none` keeps the old constant-LR behavior (matched-arm runs unaffected).
+  Per-step `sched.step()`; current LR is logged each step.
+- **`--weight-decay`** (default 0.01) — now explicit on the AdamW over the LoRA
+  params (torch's AdamW default was already 0.01; this just makes it a knob).
+- **`--epochs`** — if >0, computes `--steps` from the train-set size and the
+  *effective* batch (`batch*grad_accum`, ×`world_size` under DDP), so the schedule
+  length matches the requested passes. e.g. 436 rows, eff-batch 16, 2 epochs → 56
+  steps (warmup 6 at ratio 0.1).
+- **`--eval-split` / `--eval-dataset`** — held-out eval loss on a *real* split
+  (e.g. semancy's 116-row `test`) instead of carving `--val-frac` off train.
+  Built identically on every rank under DDP; works with `--eval-every`/`--save-best`.
+- **`--inspect N`** (single-GPU script) — decodes the first N built examples,
+  showing the masked prompt span vs the supervised response span and **warning if
+  the response was truncated by `--seq-len`** (so the model would never see the
+  turn-end token). Run once to verify tokenization on any new dataset/schema
+  before a long run.
+
+**Tokenization verified** for the `messages` path: `default_chat_prompt()` (Llama)
+injects **no** system prompt when none is passed, emits the standard Llama-3
+template ending at the assistant header; the response is tokenized separately and
+terminated with the architecture-correct turn-end token, prompt masked `-100`.
+Pure-logic checks (scheduler shape, epoch→step math, messages extraction) pass;
+the full path needs the GPU box (no torch/CUDA in the dev container).
+
+**Recommended semancy run (per the research plan: r=16/α=32, lr 1e-4, cosine,
+~10% warmup, wd 0.01, eff-batch 16, completions-only, all linear targets, 2 epochs):**
+```
+# 0. Verify tokenization first (single-GPU, exits after printing):
+python examples/qlora_train_native.py --model /path/to/exl3_model \
+    --dataset UnstableLlama/semancy --messages-key messages \
+    --no-clean-text --seq-len 2048 --inspect 3
+#    Confirm: PROMPT is the user turn, RESPONSE is the assistant turn, and
+#    "ends with turn-end token? True" (else raise --seq-len).
+
+# 1. Train (2× GPU DDP; --batch 8 × 2 GPUs = eff-batch 16):
+torchrun --standalone --nproc_per_node=2 examples/qlora_train_native_ddp.py \
+    --model /path/to/exl3_model --out /path/to/out/semancy \
+    --dataset UnstableLlama/semancy --messages-key messages --no-clean-text \
+    --eval-split test --eval-every 10 --save-best \
+    --lora-r 16 --alpha 32 --lr 1e-4 --scheduler cosine --warmup-ratio 0.1 \
+    --weight-decay 0.01 --batch 8 --grad-accum 1 --epochs 2 --seq-len 2048
+```
+- **`--no-clean-text` is important here**: the default cleaner strips `[...]`/`*...*`
+  and collapses newlines — fine for play-script style sets, **wrong for a
+  reasoning dataset** (would delete bracketed content and paragraph structure).
+- **`--seq-len`**: philosophy/reasoning answers can be long; 512 (the default)
+  likely truncates them. Use `--inspect` to check, then size `--seq-len` so most
+  responses end in the turn-end token. Bigger seq-len costs VRAM (drop `--batch`
+  or keep grad-checkpointing on if OOM).
+- Recall **finding C**: a low-rank adapter (r=16) is *attenuated* on the EXL3
+  base at inference. Evaluate on bf16 (or merge-and-requantize) for a fair read;
+  the held-out `test` loss is the format-independent signal.
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)
