@@ -104,9 +104,19 @@ be worse). DDP-specific bits live behind the `ParallelContext`.
    (100% argmax, cos 0.999999) and `--check-backward` confirms cross-device
    gradient flow (grads on both cards) through checkpointing. Single-device
    unchanged; all CPU suites green.
-2. `ParallelContext` (single/ddp/split).
-3. Shared-loop extraction + entry refactor (`--parallel`).
+2. `ParallelContext` (single/ddp/split). **DEFERRED** (maintainability only).
+3. Shared-loop extraction + entry refactor (`--parallel`). **PARTIAL / DEFERRED:**
+   split support was added directly to `qlora_train_native.py` as "increment A"
+   (`--parallel single|split` + `--reserve/--use-per-device`, per-card VRAM
+   report) and **validated on 2×3090** — a 20-step 1B split run trained cleanly
+   (loss 2.72→1.58, memory split cuda:0 0.89 / cuda:1 4.42 GB). The shared-loop
+   extraction into `examples/qlora_sft_common.py` + `ParallelContext` (the dedup,
+   steps 2–3) is **not started** — touches both working scripts, no functional
+   gain; do it carefully in CPU-suite-checkable pieces if/when wanted.
 4. Wrapper dispatch + flip `train_rocinante_yoda.sh` default to `--parallel split`.
+   **DONE:** `PARALLEL=split|ddp` selects launcher; split is the default; the
+   validate gate runs under the same split args; the greedy-fill footgun (cap
+   cuda:0 via `USE_PER_DEVICE`) is documented in the script header.
 
 ## Tests
 - CPU regression: the existing `tests/test_native_llama.py` exercises
