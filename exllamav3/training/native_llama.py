@@ -180,6 +180,7 @@ class NativeLlamaQLoRA(nn.Module):
 
         self.blocks = nn.ModuleList()
         self._block_meta = []
+        self._block_devices = []   # per-block device (differs under layer-autosplit)
         wrappers: list[DiffLinear] = []
 
         def wrap(linear, leaf):
@@ -219,13 +220,16 @@ class NativeLlamaQLoRA(nn.Module):
             self.blocks.append(entry)
 
             self._block_meta.append(backbone.block_metadata(blk))
+            self._block_devices.append(backbone.block_device(blk))
 
         self._wrappers = wrappers
         self.final_eps = backbone.rms_norm_eps(self.final_norm)
-        # The decoder device (norms / linears / RoPE). May differ from the
-        # embedding's device, which is loaded on CPU (prefer_cpu). Assumes the
-        # whole decoder sits on one device (true for single-GPU loads).
+        # Output device = where the final norm + LM head live. Under a single
+        # load this is the one decoder device; under layer-autosplit it is the
+        # last device in the split (modules[-1].device). The embedding is loaded
+        # on CPU (prefer_cpu) regardless.
         self.device = self.final_norm.weight.device
+        self._head_device = backbone.linear_device(self.lm_head)
 
         # Sanity: every requested target name actually matched something.
         matched = {w.key.split(".")[-1] for w in wrappers if w.r > 0}
@@ -315,22 +319,22 @@ class NativeLlamaQLoRA(nn.Module):
     ) -> torch.Tensor:
         """Return final-norm hidden states ``[b, t, d]`` in fp32."""
         bsz, t = input_ids.shape
-        # The embedding may live on CPU (it has prefer_cpu=True and is loaded on
-        # CPU even for a single-device model), while the decoder lives on the GPU.
-        # backbone.embed_tokens runs the lookup on the embedding's device; move
-        # the result to the decoder.
-        dec_device = self.device
-        hidden = backbone.embed_tokens(self.embed, input_ids).to(dec_device).float()
+        # Under a layer-autosplit load each block lives on its own device; the
+        # hidden state is migrated across boundaries below (mirroring exllamav3's
+        # forward_ls). Start on the first block's device. The embedding is loaded
+        # on CPU (prefer_cpu); backbone.embed_tokens runs the lookup there.
+        first_device = self._block_devices[0]
+        hidden = backbone.embed_tokens(self.embed, input_ids).to(first_device).float()
 
         if attention_mask is not None:
-            attention_mask = attention_mask.to(dec_device)
+            attention_mask = attention_mask.to(first_device)
         if position_ids is None:
             if attention_mask is not None:
                 position_ids = attention_mask.long().cumsum(-1) - 1
                 position_ids = position_ids.clamp_min(0)
             else:
-                position_ids = torch.arange(t, device=dec_device).unsqueeze(0).expand(bsz, t)
-        position_ids = position_ids.to(dec_device)
+                position_ids = torch.arange(t, device=first_device).unsqueeze(0).expand(bsz, t)
+        position_ids = position_ids.to(first_device)
 
         # Gradient checkpointing needs at least one input that requires grad, but
         # the base embedding is frozen. Detach to a leaf and flag it so the
@@ -340,9 +344,17 @@ class NativeLlamaQLoRA(nn.Module):
         if ckpt:
             hidden = hidden.detach().requires_grad_(True)
 
-        attn_bias = self._attn_bias(attention_mask, t, dec_device, torch.float32)
+        attn_bias = self._attn_bias(attention_mask, t, first_device, torch.float32)
 
-        for meta, entry in zip(self._block_meta, self.blocks):
+        cur_device = first_device
+        for meta, entry, dev in zip(self._block_meta, self.blocks, self._block_devices):
+            # Cross the device boundary if this block sits on another card. All
+            # no-ops under a single-device load (dev == cur_device throughout).
+            if dev != cur_device:
+                hidden = backbone.to_device(hidden, dev)
+                position_ids = backbone.to_device(position_ids, dev)
+                attn_bias = backbone.to_device(attn_bias, dev)
+                cur_device = dev
             if ckpt:
                 hidden = torch.utils.checkpoint.checkpoint(
                     self._block_forward, meta, entry, hidden, position_ids, attn_bias,
@@ -351,6 +363,8 @@ class NativeLlamaQLoRA(nn.Module):
             else:
                 hidden = self._block_forward(meta, entry, hidden, position_ids, attn_bias)
 
+        # Final norm + head live on the output device (the last split device).
+        hidden = backbone.to_device(hidden, self.device)
         hidden = self._rmsnorm(hidden, self.final_norm.weight, self.final_eps)
         return hidden
 
@@ -365,7 +379,7 @@ class NativeLlamaQLoRA(nn.Module):
         """Materialize full logits ``[b, t, vocab]`` (validation / small batches)."""
         hidden = self.forward(input_ids, attention_mask)
         w = self.lm_head_weight_fn()()
-        return hidden.to(w.dtype) @ w
+        return backbone.to_device(hidden, w.device).to(w.dtype) @ w
 
     def compute_loss(
         self,
@@ -377,6 +391,9 @@ class NativeLlamaQLoRA(nn.Module):
     ) -> torch.Tensor:
         """Shifted causal-LM cross-entropy via the streaming fused head."""
         hidden = self.forward(input_ids, attention_mask)
+        # The fused head matmuls hidden against the frozen head weight, which
+        # lives on the head's device; co-locate them (no-op single-device).
+        hidden = backbone.to_device(hidden, self._head_device)
         labels = labels.to(hidden.device)
         return fused_linear_cross_entropy(
             hidden, self.lm_head_weight_fn(), labels,
