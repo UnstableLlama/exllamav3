@@ -412,12 +412,28 @@ helpers live in `qlora_train_native.py` and are imported by the DDP script):**
   turn-end token). Run once to verify tokenization on any new dataset/schema
   before a long run.
 
-**Tokenization verified** for the `messages` path: `default_chat_prompt()` (Llama)
-injects **no** system prompt when none is passed, emits the standard Llama-3
-template ending at the assistant header; the response is tokenized separately and
+**Tokenization** for the `messages` path: `default_chat_prompt()` (Llama) injects
+**no** system prompt when none is passed, emits the standard Llama-3 template
+ending at the assistant header; the response is tokenized separately and
 terminated with the architecture-correct turn-end token, prompt masked `-100`.
-Pure-logic checks (scheduler shape, epoch→step math, messages extraction) pass;
-the full path needs the GPU box (no torch/CUDA in the dev container).
+
+**Doubled-BOS bug found by `--inspect` (fixed).** Running `--inspect 3` on the GPU
+box revealed every prompt began with `<|begin_of_text|><|begin_of_text|>` and the
+**response span began with a stray `<|begin_of_text|>`**. Cause: the special-token
+encode path (`tokenizer.py:243/254`) calls the underlying HF tokenizer with
+`add_special_tokens=True`, and the Llama-3 tokenizer has `add_bos_token=true`, so
+it auto-prepends BOS on *every* `encode()` — on top of the literal BOS in the chat
+template, and again on the separately-encoded response. exllamav3's own `add_bos`
+flag is independent of this. This is non-standard (real Llama-3 = exactly one BOS,
+none mid-sequence) and meant the EXL3 arm wasn't even BOS-matched to the BNB arm
+(which uses `add_special_tokens=False` and so gets a single BOS). **Fix:**
+`build_sft_examples` now normalizes to one leading BOS and strips the response's
+spurious one (no-op for tokenizers that don't auto-prepend, so it's general). The
+fix lives in the trainer, NOT the tokenizer (the inference path relies on the
+auto-BOS). Prior pirate/Yoda runs carried this double BOS and still trained/
+validated (the forward math was unaffected), but new runs should use the fix.
+Pure-logic checks (scheduler shape, epoch→step math, messages extraction, BOS
+normalization) pass; the rest needs the GPU box (no torch/CUDA in the container).
 
 **Recommended semancy run (per the research plan: r=16/α=32, lr 1e-4, cosine,
 ~10% warmup, wd 0.01, eff-batch 16, completions-only, all linear targets, 2 epochs):**
@@ -447,6 +463,26 @@ torchrun --standalone --nproc_per_node=2 examples/qlora_train_native_ddp.py \
 - Recall **finding C**: a low-rank adapter (r=16) is *attenuated* on the EXL3
   base at inference. Evaluate on bf16 (or merge-and-requantize) for a fair read;
   the held-out `test` loss is the format-independent signal.
+
+**BNB-NF4 arm matched too.** `examples/qlora_train_bnb.py` got the same flags
+(`--messages-key`, `--scheduler`/`--warmup-ratio`/`--warmup-steps`,
+`--weight-decay`, `--epochs`, `--eval-split`/`--eval-dataset`) with the helpers
+*inlined* (it runs in the separate transformers+bitsandbytes+peft venv and can't
+import the exllamav3 path) but byte-identical to the EXL3 arm, so a matched
+EXL3-vs-NF4 comparison on semancy just needs the same flags on both:
+```
+# EXL3-4bpw arm: the DDP command above.
+# BNB-NF4 arm (point --model at the bf16 HF weights; same eff-batch via --batch):
+~/exl3/bnb-venv/bin/torchrun --standalone --nproc_per_node=2 \
+    examples/qlora_train_bnb.py --model /path/to/Llama-bf16 --out /path/to/out/semancy_bnb \
+    --dataset UnstableLlama/semancy --messages-key messages --no-clean-text \
+    --eval-split test --eval-every 10 --save-best \
+    --lora-r 16 --alpha 32 --lr 1e-4 --scheduler cosine --warmup-ratio 0.1 \
+    --weight-decay 0.01 --batch 8 --grad-accum 1 --epochs 2 --seq-len 2048
+```
+Compare the held-out `test` loss floors (per S3-B: compare floors, not steps —
+the arms differ in effective LR/init). BNB may need a smaller `--batch` +
+`--grad-accum` to hit eff-batch 16 within 24GB (it lacks the EXL3 arm's fused-CE).
 
 ---
 
