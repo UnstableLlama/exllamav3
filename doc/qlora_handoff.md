@@ -376,6 +376,102 @@ ratio at inference**; the adapter was good all along (loss + bf16 gens prove it)
 3. Then the headline low-bitrate run: EXL3-2.5/3bpw (where NF4 can't follow),
    deployed via merge-requantize, on a real metric.
 
+### Session 4 — multi-GPU (`--parallel`), code cleanup, and the fork/upstream call
+
+> Branch `claude/trusting-goodall-in70lc`. Mostly infrastructure: a second
+> multi-GPU path (layer-split), a code-health pass, and a strategy decision.
+> No new training science — set up so **next session is training runs**.
+
+#### A. Strategy: keep it in the fork for now; extract/upstream later
+
+Discussed whether QLoRA support belongs in this exllamav3 fork, its own repo, or
+an Axolotl plugin. Decision: **stay in the fork** (research-first; the goal is the
+low-bitrate result, not a product). Axolotl is the wrong home (it's built on the
+transformers/PEFT/Trainer stack this work deliberately routes *around*, and its
+deps threaten the torch/EXL3 ABI pin). The clean end-state is a small **stable
+training seam upstreamed into exllamav3** (turboderp is amenable if it shows
+promise) with a thin trainer repo on top — but only *after* the science lands and
+the API stops moving. To keep that option cheap, two disciplines were applied now:
+
+#### B. Code-health pass (done, on the branch)
+
+- **Pruned the dead HF-Trainer path**: deleted `exllamav3/training/hf_qlora.py`,
+  `examples/qlora_train.py`, `examples/qlora_infer.py`, `tests/test_qlora_train_loop.py`
+  (the transformers route superseded by the native forward; §4–6 below are now
+  historical only).
+- **Added a single seam, `exllamav3/training/backbone.py`**: every reach into
+  exllamav3 internals (the `..modules` types, `attn.rope.inv_freq`, `sm_scale`,
+  RMSNorm eps, the `.inner` trellis weight reconstruction, the runtime
+  `lora_*_tensors` slots, the cross-device migration) now funnels through ~15
+  named functions there. `native_llama.py` depends only on that surface. This is
+  the future upstream API surface — if promoted, `backbone.py` is the one file
+  that moves. CPU suites all green after the refactor.
+
+#### C. Multi-GPU: `--parallel {single, ddp, split}` (the main work)
+
+Two selectable multi-GPU paths, by problem:
+- **`ddp`** (already existed, `qlora_train_native_ddp.py`, torchrun): replicate the
+  model per card, shard the batch — *throughput* for models that fit one card.
+- **`split`** (NEW): layer-split the frozen base across cards in one process —
+  *memory* for models that don't. Cards alternate (~50% duty each) so they run
+  cooler on multi-day runs. Reuses exllamav3's own layer-split: each
+  `Module.device` is set by `_load_autosplit`; the training forward mirrors
+  `forward_ls` (`model_ls.py`), migrating the hidden state across each block
+  boundary via the `no_p2p_copy`-aware logic (CPU bounce on no-P2P rigs — this
+  box's PCIe ×4 card). Cross-device gradients flow for free (autograd through the
+  `.to()` migrations). Design + rationale: **`doc/qlora_multigpu_plan.md`**.
+
+**Status — done and hardware-validated on the 2×3090:**
+- Device-aware forward: `qlora_validate_native.py --parallel split` on Llama-3.2-1B
+  forced to a 7/9 layer split — forward matches native (100% argmax, cos 0.999999),
+  and `--check-backward` confirms grads reach adapters on *both* cards.
+- Split *training*: a 20-step 1B run (`--parallel split --use-per-device 0.5 12`)
+  trained cleanly — loss 2.72→1.58, `|B|` climbing, `[PERF] peak VRAM cuda:0 0.89GB
+  / cuda:1 4.42GB` (memory genuinely distributed).
+- `train_rocinante_yoda.sh` now dispatches `PARALLEL=split|ddp` (default split).
+
+**THE split footgun (critical for the real run):** exllamav3 autosplit is
+**greedy** — it fills cuda:0 to its budget and only spills to cuda:1 on OoM
+(`model_ls.py`). Rocinante (~9 GB at 4bpw) *fits* one card, so plain
+`--parallel split` puts it **all on cuda:0** → back to the memory wall. You must
+**cap cuda:0** (`--use-per-device "5 24"` or `--reserve-per-device`) to force the
+spill. That cap only sizes the **load** (base + a reference forward); the training
+overhead (optimizer 2× moments, grads, activations — ~5 GB at r64!) is allocated at
+**runtime** in the leftover headroom. So cap cuda:0 near **half the base (~5 GB),
+not half the card**, and tune by watching the printed `decoder block devices:` line
+and the per-card `[PERF]` peaks.
+
+**Deferred (optional, maintainability only):** plan steps 2–3 — extract the shared
+training loop into `examples/qlora_sft_common.py` + a `ParallelContext` so the
+single/split and DDP scripts stop duplicating the loop. Not started (touches both
+working scripts; no functional gain). Nothing about training depends on it.
+
+#### D. Environment gotcha (resurfaced — see §2)
+
+The qlora-venv had drifted to **torch 2.12.1+cu130**, breaking flash-attn / the
+EXL3 ext with the documented `c10_cuda_check_implementation` undefined-symbol ABI
+error. Fix that worked: `pip install "torch==2.8.0" --index-url
+https://download.pytorch.org/whl/cu128` then `rm -rf ~/.cache/torch_extensions`
+(force the JIT ext to rebuild). Do **not** `pip install -e .` to "fix" it — that's
+what drags torch up. The xFormers "can't load C++/CUDA extensions" warning is
+cosmetic (built for 2.10; exllamav3 tolerates its absence).
+
+#### E. NEXT SESSION — training runs (what you wanted)
+
+The split path is ready. Quick-start for the big run:
+
+```
+# One command (defaults to split; validates the Mistral forward first, then trains):
+bash examples/train_rocinante_yoda.sh /path/to/rocinante/4/ /path/to/yoda.jsonl
+#   tune the split:   USE_PER_DEVICE="6 24" bash ...   (watch "decoder block devices:")
+#   replicate instead: PARALLEL=ddp bash ...           (Rocinante fits one card)
+```
+Or drive `qlora_train_native.py --parallel split --use-per-device <cap> 24 ...`
+directly. Then evaluate the adapter **on the bf16 base** (finding C: the 4bpw base
+attenuates low-rank LoRAs) and pursue the Session-3 next steps (merge-and-requantize,
+then the low-bitrate headline run). Remember `--save-best` + `--val-frac` for a
+clean held-out minimum; lr 1e-4 (2e-4 overfits).
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)
