@@ -99,6 +99,11 @@ be worse). DDP-specific bits live behind the `ParallelContext`.
 ## Sequencing
 1. **Device-aware forward + `backbone.block_device`/`to_device`** — the
    load-bearing piece; preserves single-device, CPU-regression-safe.
+   **DONE & validated on 2×3090** (2026-06): `qlora_validate_native.py --parallel
+   split` on Llama-3.2-1B forced to a 7/9 layer split — forward matches native
+   (100% argmax, cos 0.999999) and `--check-backward` confirms cross-device
+   gradient flow (grads on both cards) through checkpointing. Single-device
+   unchanged; all CPU suites green.
 2. `ParallelContext` (single/ddp/split).
 3. Shared-loop extraction + entry refactor (`--parallel`).
 4. Wrapper dispatch + flip `train_rocinante_yoda.sh` default to `--parallel split`.
