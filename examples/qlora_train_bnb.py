@@ -9,7 +9,10 @@ else is matched so the comparison isolates the quantization format:
   - same Llama-3 chat prompt + completion-only masking (prompt tokens = -100)
   - same `datasets` shuffle(seed=0)+select and the same deterministic val split
   - same LoRA (r/alpha/targets, dropout 0, bias none), fp32 adapters, bf16 compute
-  - same optimizer (AdamW, lr, no weight decay, constant LR), grad-clip
+  - same optimizer (AdamW, lr, weight decay) + the same LR schedule helper
+    (--scheduler/--warmup-*, identical to the EXL3 arm), grad-clip
+  - same OpenAI `messages` loader (--messages-key) and real test-split eval
+    (--eval-split), so a matched run needs identical flags on both arms
   - held-out loss computed identically (mean per-example completion loss, batch 1)
 
 Runs in a SEPARATE venv (transformers + bitsandbytes + peft + accelerate +
@@ -31,6 +34,7 @@ Multi-GPU (DDP; --batch is PER-GPU, effective = batch * nproc * grad-accum):
 
 import argparse
 import json
+import math
 import os
 import random
 import re
@@ -67,33 +71,98 @@ def llama3_prompt(user):  # identical to Llama.default_chat_prompt (no system)
             f"{user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n")
 
 
-def build_sft_examples(tok, args):
+def extract_single_turn(messages):  # identical to qlora_train_native.py
+    """(user_text, assistant_text) from an OpenAI-style single-turn messages list.
+    Last user turn before the first assistant turn = prompt; that assistant turn =
+    target. System turns ignored. ("", "") if either is missing -> row skipped."""
+    user_text, asst_text = "", ""
+    for m in messages or []:
+        role = (m.get("role") or "").lower()
+        content = (m.get("content") or "").strip()
+        if role == "user":
+            user_text = content
+        elif role == "assistant":
+            asst_text = content
+            break
+    return user_text, asst_text
+
+
+def make_lr_scheduler(optimizer, name, total_steps, warmup_steps):
+    """Transformers-free LR scheduler (none/linear/cosine) with linear warmup,
+    identical to qlora_train_native.py so the arms stay matched. Matches HF's
+    get_{linear,cosine}_schedule_with_warmup."""
+    name = (name or "none").lower()
+    warmup_steps = max(0, int(warmup_steps))
+    total_steps = max(1, int(total_steps))
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        if name in ("none", "constant"):
+            return 1.0
+        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        progress = min(1.0, max(0.0, progress))
+        if name == "linear":
+            return 1.0 - progress
+        if name == "cosine":
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        raise ValueError(f"unknown scheduler '{name}' (expected none/linear/cosine)")
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def resolve_steps_and_warmup(args, num_train_examples, effective_batch):
+    """Finalize args.steps (from --epochs) and compute warmup steps, identical to
+    qlora_train_native.py."""
+    if getattr(args, "epochs", 0) and args.epochs > 0:
+        eff = max(1, int(effective_batch))
+        steps_per_epoch = max(1, math.ceil(num_train_examples / eff))
+        args.steps = max(1, math.ceil(args.epochs * steps_per_epoch))
+    warmup = (args.warmup_steps if getattr(args, "warmup_steps", 0) and args.warmup_steps > 0
+              else int(round(getattr(args, "warmup_ratio", 0.0) * args.steps)))
+    return args.steps, max(0, warmup)
+
+
+def build_sft_examples(tok, args, split=None, dataset=None, max_samples=None):
     """Mirror of qlora_train_native.build_sft_examples using the HF tokenizer.
     The underlying Llama-3 tokenizer is the same, so token IDs match the EXL3
     arm for identical text; add_special_tokens=False (the chat string already
-    contains <|begin_of_text|>) reproduces add_bos=False + encode_special."""
+    contains <|begin_of_text|>) reproduces add_bos=False + encode_special.
+
+    split/dataset/max_samples override the args defaults (used to build the
+    held-out eval set from a real split, e.g. 'test'). args.messages_key picks
+    the OpenAI `messages` layout, matching the EXL3 arm."""
     from datasets import load_dataset
-    name = args.dataset
+    name = dataset or args.dataset
+    split = split or args.dataset_split
+    max_samples = args.max_samples if max_samples is None else max_samples
     if os.path.exists(name):
         ext = os.path.splitext(name)[1].lower()
         builder = {".json": "json", ".jsonl": "json",
                    ".parquet": "parquet", ".csv": "csv"}.get(ext, "json")
-        ds = load_dataset(builder, data_files=name, split=args.dataset_split)
+        ds = load_dataset(builder, data_files=name, split=split)
     else:
-        ds = load_dataset(name, split=args.dataset_split)
-    if args.max_samples and args.max_samples < len(ds):
-        ds = ds.shuffle(seed=0).select(range(args.max_samples))
+        ds = load_dataset(name, split=split)
+    if max_samples and max_samples < len(ds):
+        ds = ds.shuffle(seed=0).select(range(max_samples))
 
+    messages_key = getattr(args, "messages_key", None)
     examples = []
     for ex in ds:
-        instr = (ex.get(args.instruction_key) or "").strip()
-        ctx = (ex.get(args.context_key) or "").strip()
-        resp = (ex.get(args.response_key) or "").strip()
+        if messages_key:
+            instr, resp = extract_single_turn(ex.get(messages_key))
+            ctx = ""
+        else:
+            instr = (ex.get(args.instruction_key) or "").strip()
+            ctx = (ex.get(args.context_key) or "").strip()
+            resp = (ex.get(args.response_key) or "").strip()
         if not args.no_clean_text:
             instr, ctx, resp = (clean_style_text(instr), clean_style_text(ctx),
                                 clean_style_text(resp))
         if not resp or len(resp.split()) < args.min_response_words:
             continue
+        if messages_key and not instr:
+            continue  # malformed messages row: no user turn to prompt with
         if args.uppercase_response:
             resp = resp.upper()
         user = instr if not ctx else f"{instr}\n\n{ctx}"
@@ -128,6 +197,12 @@ def main():
     ap.add_argument("--instruction-key", default="instruction")
     ap.add_argument("--context-key", default="input")
     ap.add_argument("--response-key", default="output")
+    ap.add_argument("--messages-key", default=None,
+                    help="Column holding OpenAI-style single-turn messages (e.g. "
+                         "'messages' for UnstableLlama/semancy). When set, the user "
+                         "turn is the prompt and the assistant turn the supervised "
+                         "response; the flat instruction/response keys are ignored. "
+                         "Matches the EXL3 arm's --messages-key.")
     ap.add_argument("--no-clean-text", action="store_true")
     ap.add_argument("--min-response-words", type=int, default=3)
     ap.add_argument("--uppercase-response", action="store_true")
@@ -136,6 +211,22 @@ def main():
     ap.add_argument("--lora-r", dest="r", type=int, default=64)
     ap.add_argument("--alpha", type=float, default=64.0)
     ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--weight-decay", type=float, default=0.01,
+                    help="AdamW weight decay on the LoRA params (default 0.01, "
+                         "matching the EXL3 arm's torch-AdamW default).")
+    ap.add_argument("--scheduler", choices=["none", "linear", "cosine"],
+                    default="none",
+                    help="LR schedule after warmup: none/linear/cosine (to 0). "
+                         "Matches the EXL3 arm's --scheduler.")
+    ap.add_argument("--warmup-ratio", type=float, default=0.0,
+                    help="Fraction of total steps to warm up the LR from 0 "
+                         "(e.g. 0.05-0.1). Ignored if --warmup-steps>0.")
+    ap.add_argument("--warmup-steps", type=int, default=0,
+                    help="Absolute warmup steps; overrides --warmup-ratio when >0.")
+    ap.add_argument("--epochs", type=float, default=0.0,
+                    help="If >0, set --steps to cover this many passes over the "
+                         "FULL training set (one step = batch*world*grad-accum "
+                         "examples), so the schedule matches the epoch count.")
     ap.add_argument("--steps", type=int, default=500)
     ap.add_argument("--batch", type=int, default=8, help="Per-GPU micro-batch")
     ap.add_argument("--grad-accum", type=int, default=1)
@@ -143,10 +234,17 @@ def main():
     ap.add_argument("--max-samples", type=int, default=0,
                     help="Cap source rows (0 = use all). Match this to the EXL3 "
                          "arm so both train/eval on the same split.")
+    ap.add_argument("--eval-split", default=None,
+                    help="Use this split of the dataset (e.g. 'test') as the "
+                         "held-out eval set, instead of carving --val-frac off "
+                         "train. Real held-out data; takes precedence over "
+                         "--val-frac. Built identically on every rank.")
+    ap.add_argument("--eval-dataset", default=None,
+                    help="Dataset id/path for --eval-split (defaults to --dataset).")
     ap.add_argument("--val-frac", type=float, default=0.0)
     ap.add_argument("--eval-every", type=int, default=0,
                     help="Also report held-out loss every N steps (needs "
-                         "--val-frac > 0). 0 = only at the end.")
+                         "--val-frac > 0 or --eval-split). 0 = only at the end.")
     ap.add_argument("--save-best", action="store_true",
                     help="Save the adapter only when held-out loss improves "
                          "(needs --val-frac + --eval-every). Avoids keeping an "
@@ -217,18 +315,32 @@ def main():
 
     examples = build_sft_examples(tok, args)
     assert examples, "no usable training examples"
-    # Hold out the val split BEFORE sharding so it never leaks into any rank's
-    # training data and matches the other arms exactly.
+    # Held-out eval set. Prefer the dataset's own eval split (real held-out data);
+    # otherwise carve the first val_frac off train BEFORE sharding so it never
+    # leaks into any rank's training data and matches the other arms exactly.
     val_examples = []
-    if args.val_frac > 0:
+    if args.eval_split:
+        val_examples = build_sft_examples(
+            tok, args, split=args.eval_split,
+            dataset=args.eval_dataset or args.dataset, max_samples=0)
+    elif args.val_frac > 0:
         n_val = max(1, int(len(examples) * args.val_frac))
         val_examples, examples = examples[:n_val], examples[n_val:]
     shard = examples[rank::world_size] if ddp else examples
+
+    # Finalize step count (from --epochs over the FULL train set) and warmup.
+    eff_batch = args.batch * world_size * args.grad_accum
+    args.steps, warmup_steps = resolve_steps_and_warmup(args, len(examples), eff_batch)
     if is_main:
         print(f" -- {len(examples)} train examples ({len(shard)}/rank), "
-              f"{len(val_examples)} val")
+              f"{len(val_examples)} val "
+              f"({'split ' + args.eval_split if args.eval_split else 'val_frac'})")
+        print(f" -- {args.steps} steps, eff_batch {eff_batch}, "
+              f"scheduler={args.scheduler}, warmup={warmup_steps}, "
+              f"weight_decay={args.weight_decay}")
 
-    opt = torch.optim.AdamW(params, lr=args.lr)  # no weight decay, constant LR
+    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+    sched = make_lr_scheduler(opt, args.scheduler, args.steps, warmup_steps)
 
     def batches():
         order = list(range(len(shard)))
@@ -285,11 +397,13 @@ def main():
         gnorm = torch.nn.utils.clip_grad_norm_(params, args.max_grad_norm
                                                or float("inf")).item()
         opt.step()
+        sched.step()
         opt.zero_grad(set_to_none=True)
         ema = accum if ema is None else 0.9 * ema + 0.1 * accum
         if is_main:
             print(f"  step {step:>5}/{args.steps} | loss {accum:6.4f} | "
-                  f"ema {ema:6.4f} | grad {gnorm:7.4f}")
+                  f"ema {ema:6.4f} | grad {gnorm:7.4f} | "
+                  f"lr {sched.get_last_lr()[0]:.2e}")
         if args.eval_every and val_examples and step % args.eval_every == 0:
             vl = evaluate()
             if is_main:

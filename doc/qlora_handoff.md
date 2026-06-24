@@ -448,6 +448,26 @@ torchrun --standalone --nproc_per_node=2 examples/qlora_train_native_ddp.py \
   base at inference. Evaluate on bf16 (or merge-and-requantize) for a fair read;
   the held-out `test` loss is the format-independent signal.
 
+**BNB-NF4 arm matched too.** `examples/qlora_train_bnb.py` got the same flags
+(`--messages-key`, `--scheduler`/`--warmup-ratio`/`--warmup-steps`,
+`--weight-decay`, `--epochs`, `--eval-split`/`--eval-dataset`) with the helpers
+*inlined* (it runs in the separate transformers+bitsandbytes+peft venv and can't
+import the exllamav3 path) but byte-identical to the EXL3 arm, so a matched
+EXL3-vs-NF4 comparison on semancy just needs the same flags on both:
+```
+# EXL3-4bpw arm: the DDP command above.
+# BNB-NF4 arm (point --model at the bf16 HF weights; same eff-batch via --batch):
+~/exl3/bnb-venv/bin/torchrun --standalone --nproc_per_node=2 \
+    examples/qlora_train_bnb.py --model /path/to/Llama-bf16 --out /path/to/out/semancy_bnb \
+    --dataset UnstableLlama/semancy --messages-key messages --no-clean-text \
+    --eval-split test --eval-every 10 --save-best \
+    --lora-r 16 --alpha 32 --lr 1e-4 --scheduler cosine --warmup-ratio 0.1 \
+    --weight-decay 0.01 --batch 8 --grad-accum 1 --epochs 2 --seq-len 2048
+```
+Compare the held-out `test` loss floors (per S3-B: compare floors, not steps —
+the arms differ in effective LR/init). BNB may need a smaller `--batch` +
+`--grad-accum` to hit eff-batch 16 within 24GB (it lacks the EXL3 arm's fused-CE).
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)
