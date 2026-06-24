@@ -193,7 +193,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="Path to a local EXL3 model dir")
     ap.add_argument("--out", default="out/exl3_qlora_adapter")
-    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--device", default="cuda:0",
+                    help="single-device load target (ignored when --parallel split)")
+    ap.add_argument("--parallel", choices=["single", "split"], default="single",
+                    help="single: one GPU; split: layer-autosplit the frozen base "
+                         "across visible GPUs (memory, for models too big for one card)")
+    ap.add_argument("--reserve-per-device", nargs="*", type=float, default=None, metavar="GB",
+                    help="(split) GB to reserve per device; negative excludes a device")
+    ap.add_argument("--use-per-device", nargs="*", type=float, default=None, metavar="GB",
+                    help="(split) GB budget per device; caps a card to force/tune the split")
     ap.add_argument("--r", type=int, default=32)
     ap.add_argument("--alpha", type=float, default=64.0)
     ap.add_argument("--lr", type=float, default=2e-4)
@@ -273,7 +281,19 @@ def main():
         from exllamav3 import Cache
         cache = Cache(model, max_num_tokens=4096)
 
-    model.load(device=args.device, progressbar=True)
+    if args.parallel == "split":
+        load_kwargs = {}
+        if args.reserve_per_device is not None:
+            load_kwargs["reserve_per_device"] = args.reserve_per_device
+        if args.use_per_device is not None:
+            load_kwargs["use_per_device"] = args.use_per_device
+        model.load(progressbar=True, **load_kwargs)
+        active_devices = list(model.active_devices)
+        print(f" -- layer-autosplit: active devices {active_devices}, "
+              f"output device {model.output_device}")
+    else:
+        model.load(device=args.device, progressbar=True)
+        active_devices = [torch.device(args.device).index]
     tokenizer = Tokenizer.from_config(config)
     pad_id = tokenizer.pad_token_id
     if pad_id is None or pad_id < 0:
@@ -289,6 +309,10 @@ def main():
         net.load_adapter(args.resume)
     print(f" -- trainable LoRA params: {net.num_trainable():,} "
           f"(r={args.r}, alpha={args.alpha}, targets={net.target_modules})")
+    if args.parallel == "split":
+        from collections import Counter
+        dist = Counter(str(d) for d in net._block_devices)
+        print(f" -- decoder block devices: {dict(dist)}  (final norm + head on {net.device})")
 
     # 3. Data.
     examples = build_sft_examples(
@@ -370,7 +394,8 @@ def main():
     best_val = float("inf")
     tok_seen, t0 = 0, time.time()
     if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
+        for d in active_devices:
+            torch.cuda.reset_peak_memory_stats(d)
     try:
         for step in range(1, args.steps + 1):
             accum_loss = 0.0
@@ -437,10 +462,15 @@ def main():
         tag = f" (best kept: {best_val:.4f})" if args.save_best else ""
         print(f"\n[EVAL] held-out loss (EXL3 arm): {val_loss:.4f}{tag} "
               f"over {len(val_examples)} examples")
-    peak_gb = (torch.cuda.max_memory_allocated() / 1e9
-               if torch.cuda.is_available() else 0.0)
+    if torch.cuda.is_available():
+        peak_str = " / ".join(
+            f"cuda:{d} {torch.cuda.max_memory_allocated(d) / 1e9:.2f}GB"
+            for d in active_devices
+        )
+    else:
+        peak_str = "n/a"
     print(f"[PERF] {tok_seen / dt if dt else 0:,.0f} supervised tok/s | "
-          f"peak VRAM {peak_gb:.2f} GB | {dt:.0f}s for {step} steps")
+          f"peak VRAM {peak_str} | {dt:.0f}s for {step} steps")
     print("Verify with: python examples/qlora_infer_native.py "
           f"--model {args.model} --adapter {args.out}")
 
