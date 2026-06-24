@@ -361,9 +361,12 @@ def main():
                 yield [examples[j] for j in order[i:i + args.batch]]
 
     def adapter_b_norm():
+        # Per-wrapper sums live on each wrapper's own device (they differ under a
+        # layer split), so reduce each to a Python float before summing -- adding
+        # tensors across cuda:0/cuda:1 would raise a cross-device error.
         with torch.no_grad():
-            return sum(w.lora_b.float().pow(2).sum() for w in net._wrappers
-                       if w.r > 0).sqrt().item()
+            return sum(w.lora_b.float().pow(2).sum().item() for w in net._wrappers
+                       if w.r > 0) ** 0.5
 
     def save(tag):
         # Always leave net in train mode after; saving touches the adapter only.
