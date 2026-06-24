@@ -232,6 +232,21 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
             resp + eot, add_bos=False, encode_special_tokens=True
         )[0].tolist()
 
+        # Normalize BOS. With encode_special_tokens=True the underlying HF
+        # tokenizer adds <|begin_of_text|> itself (Llama-3 has add_bos_token=true),
+        # *in addition to* the literal one default_chat_prompt() embeds and *again*
+        # on the separately-encoded response -- so the prompt would start with two
+        # BOS and the response with a spurious one. Standard Llama-3 (and the BNB
+        # arm, which uses add_special_tokens=False) is exactly one BOS at the very
+        # start and none mid-sequence. Drop the duplicates; no-op for tokenizers
+        # that don't auto-prepend BOS.
+        bos = tokenizer.bos_token_id
+        if bos is not None:
+            while len(prompt_ids) >= 2 and prompt_ids[0] == bos and prompt_ids[1] == bos:
+                prompt_ids = prompt_ids[1:]
+            if resp_ids and resp_ids[0] == bos:
+                resp_ids = resp_ids[1:]
+
         input_ids = (prompt_ids + resp_ids)[:seq_len]
         labels = [-100] * len(prompt_ids) + list(resp_ids)
         labels = labels[:seq_len]
@@ -449,6 +464,11 @@ def main():
         eot = turn_end_token(tokenizer)
         eot_id = tokenizer.encode(eot, add_bos=False,
                                   encode_special_tokens=True)[0].tolist() if eot else []
+        # encode() auto-prepends BOS (see build_sft_examples); strip it so the
+        # "ends with turn-end token" check compares the real eot id(s), not [BOS, eot].
+        bos = tokenizer.bos_token_id
+        if eot_id and bos is not None and eot_id[0] == bos:
+            eot_id = eot_id[1:]
         for i, ex in enumerate(examples[:args.inspect]):
             ids, labs = ex["input_ids"], ex["labels"]
             n_prompt = sum(1 for l in labs if l == -100)
