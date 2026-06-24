@@ -484,6 +484,42 @@ Compare the held-out `test` loss floors (per S3-B: compare floors, not steps —
 the arms differ in effective LR/init). BNB may need a smaller `--batch` +
 `--grad-accum` to hit eff-batch 16 within 24GB (it lacks the EXL3 arm's fused-CE).
 
+**semancy run result (Llama-3.2-1B 4bpw, 2×3090 DDP, r16/α32, lr1e-4 cosine,
+warmup6, 56 steps):** clean — both GPUs, cosine schedule exactly as designed
+(LR→1e-4 by step6, →0 at step56). Train loss 3.53→2.14; held-out `test` loss
+3.30→**3.09** (`--save-best`); peak VRAM **5.26 GB/GPU** (huge headroom); 179s.
+Eval flattened ~3.09 after step30 with a widening train/eval gap → near plateau;
+3.09 is high vs the style runs (~2.0) but expected (dense reasoning + a
+deliberately-hard generalization test split, not memorization). Likely
+capacity-bound on 1B — a 3B/8B base is the bigger lever than more 1B epochs.
+
+### Prompt formats (`--prompt-format`) + Mistral
+
+`build_sft_examples` got a `--prompt-format {auto,metharme}` knob (single +
+DDP; `format_prompt_and_eot()` is the seam):
+- **auto** (default, unchanged): the model's own template via
+  `default_chat_prompt` — Llama-3 headers, Mistral `<s>[INST] … [/INST]`, etc.,
+  with the architecture-correct turn-end token.
+- **metharme**: Pygmalion format `<s><|user|>{q}<|model|>{a}</s>`. On a base
+  model the `<|user|>`/`<|model|>` markers are **plain text** (not registered
+  special tokens) — the model learns them as a literal pattern, the standard way
+  these tunes train; EOS ends the turn. The literal `<s>` + the existing
+  BOS-normalization → exactly one leading BOS, none mid-sequence (verified).
+  Mistral did **not** do this before (its `default_chat_prompt` is `[INST]`).
+
+**Mistral caveat:** the native forward (`backbone.assert_block_supported`,
+backbone.py:71) **rejects sliding-window attention**, so Mistral-7B-v0.1
+(sliding_window=4096) won't load; v0.2/v0.3/Nemo/Small (sliding_window=null) are
+fine. Verify a new Mistral base with `--inspect` first (it now reports the
+metharme spans + the EOS turn-end check).
+
+Run a Mistral metharme SFT by adding `--prompt-format metharme` to the usual
+command (point `--model` at a no-sliding-window Mistral EXL3). Inference must use
+the same metharme template for the adapter to fire (the single-GPU live `sample`
+already does; set it in your own frontend for real inference). The BNB arm still
+uses `[INST]`/native only — mirror `--prompt-format` into `qlora_train_bnb.py` if
+a metharme EXL3-vs-NF4 comparison is wanted.
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)

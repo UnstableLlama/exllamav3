@@ -105,6 +105,10 @@ def main():
                          "'messages' for UnstableLlama/semancy). When set, the user "
                          "turn is the prompt and the assistant turn the supervised "
                          "response; the flat instruction/response keys are ignored.")
+    ap.add_argument("--prompt-format", choices=["auto", "metharme"], default="auto",
+                    help="Chat format. auto: the model's native template "
+                         "(Llama-3, Mistral [INST], ...). metharme: Pygmalion "
+                         "<|user|>{q}<|model|>{a}</s> (EOS ends the turn).")
     ap.add_argument("--no-clean-text", action="store_true")
     ap.add_argument("--min-response-words", type=int, default=3)
     ap.add_argument("--uppercase-response", action="store_true",
@@ -189,6 +193,7 @@ def main():
         min_response_words=args.min_response_words,
         uppercase_response=args.uppercase_response,
         messages_key=args.messages_key,
+        prompt_format=args.prompt_format,
     )
     # Held-out eval set, built identically on every rank. Prefer the dataset's own
     # eval split (real held-out data); otherwise carve the first val_frac off
@@ -203,6 +208,7 @@ def main():
             min_response_words=args.min_response_words,
             uppercase_response=args.uppercase_response,
             messages_key=args.messages_key,
+            prompt_format=args.prompt_format,
         )
     elif args.val_frac > 0:
         n_val = max(1, int(len(examples) * args.val_frac))

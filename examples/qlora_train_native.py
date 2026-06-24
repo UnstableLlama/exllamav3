@@ -66,6 +66,30 @@ def turn_end_token(tokenizer):
     return ""
 
 
+def format_prompt_and_eot(model, tokenizer, prompt_format):
+    """Return ``(build_prompt(user) -> str, eot_str)`` for the chosen chat format.
+
+    - ``auto`` (default): the model's own template (``default_chat_prompt`` --
+      Llama-3, Mistral ``[INST]``, etc.) and the architecture-correct turn-end
+      token (:func:`turn_end_token`). Unchanged from prior behavior.
+    - ``metharme``: the Pygmalion/Metharme format
+      ``<|system|>..<|user|>{user}<|model|>{response}</s>`` (system omitted here;
+      none in the data). The ``<|user|>``/``<|model|>`` markers are plain text on
+      a base model (not registered special tokens) -- the model learns them as a
+      literal pattern, which is the standard way these tunes are trained. The
+      turn ends with the model's EOS so generation stops. A literal BOS is
+      prepended so the sequence starts with one; the caller's BOS-normalization
+      then collapses any duplicate the tokenizer auto-adds.
+    """
+    if prompt_format == "metharme":
+        bos = tokenizer.bos_token or ""
+        eos = tokenizer.eos_token or ""
+        return (lambda user: f"{bos}<|user|>{user}<|model|>"), eos
+    if prompt_format == "auto":
+        return (lambda user: model.default_chat_prompt(user)), turn_end_token(tokenizer)
+    raise ValueError(f"unknown prompt-format '{prompt_format}' (expected auto/metharme)")
+
+
 # Stage directions / inline actions, e.g. "[as CAMBIO]", "[TRINCULO grabs ...]",
 # "*stares at the ceiling*". Style datasets built from play scripts carry these,
 # and the model happily learns to emit them, producing disjoint non-answers.
@@ -153,7 +177,8 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
                        instruction_key="instruction", context_key="context",
                        response_key="response", split="train",
                        clean_text=True, min_response_words=3,
-                       uppercase_response=False, messages_key=None):
+                       uppercase_response=False, messages_key=None,
+                       prompt_format="auto"):
     """
     Load an instruction dataset and tokenize for completion-only SFT using the
     model's native chat template (Llama-3, Mistral, etc. -- whatever
@@ -193,7 +218,7 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
     if max_samples and max_samples < len(ds):
         ds = ds.shuffle(seed=0).select(range(max_samples))
 
-    eot = turn_end_token(tokenizer)
+    build_prompt, eot = format_prompt_and_eot(model, tokenizer, prompt_format)
 
     examples = []
     for ex in ds:
@@ -224,7 +249,7 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
         # Tokenize the prompt and the response SEPARATELY and concatenate, so the
         # prompt/response boundary is exact -- masking by the prompt-string length
         # is vulnerable to tokenizer boundary merges that mis-align the mask.
-        prompt_text = model.default_chat_prompt(user)
+        prompt_text = build_prompt(user)
         prompt_ids = tokenizer.encode(
             prompt_text, add_bos=False, encode_special_tokens=True
         )[0].tolist()
@@ -274,9 +299,10 @@ def collate(batch, pad_id):
     )
 
 
-def sample(model, cache, tokenizer, generator, prompt, max_new_tokens=48):
-    """Quick native generation for live progress feedback."""
-    text = model.default_chat_prompt(prompt)
+def sample(model, cache, tokenizer, generator, build_prompt, prompt, max_new_tokens=48):
+    """Quick native generation for live progress feedback (uses the same chat
+    format as training, so a metharme-trained adapter previews meaningfully)."""
+    text = build_prompt(prompt)
     resp = generator.generate(
         prompt=text, max_new_tokens=max_new_tokens,
         add_bos=False, completion_only=True,
@@ -340,6 +366,11 @@ def main():
                          "user turn is the prompt and the assistant turn the "
                          "supervised response; --instruction/context/response-key "
                          "are ignored.")
+    ap.add_argument("--prompt-format", choices=["auto", "metharme"], default="auto",
+                    help="Chat format. auto: the model's native template "
+                         "(Llama-3, Mistral [INST], ...). metharme: Pygmalion "
+                         "<|user|>{q}<|model|>{a}</s> (markers are plain text on a "
+                         "base model; the model learns them; EOS ends the turn).")
     ap.add_argument("--no-clean-text", action="store_true",
                     help="Disable stripping of [stage directions]/*actions* and "
                          "whitespace normalization (on by default; helps play-script "
@@ -452,6 +483,7 @@ def main():
         min_response_words=args.min_response_words,
         uppercase_response=args.uppercase_response,
         messages_key=args.messages_key,
+        prompt_format=args.prompt_format,
     )
     print(f" -- {len(examples)} SFT examples")
     assert examples, "no usable training examples"
@@ -461,7 +493,7 @@ def main():
     # --seq-len truncation are visible before committing to a run. Specials are
     # shown so the chat template / <|eot_id|> stop token can be eyeballed.
     if args.inspect:
-        eot = turn_end_token(tokenizer)
+        _, eot = format_prompt_and_eot(model, tokenizer, args.prompt_format)
         eot_id = tokenizer.encode(eot, add_bos=False,
                                   encode_special_tokens=True)[0].tolist() if eot else []
         # encode() auto-prepends BOS (see build_sft_examples); strip it so the
@@ -501,6 +533,7 @@ def main():
             min_response_words=args.min_response_words,
             uppercase_response=args.uppercase_response,
             messages_key=args.messages_key,
+            prompt_format=args.prompt_format,
         )
         print(f" -- held-out eval: {len(val_examples)} examples from "
               f"split '{args.eval_split}'; {len(examples)} for training")
@@ -518,14 +551,16 @@ def main():
           f"warmup={warmup_steps}, weight_decay={args.weight_decay}")
 
     # 4. Optional generator for live samples (KV-cache inference path). The cache
-    #    was allocated before load() above.
+    #    was allocated before load() above. Use the training chat format so the
+    #    preview is meaningful for a metharme-trained adapter.
+    build_prompt, _ = format_prompt_and_eot(model, tokenizer, args.prompt_format)
     generator = None
     if args.sample_every:
         from exllamav3 import Generator
         generator = Generator(model=model, cache=cache, tokenizer=tokenizer)
         net.eval()
         with torch.inference_mode():
-            base = sample(model, cache, tokenizer, generator, args.sample_prompt)
+            base = sample(model, cache, tokenizer, generator, build_prompt, args.sample_prompt)
         net.train()
         print(f"\n\U0001f3ad  baseline (step 0): {args.sample_prompt}\n     -> {base}\n")
 
@@ -617,7 +652,7 @@ def main():
                 net.eval()
                 net.apply_to_native()      # make generation reflect the adapter
                 with torch.inference_mode():
-                    txt = sample(model, cache, tokenizer, generator, args.sample_prompt)
+                    txt = sample(model, cache, tokenizer, generator, build_prompt, args.sample_prompt)
                 net.remove_from_native()
                 net.train()
                 print(f"\n  \U0001f3ad  [step {step}] {args.sample_prompt}\n     -> {txt}\n")
