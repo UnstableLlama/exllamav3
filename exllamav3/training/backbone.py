@@ -50,28 +50,37 @@ def assert_block_supported(block):
     """
     Reject architectures the native forward can't faithfully reproduce, loudly,
     so a mismatch is an explicit error rather than a silently wrong forward.
+
+    The native block forward reproduces a pre-norm softmax-attention decoder and
+    reads every norm / activation / scale from the loaded modules, so it covers
+    Llama/Mistral/Qwen2 (plain), Qwen3 (q/k-norm), and Gemma3/4 (q/k/v-norm +
+    sandwich post-norms + GeGLU + sliding/full window + per-layer head dims).
+    What it still cannot do is rejected here: linear/recurrent attention
+    (GatedDeltaNet -> Qwen3.5/3.6), MoE, attention output gating, mRoPE, partial
+    rotary, and non-NeoX RoPE.
     """
-    from ..modules import GatedMLP
+    from ..modules import GatedMLP, Attention, SlidingAttention
     key = getattr(block, "key", "?")
     attn = getattr(block, "attn", None)
     mlp = getattr(block, "mlp", None)
     assert attn is not None and mlp is not None, \
         f"{key}: block must have both attention and MLP (parallel/no-op blocks unsupported)"
+    # Softmax attention only -- GatedDeltaNet (linear/recurrent attention, used by
+    # Qwen3.5/3.6 for ~3/4 of layers) needs a differentiable recurrent forward we
+    # do not have.
+    assert isinstance(attn, (Attention, SlidingAttention)), \
+        f"{key}: only softmax Attention/SlidingAttention is supported, got " \
+        f"{type(attn).__name__} (linear/recurrent attention is unsupported)"
     assert isinstance(mlp, GatedMLP), \
-        f"{key}: only GatedMLP (SiLU/GeLU gated) MLPs are supported, got {type(mlp).__name__}"
-    assert mlp.activation_fn in ("silu",), \
-        f"{key}: only SiLU gated MLP is supported, got activation {mlp.activation_fn!r}"
+        f"{key}: only GatedMLP is supported (no MoE), got {type(mlp).__name__}"
+    assert mlp.activation_fn in ("silu", "gelu"), \
+        f"{key}: only SiLU/GeLU gated MLP is supported, got activation {mlp.activation_fn!r}"
     assert getattr(mlp, "act_limit", 0.0) in (0.0, None), \
         f"{key}: gated-MLP act_limit is not supported"
-    assert attn.q_norm is None and attn.k_norm is None, \
-        f"{key}: attention q/k norms are not supported by the native QLoRA forward"
-    assert getattr(attn, "v_norm", None) is None, f"{key}: attention v_norm unsupported"
+    # q/k/v norms ARE supported now (read from the modules); only attention output
+    # gating (interleaved/headwise gate, used by Qwen3.5 full-attn layers) is not.
     assert getattr(attn, "g_proj", None) is None and not getattr(attn, "interleaved_gate", False), \
         f"{key}: attention output gating is not supported"
-    assert getattr(attn, "sliding_window", -1) in (-1, 0, None), \
-        f"{key}: sliding-window attention is not supported"
-    assert not getattr(attn, "logit_softcapping", 0.0), \
-        f"{key}: attention logit softcapping is not supported"
     assert attn.rope is not None and attn.rope.inv_freq is not None, \
         f"{key}: model loaded without a RoPE table; cannot build positional encoding"
     assert attn.rope.mrope_section is None, f"{key}: mRoPE is not supported"
@@ -88,22 +97,71 @@ def block_metadata(block) -> dict:
     copied (``inv_freq`` is the loaded RoPE table itself).
     """
     attn = block.attn
+    sw = getattr(attn, "sliding_window", -1)
     return {
         "num_q_heads": attn.num_q_heads,
         "num_kv_heads": attn.num_kv_heads,
         "head_dim": attn.head_dim,
         "sm_scale": attn.sm_scale,
-        "attn_eps": rms_norm_eps(block.attn_norm),
-        "mlp_eps": rms_norm_eps(block.mlp_norm),
         # RoPE: the llama3-scaled inv_freq lives on the loaded RoPE object.
         "inv_freq": attn.rope.inv_freq,
         "attn_factor": attn.rope.attn_factor,
+        # Per-layer attention window: >0 means sliding (band) attention, else full
+        # causal (Gemma alternates local-sliding / global-full layers).
+        "sliding_window": int(sw) if sw not in (None, 0) else -1,
+        # tanh logit softcapping on the attention scores (Gemma2; 0 = none).
+        "softcap": float(getattr(attn, "logit_softcapping", 0.0) or 0.0),
+        # gated-MLP activation ("silu" or "gelu"/GeGLU for Gemma).
+        "activation": block.mlp.activation_fn,
+        # Some Gemma layers reuse the K projection as V (no separate v_proj).
+        "use_k_as_v": bool(getattr(attn, "use_k_as_v", False)),
+    }
+
+
+def norm_spec(norm) -> Optional[dict]:
+    """
+    Plain-data description of an ``RMSNorm`` module for the native forward:
+    ``{weight, eps, bias, scale}`` (``weight`` is the frozen tensor, or ``None``
+    when unweighted). Reproduces ``RMSNorm.forward_torch`` exactly --
+    ``y = (x / rms(x)) * scale * (weight + bias)`` -- so Gemma's ``(1 + weight)``
+    convention and unweighted v-norm are handled by reading the module's own
+    ``constant_bias`` / ``constant_scale`` / ``unweighted`` rather than hardcoding.
+    Returns ``None`` for a missing norm.
+    """
+    if norm is None:
+        return None
+    from ..modules import RMSNorm
+    assert isinstance(norm, RMSNorm), \
+        f"native forward only supports RMSNorm, got {type(norm).__name__}"
+    return {
+        "weight": None if getattr(norm, "unweighted", False) else norm.weight,
+        "eps": norm.rms_norm_eps,
+        "bias": float(getattr(norm, "constant_bias", 0.0)),
+        "scale": float(getattr(norm, "constant_scale", 1.0)),
     }
 
 
 def block_norms(block):
     """Return the ``(attn_norm, mlp_norm)`` modules of one block."""
     return block.attn_norm, block.mlp_norm
+
+
+def block_post_norms(block):
+    """Return the optional ``(attn_post_norm, mlp_post_norm)`` modules of one
+    block (Gemma sandwich norms). Either is ``None`` for a plain pre-norm block."""
+    return getattr(block, "attn_post_norm", None), getattr(block, "mlp_post_norm", None)
+
+
+def attn_qkv_norms(block):
+    """Return the optional ``(q_norm, k_norm, v_norm)`` modules of one block's
+    attention (Qwen3: q/k; Gemma: q/k/v; Llama/Mistral/Qwen2: all ``None``)."""
+    a = block.attn
+    return getattr(a, "q_norm", None), getattr(a, "k_norm", None), getattr(a, "v_norm", None)
+
+
+def head_softcap(lm_head) -> float:
+    """Final-logit tanh softcapping on the LM head (Gemma2; 0 = none)."""
+    return float(getattr(lm_head, "softcap", 0.0) or 0.0)
 
 
 def block_device(block):
