@@ -404,6 +404,17 @@ def main():
                          "training. Run this once to verify a new dataset/schema.")
     ap.add_argument("--targets", nargs="*", default=None,
                     help="Target module leaf names (default: attn+mlp projections)")
+    ap.add_argument("--train-embeddings", action="store_true",
+                    help="Also FULLY train the input embeddings (modules_to_save), "
+                         "not just LoRA. Saved to modules_to_save.safetensors. Big "
+                         "(vocab x hidden) -- raises VRAM and, under DDP, the "
+                         "per-step grad all-reduce. On a tied model this also "
+                         "trains the head (shared weight).")
+    ap.add_argument("--train-head", action="store_true",
+                    help="Also FULLY train the LM head (modules_to_save). Switches "
+                         "the loss off the fused frozen-head path to a supervised-"
+                         "position cross-entropy so the head gets a gradient. On a "
+                         "tied model this is equivalent to --train-embeddings.")
     ap.add_argument("--compute-dtype", default="bfloat16",
                     choices=["float32", "float16", "bfloat16"])
     ap.add_argument("--no-grad-ckpt", action="store_true")
@@ -477,12 +488,15 @@ def main():
     net = NativeLlamaQLoRA(
         model, r=args.r, alpha=args.alpha, target_modules=args.targets,
         compute_dtype=cdt, gradient_checkpointing=not args.no_grad_ckpt,
+        train_embeddings=args.train_embeddings, train_head=args.train_head,
     )
     net.train()
     if args.resume:
         net.load_adapter(args.resume)
-    print(f" -- trainable LoRA params: {net.num_trainable():,} "
-          f"(r={args.r}, alpha={args.alpha}, targets={net.target_modules})")
+    ms = [n for n, p in [("embed", net.embed_weight), ("head", net.head_weight)] if p is not None]
+    print(f" -- trainable params: {net.num_trainable():,} "
+          f"(r={args.r}, alpha={args.alpha}, targets={net.target_modules}"
+          f"{', modules_to_save=' + str(ms) if ms else ''})")
     if args.parallel == "split":
         from collections import Counter
         dist = Counter(str(d) for d in net._block_devices)
@@ -578,9 +592,9 @@ def main():
         net.train()
         print(f"\n\U0001f3ad  baseline (step 0): {args.sample_prompt}\n     -> {base}\n")
 
-    # 5. Optimizer over the adapter params only, plus the LR schedule.
-    opt = torch.optim.AdamW(net.lora_parameters(), lr=args.lr,
-                            weight_decay=args.weight_decay)
+    # 5. Optimizer over the trainable params, plus the LR schedule. Weight decay
+    #    on the LoRA params only (param_groups puts embed/head in a 0-WD group).
+    opt = torch.optim.AdamW(net.param_groups(args.weight_decay), lr=args.lr)
     sched = make_lr_scheduler(opt, args.scheduler, args.steps, warmup_steps)
 
     def batches():
@@ -644,7 +658,7 @@ def main():
             # grad norm BEFORE clipping is a direct check that gradients reach the
             # adapters (a flat ~0 here would mean the backward graph is broken).
             gnorm = torch.nn.utils.clip_grad_norm_(
-                net.lora_parameters(), args.max_grad_norm or float("inf")
+                net.trainable_parameters(), args.max_grad_norm or float("inf")
             ).item()
             opt.step()
             sched.step()

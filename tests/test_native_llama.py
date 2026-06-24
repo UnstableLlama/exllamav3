@@ -280,10 +280,39 @@ def test_block_backward_reaches_adapters_only():
     print("[block] backward reaches all adapters, base stays frozen PASSED")
 
 
+def test_modules_to_save_param_groups():
+    # Full-trained embed/head (modules_to_save) must be optimized but excluded
+    # from weight decay (decaying a whole embedding table is harmful), while LoRA
+    # params keep it. Build a headless net and set only the attrs the helpers read.
+    net = NativeLlamaQLoRA.__new__(NativeLlamaQLoRA)
+    net._wrappers = []                                  # no LoRA wrappers here
+    net.embed_weight = torch.nn.Parameter(torch.zeros(5, 3))
+    net.head_weight = torch.nn.Parameter(torch.zeros(3, 5))
+
+    assert net.lora_parameters() == []
+    ms = net.modules_to_save_parameters()
+    assert ms == [net.embed_weight, net.head_weight]
+    assert net.trainable_parameters() == [net.embed_weight, net.head_weight]
+    assert net.num_trainable() == 5 * 3 + 3 * 5
+
+    groups = net.param_groups(weight_decay=0.01)
+    # group 0 = LoRA (wd kept, here empty); group 1 = embed/head (wd forced to 0).
+    assert groups[0]["weight_decay"] == 0.01 and groups[0]["params"] == []
+    assert groups[1]["weight_decay"] == 0.0
+    assert groups[1]["params"] == [net.embed_weight, net.head_weight]
+
+    # With no modules_to_save, there is no second group at all.
+    net.embed_weight = net.head_weight = None
+    g = net.param_groups(weight_decay=0.01)
+    assert len(g) == 1 and g[0]["weight_decay"] == 0.01
+    print("[modules_to_save] param-group split (embed/head = no weight decay) PASSED")
+
+
 def main():
     test_difflinear_matches_reference_and_gradchecks()
     test_block_matches_reference()
     test_block_backward_reaches_adapters_only()
+    test_modules_to_save_param_groups()
     print("\nAll native-Llama differentiable-forward checks passed.")
 
 

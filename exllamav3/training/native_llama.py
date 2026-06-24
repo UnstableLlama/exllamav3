@@ -163,6 +163,8 @@ class NativeLlamaQLoRA(nn.Module):
         use_rslora: bool = False,
         compute_dtype: torch.dtype = torch.bfloat16,
         gradient_checkpointing: bool = True,
+        train_embeddings: bool = False,
+        train_head: bool = False,
     ):
         super().__init__()
         self.model = model
@@ -239,6 +241,34 @@ class NativeLlamaQLoRA(nn.Module):
                 f"target_modules {sorted(missing)} matched no linear in the model "
                 f"(available leaves: {sorted({w.key.split('.')[-1] for w in wrappers})})"
             )
+
+        # --- optional full-trained input/output embeddings (modules_to_save) ---
+        # LoRA normally freezes embed_tokens / lm_head; these flags fully train
+        # them (a trainable fp32 copy reconstructed once from the frozen base),
+        # PEFT-`modules_to_save` style, and save them alongside the adapter.
+        #
+        # exllamav3 always loads a *separate* embedding and lm_head, even for a
+        # tied model (the tied weight is materialized into both), so we train
+        # whichever is requested independently -- no shared-parameter special
+        # case. (tie_word_embeddings is recorded in the saved config only as a
+        # hint for a downstream merge/re-quantize step.)
+        self.train_embeddings = bool(train_embeddings)
+        self.train_head = bool(train_head)
+        self.tie_word_embeddings = bool(
+            getattr(getattr(model, "config", None), "tie_word_embeddings", False))
+        self.embed_weight = None    # [vocab, hidden], trainable, or None
+        self.head_weight = None     # [hidden, vocab], trainable, or None
+
+        # The base embedding is often loaded on CPU (prefer_cpu); put the trainable
+        # copies on the GPU compute devices so training isn't bottlenecked on a CPU
+        # optimizer / matmul. First-block device for the input embedding, head
+        # device for the output projection (identical under single-device / DDP).
+        if self.train_embeddings:
+            w = backbone.embed_weight(self.embed).detach().to(torch.float32)   # [V, d]
+            self.embed_weight = nn.Parameter(w.clone().to(self._block_devices[0]))
+        if self.train_head:
+            hw = backbone.head_weight_closure(self.lm_head)().detach().to(torch.float32)  # [d, V]
+            self.head_weight = nn.Parameter(hw.clone().to(self._head_device))
 
     # --- forward -----------------------------------------------------------
 
@@ -324,7 +354,14 @@ class NativeLlamaQLoRA(nn.Module):
         # forward_ls). Start on the first block's device. The embedding is loaded
         # on CPU (prefer_cpu); backbone.embed_tokens runs the lookup there.
         first_device = self._block_devices[0]
-        hidden = backbone.embed_tokens(self.embed, input_ids).to(first_device).float()
+        if self.embed_weight is not None:
+            # Trainable input embedding: lookup against the fp32 master weight,
+            # then the same multiplier/normalize the frozen path applies.
+            ew = self.embed_weight
+            looked_up = F.embedding(input_ids.to(ew.device), ew)
+            hidden = backbone.embed_apply(self.embed, looked_up).to(first_device).float()
+        else:
+            hidden = backbone.embed_tokens(self.embed, input_ids).to(first_device).float()
 
         if attention_mask is not None:
             attention_mask = attention_mask.to(first_device)
@@ -336,12 +373,13 @@ class NativeLlamaQLoRA(nn.Module):
                 position_ids = torch.arange(t, device=first_device).unsqueeze(0).expand(bsz, t)
         position_ids = position_ids.to(first_device)
 
-        # Gradient checkpointing needs at least one input that requires grad, but
-        # the base embedding is frozen. Detach to a leaf and flag it so the
-        # checkpointed blocks (whose only trainable params are the LoRA adapters)
-        # build a backward graph. No gradient is lost: the embedding is frozen.
+        # Gradient checkpointing needs at least one input that requires grad. With
+        # a frozen embedding the hidden state doesn't, so detach to a leaf and flag
+        # it (no gradient is lost: the embedding is frozen). But when the embedding
+        # is TRAINABLE, hidden already requires grad and carries the path back to
+        # embed_weight -- detaching would sever it, so only detach when needed.
         ckpt = self.gradient_checkpointing and self.training
-        if ckpt:
+        if ckpt and not hidden.requires_grad:
             hidden = hidden.detach().requires_grad_(True)
 
         attn_bias = self._attn_bias(attention_mask, t, first_device, torch.float32)
@@ -389,8 +427,26 @@ class NativeLlamaQLoRA(nn.Module):
         chunk: int = DEFAULT_CHUNK,
         ignore_index: int = IGNORE_INDEX,
     ) -> torch.Tensor:
-        """Shifted causal-LM cross-entropy via the streaming fused head."""
+        """Shifted causal-LM cross-entropy.
+
+        Frozen head: the streaming fused head (never materializes ``[tokens,
+        vocab]``). Trainable head (``train_head``): standard autograd so the head
+        weight gets a gradient -- but logits are computed only at the *supervised*
+        positions (labels != ignore_index), so memory scales with the number of
+        supervised tokens, not the full sequence."""
         hidden = self.forward(input_ids, attention_mask)
+        if self.train_head:
+            d = hidden.shape[-1]
+            hs = hidden[:, :-1, :].reshape(-1, d)                 # shift
+            lbl = labels[:, 1:].reshape(-1).to(hs.device)
+            valid = lbl != ignore_index
+            w = self.head_weight                                  # [d, V]
+            if not bool(valid.any()):
+                # No supervised tokens: keep the head in the graph with a 0 grad.
+                return (hs.sum() * 0.0) + (w.sum() * 0.0)
+            hs = backbone.to_device(hs[valid], w.device).to(w.dtype)
+            logits = hs @ w
+            return F.cross_entropy(logits, lbl[valid].to(w.device))
         # The fused head matmuls hidden against the frozen head weight, which
         # lives on the head's device; co-locate them (no-op single-device).
         hidden = backbone.to_device(hidden, self._head_device)
@@ -409,8 +465,31 @@ class NativeLlamaQLoRA(nn.Module):
                 ps += [w.lora_a, w.lora_b]
         return ps
 
+    def modules_to_save_parameters(self) -> list[nn.Parameter]:
+        """Trainable full embed/head params (PEFT ``modules_to_save``), if any.
+        For a tied model this is the single shared embedding weight."""
+        ps: list[nn.Parameter] = []
+        if self.embed_weight is not None:
+            ps.append(self.embed_weight)
+        if self.head_weight is not None:
+            ps.append(self.head_weight)
+        return ps
+
+    def trainable_parameters(self) -> list[nn.Parameter]:
+        """All trainable params: LoRA adapters + any full-trained embed/head."""
+        return self.lora_parameters() + self.modules_to_save_parameters()
+
+    def param_groups(self, weight_decay: float) -> list[dict]:
+        """Optimizer param groups: weight decay on the LoRA params, but NONE on
+        the full embed/head (weight-decaying a whole embedding table is harmful)."""
+        groups = [{"params": self.lora_parameters(), "weight_decay": weight_decay}]
+        ms = self.modules_to_save_parameters()
+        if ms:
+            groups.append({"params": ms, "weight_decay": 0.0})
+        return groups
+
     def num_trainable(self) -> int:
-        return sum(p.numel() for p in self.lora_parameters())
+        return sum(p.numel() for p in self.trainable_parameters())
 
     @torch.no_grad()
     def apply_to_native(self, scaling: float = 1.0) -> None:
@@ -470,6 +549,25 @@ class NativeLlamaQLoRA(nn.Module):
             raise ValueError("No trainable LoRA adapters to save.")
 
         save_file(state, os.path.join(directory, "adapter_model.safetensors"))
+
+        # Fully-trained embed/head (PEFT modules_to_save). Kept in a SEPARATE file
+        # so the LoRA loader (which expects only lora_A/lora_B) is undisturbed;
+        # they are large full matrices, applied by merging into the base, not via
+        # the runtime LoRA slots. Saved in HF orientation ([vocab, hidden]) under
+        # the standard module names.
+        modules_to_save: list[str] = []
+        ms_state: dict[str, torch.Tensor] = {}
+        if self.embed_weight is not None:
+            ms_state["model.embed_tokens.weight"] = \
+                self.embed_weight.detach().to(torch.float16).cpu()           # [V, d]
+            modules_to_save.append("embed_tokens")
+        if self.head_weight is not None:
+            ms_state["lm_head.weight"] = \
+                self.head_weight.detach().t().contiguous().to(torch.float16).cpu()  # [d,V]->[V,d]
+            modules_to_save.append("lm_head")
+        if ms_state:
+            save_file(ms_state, os.path.join(directory, "modules_to_save.safetensors"))
+
         config = {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
@@ -480,11 +578,15 @@ class NativeLlamaQLoRA(nn.Module):
             "bias": "none",
             "fan_in_fan_out": False,
             "target_modules": sorted(target_leaves),
+            "modules_to_save": modules_to_save,
+            "tie_word_embeddings": self.tie_word_embeddings,
             "base_model_name_or_path": base_model_name_or_path,
         }
         with open(os.path.join(directory, "adapter_config.json"), "w", encoding="utf8") as f:
             json.dump(config, f, indent=2)
-        print(f" -- saved native QLoRA adapter ({len(target_leaves)} target types) to {directory}")
+        extra = f" + modules_to_save {modules_to_save}" if modules_to_save else ""
+        print(f" -- saved native QLoRA adapter ({len(target_leaves)} target types"
+              f"{extra}) to {directory}")
 
     def load_adapter(self, directory: str) -> int:
         """
@@ -528,5 +630,20 @@ class NativeLlamaQLoRA(nn.Module):
 
         if loaded == 0:
             raise ValueError("No trainable LoRA adapters matched the checkpoint.")
+
+        # Restore fully-trained embed/head if present and currently enabled.
+        ms_path = os.path.join(directory, "modules_to_save.safetensors")
+        if os.path.exists(ms_path) and (self.embed_weight is not None
+                                        or self.head_weight is not None):
+            ms = load_file(ms_path)
+            with torch.no_grad():
+                if self.embed_weight is not None and "model.embed_tokens.weight" in ms:
+                    e = ms["model.embed_tokens.weight"]            # [V, d]
+                    self.embed_weight.copy_(e.to(self.embed_weight.dtype).to(self.embed_weight.device))
+                if self.head_weight is not None and "lm_head.weight" in ms:
+                    h = ms["lm_head.weight"].t()                   # [V,d] -> [d,V]
+                    self.head_weight.copy_(h.to(self.head_weight.dtype).to(self.head_weight.device))
+            print(f" -- resumed modules_to_save from {directory}")
+
         print(f" -- resumed {loaded} adapters from {directory} (optimizer state not restored)")
         return loaded

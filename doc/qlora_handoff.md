@@ -517,6 +517,41 @@ DDP; `format_prompt_and_eot()` is the seam):
   BOS-normalization → exactly one leading BOS, none mid-sequence (verified).
   Mistral did **not** do this before (its `default_chat_prompt` is `[INST]`).
 
+### Training the embeddings + LM head (`--train-embeddings` / `--train-head`)
+
+LoRA freezes `embed_tokens`/`lm_head`; these flags fully train them
+(PEFT `modules_to_save` semantics) and save them. Single + DDP; in
+`NativeLlamaQLoRA`:
+- A trainable **fp32 copy** of the embedding (`[vocab,hidden]`) and/or head
+  (`[hidden,vocab]`) is reconstructed once from the frozen base and placed on the
+  GPU compute device (the base embedding is on CPU under `prefer_cpu`; a CPU
+  optimizer would crawl). exllamav3 loads a *separate* embed and head even for a
+  tied model, so they're trained **independently** — no shared-param special case
+  (the saved config records `tie_word_embeddings` only as a merge-time hint).
+- **Head loss path:** the fused-CE head is frozen-only (returns no weight grad),
+  so `--train-head` switches `compute_loss` to a standard-autograd cross-entropy
+  computed **only at the supervised positions** (labels≠ignore) — the head gets a
+  gradient and memory scales with supervised tokens, not the full `[tokens,vocab]`.
+- **Grad-checkpointing fix:** `forward` used to `detach()` the embedding (frozen
+  assumption); it now only detaches when `hidden` doesn't already require grad, so
+  a trainable embedding's gradient isn't severed.
+- Optimizer: embed/head go in a **0-weight-decay** group (`param_groups()`);
+  decaying a whole embedding table is harmful. LoRA keeps its weight decay.
+- Saved to `modules_to_save.safetensors` (HF orientation `[vocab,hidden]`) beside
+  the adapter, kept OUT of `adapter_model.safetensors` so the LoRA loader is
+  undisturbed; `adapter_config.json` lists `modules_to_save`. `load_adapter`
+  restores them on resume. CPU test: `test_modules_to_save_param_groups`.
+
+**Cost / caveats:** these are big matrices. On the tied 1B (vocab 128k×2048 ≈
+262M params) that's ~4 GB (fp32 master+grad+Adam m,v) — fine. On a 16B (vocab
+131k×~6144 ≈ 805M *each*, untied) it's ~13 GB *per* matrix — under **DDP it's
+replicated per card AND the grad is all-reduced every step** (the embed/head grad,
+not just the few-MB LoRA grad), so `--train-embeddings`/`--train-head` on a 16B
+will OOM 24 GB and is slow over PCIe. Realistic on small models, or large models
+only with `--parallel split` / more VRAM. Live samples + the native infer path do
+NOT yet reflect a trained embed/head (only the runtime LoRA slots are wired) — the
+trained matrices are for the merge/re-quantize deploy path.
+
 **Mistral caveat:** the native forward (`backbone.assert_block_supported`,
 backbone.py:71) **rejects sliding-window attention**, so Mistral-7B-v0.1
 (sliding_window=4096) won't load; v0.2/v0.3/Nemo/Small (sliding_window=null) are
