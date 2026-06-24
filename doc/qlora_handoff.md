@@ -376,101 +376,77 @@ ratio at inference**; the adapter was good all along (loss + bf16 gens prove it)
 3. Then the headline low-bitrate run: EXL3-2.5/3bpw (where NF4 can't follow),
    deployed via merge-requantize, on a real metric.
 
-### Session 4 — multi-GPU (`--parallel`), code cleanup, and the fork/upstream call
+### Session 4 — LR schedulers + warmup, OpenAI `messages` loader, real test-split eval (semancy)
 
-> Branch `claude/trusting-goodall-in70lc`. Mostly infrastructure: a second
-> multi-GPU path (layer-split), a code-health pass, and a strategy decision.
-> No new training science — set up so **next session is training runs**.
+> Branch `claude/epic-planck-n892gw`. Tooling session to support a real-task run
+> on **UnstableLlama/semancy** (a philosophy fine-tune: 436 train / 116 test,
+> OpenAI-style single-turn `messages`, no system prompts). Code only here; the
+> training run happens on the GPU box.
 
-#### A. Strategy: keep it in the fork for now; extract/upstream later
+**New trainer features (both `qlora_train_native.py` and the DDP variant; shared
+helpers live in `qlora_train_native.py` and are imported by the DDP script):**
+- **`--messages-key`** — OpenAI `messages` loader. For single-turn rows it takes
+  the user turn as the prompt and the assistant turn as the supervised response
+  (system turns ignored; the dataset has none). `extract_single_turn()` does the
+  pull; the rest of the completion-only masking path is unchanged, so the answer
+  (plus `<|eot_id|>`) is supervised and the prompt is `-100`. Takes precedence
+  over the flat `--instruction/context/response-key`.
+- **LR schedulers** — `--scheduler {none,linear,cosine}` + `--warmup-ratio`
+  (fraction of steps) or `--warmup-steps` (absolute). `make_lr_scheduler()` is a
+  transformers-free `LambdaLR` matching HF's `get_{linear,cosine}_schedule_with_warmup`
+  exactly: LR ramps 0→base over warmup, then linear-to-0 or half-cosine-to-0.
+  Default `none` keeps the old constant-LR behavior (matched-arm runs unaffected).
+  Per-step `sched.step()`; current LR is logged each step.
+- **`--weight-decay`** (default 0.01) — now explicit on the AdamW over the LoRA
+  params (torch's AdamW default was already 0.01; this just makes it a knob).
+- **`--epochs`** — if >0, computes `--steps` from the train-set size and the
+  *effective* batch (`batch*grad_accum`, ×`world_size` under DDP), so the schedule
+  length matches the requested passes. e.g. 436 rows, eff-batch 16, 2 epochs → 56
+  steps (warmup 6 at ratio 0.1).
+- **`--eval-split` / `--eval-dataset`** — held-out eval loss on a *real* split
+  (e.g. semancy's 116-row `test`) instead of carving `--val-frac` off train.
+  Built identically on every rank under DDP; works with `--eval-every`/`--save-best`.
+- **`--inspect N`** (single-GPU script) — decodes the first N built examples,
+  showing the masked prompt span vs the supervised response span and **warning if
+  the response was truncated by `--seq-len`** (so the model would never see the
+  turn-end token). Run once to verify tokenization on any new dataset/schema
+  before a long run.
 
-Discussed whether QLoRA support belongs in this exllamav3 fork, its own repo, or
-an Axolotl plugin. Decision: **stay in the fork** (research-first; the goal is the
-low-bitrate result, not a product). Axolotl is the wrong home (it's built on the
-transformers/PEFT/Trainer stack this work deliberately routes *around*, and its
-deps threaten the torch/EXL3 ABI pin). The clean end-state is a small **stable
-training seam upstreamed into exllamav3** (turboderp is amenable if it shows
-promise) with a thin trainer repo on top — but only *after* the science lands and
-the API stops moving. To keep that option cheap, two disciplines were applied now:
+**Tokenization verified** for the `messages` path: `default_chat_prompt()` (Llama)
+injects **no** system prompt when none is passed, emits the standard Llama-3
+template ending at the assistant header; the response is tokenized separately and
+terminated with the architecture-correct turn-end token, prompt masked `-100`.
+Pure-logic checks (scheduler shape, epoch→step math, messages extraction) pass;
+the full path needs the GPU box (no torch/CUDA in the dev container).
 
-#### B. Code-health pass (done, on the branch)
-
-- **Pruned the dead HF-Trainer path**: deleted `exllamav3/training/hf_qlora.py`,
-  `examples/qlora_train.py`, `examples/qlora_infer.py`, `tests/test_qlora_train_loop.py`
-  (the transformers route superseded by the native forward; §4–6 below are now
-  historical only).
-- **Added a single seam, `exllamav3/training/backbone.py`**: every reach into
-  exllamav3 internals (the `..modules` types, `attn.rope.inv_freq`, `sm_scale`,
-  RMSNorm eps, the `.inner` trellis weight reconstruction, the runtime
-  `lora_*_tensors` slots, the cross-device migration) now funnels through ~15
-  named functions there. `native_llama.py` depends only on that surface. This is
-  the future upstream API surface — if promoted, `backbone.py` is the one file
-  that moves. CPU suites all green after the refactor.
-
-#### C. Multi-GPU: `--parallel {single, ddp, split}` (the main work)
-
-Two selectable multi-GPU paths, by problem:
-- **`ddp`** (already existed, `qlora_train_native_ddp.py`, torchrun): replicate the
-  model per card, shard the batch — *throughput* for models that fit one card.
-- **`split`** (NEW): layer-split the frozen base across cards in one process —
-  *memory* for models that don't. Cards alternate (~50% duty each) so they run
-  cooler on multi-day runs. Reuses exllamav3's own layer-split: each
-  `Module.device` is set by `_load_autosplit`; the training forward mirrors
-  `forward_ls` (`model_ls.py`), migrating the hidden state across each block
-  boundary via the `no_p2p_copy`-aware logic (CPU bounce on no-P2P rigs — this
-  box's PCIe ×4 card). Cross-device gradients flow for free (autograd through the
-  `.to()` migrations). Design + rationale: **`doc/qlora_multigpu_plan.md`**.
-
-**Status — done and hardware-validated on the 2×3090:**
-- Device-aware forward: `qlora_validate_native.py --parallel split` on Llama-3.2-1B
-  forced to a 7/9 layer split — forward matches native (100% argmax, cos 0.999999),
-  and `--check-backward` confirms grads reach adapters on *both* cards.
-- Split *training*: a 20-step 1B run (`--parallel split --use-per-device 0.5 12`)
-  trained cleanly — loss 2.72→1.58, `|B|` climbing, `[PERF] peak VRAM cuda:0 0.89GB
-  / cuda:1 4.42GB` (memory genuinely distributed).
-- `train_rocinante_yoda.sh` now dispatches `PARALLEL=split|ddp` (default split).
-
-**THE split footgun (critical for the real run):** exllamav3 autosplit is
-**greedy** — it fills cuda:0 to its budget and only spills to cuda:1 on OoM
-(`model_ls.py`). Rocinante (~9 GB at 4bpw) *fits* one card, so plain
-`--parallel split` puts it **all on cuda:0** → back to the memory wall. You must
-**cap cuda:0** (`--use-per-device "5 24"` or `--reserve-per-device`) to force the
-spill. That cap only sizes the **load** (base + a reference forward); the training
-overhead (optimizer 2× moments, grads, activations — ~5 GB at r64!) is allocated at
-**runtime** in the leftover headroom. So cap cuda:0 near **half the base (~5 GB),
-not half the card**, and tune by watching the printed `decoder block devices:` line
-and the per-card `[PERF]` peaks.
-
-**Deferred (optional, maintainability only):** plan steps 2–3 — extract the shared
-training loop into `examples/qlora_sft_common.py` + a `ParallelContext` so the
-single/split and DDP scripts stop duplicating the loop. Not started (touches both
-working scripts; no functional gain). Nothing about training depends on it.
-
-#### D. Environment gotcha (resurfaced — see §2)
-
-The qlora-venv had drifted to **torch 2.12.1+cu130**, breaking flash-attn / the
-EXL3 ext with the documented `c10_cuda_check_implementation` undefined-symbol ABI
-error. Fix that worked: `pip install "torch==2.8.0" --index-url
-https://download.pytorch.org/whl/cu128` then `rm -rf ~/.cache/torch_extensions`
-(force the JIT ext to rebuild). Do **not** `pip install -e .` to "fix" it — that's
-what drags torch up. The xFormers "can't load C++/CUDA extensions" warning is
-cosmetic (built for 2.10; exllamav3 tolerates its absence).
-
-#### E. NEXT SESSION — training runs (what you wanted)
-
-The split path is ready. Quick-start for the big run:
-
+**Recommended semancy run (per the research plan: r=16/α=32, lr 1e-4, cosine,
+~10% warmup, wd 0.01, eff-batch 16, completions-only, all linear targets, 2 epochs):**
 ```
-# One command (defaults to split; validates the Mistral forward first, then trains):
-bash examples/train_rocinante_yoda.sh /path/to/rocinante/4/ /path/to/yoda.jsonl
-#   tune the split:   USE_PER_DEVICE="6 24" bash ...   (watch "decoder block devices:")
-#   replicate instead: PARALLEL=ddp bash ...           (Rocinante fits one card)
+# 0. Verify tokenization first (single-GPU, exits after printing):
+python examples/qlora_train_native.py --model /path/to/exl3_model \
+    --dataset UnstableLlama/semancy --messages-key messages \
+    --no-clean-text --seq-len 2048 --inspect 3
+#    Confirm: PROMPT is the user turn, RESPONSE is the assistant turn, and
+#    "ends with turn-end token? True" (else raise --seq-len).
+
+# 1. Train (2× GPU DDP; --batch 8 × 2 GPUs = eff-batch 16):
+torchrun --standalone --nproc_per_node=2 examples/qlora_train_native_ddp.py \
+    --model /path/to/exl3_model --out /path/to/out/semancy \
+    --dataset UnstableLlama/semancy --messages-key messages --no-clean-text \
+    --eval-split test --eval-every 10 --save-best \
+    --lora-r 16 --alpha 32 --lr 1e-4 --scheduler cosine --warmup-ratio 0.1 \
+    --weight-decay 0.01 --batch 8 --grad-accum 1 --epochs 2 --seq-len 2048
 ```
-Or drive `qlora_train_native.py --parallel split --use-per-device <cap> 24 ...`
-directly. Then evaluate the adapter **on the bf16 base** (finding C: the 4bpw base
-attenuates low-rank LoRAs) and pursue the Session-3 next steps (merge-and-requantize,
-then the low-bitrate headline run). Remember `--save-best` + `--val-frac` for a
-clean held-out minimum; lr 1e-4 (2e-4 overfits).
+- **`--no-clean-text` is important here**: the default cleaner strips `[...]`/`*...*`
+  and collapses newlines — fine for play-script style sets, **wrong for a
+  reasoning dataset** (would delete bracketed content and paragraph structure).
+- **`--seq-len`**: philosophy/reasoning answers can be long; 512 (the default)
+  likely truncates them. Use `--inspect` to check, then size `--seq-len` so most
+  responses end in the turn-end token. Bigger seq-len costs VRAM (drop `--batch`
+  or keep grad-checkpointing on if OOM).
+- Recall **finding C**: a low-rank adapter (r=16) is *attenuated* on the EXL3
+  base at inference. Evaluate on bf16 (or merge-and-requantize) for a fair read;
+  the held-out `test` loss is the format-independent signal.
 
 ---
 

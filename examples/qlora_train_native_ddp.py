@@ -43,7 +43,9 @@ import torch.distributed as dist
 
 # Reuse the single-GPU example's data helpers (same dir on sys.path under torchrun).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from qlora_train_native import build_sft_examples, collate  # noqa: E402
+from qlora_train_native import (  # noqa: E402
+    build_sft_examples, collate, make_lr_scheduler, resolve_steps_and_warmup,
+)
 
 from exllamav3 import Config, Model, Tokenizer  # noqa: E402
 from exllamav3.training.native_llama import NativeLlamaQLoRA  # noqa: E402
@@ -76,6 +78,20 @@ def main():
     ap.add_argument("--lora-r", dest="r", type=int, default=64)
     ap.add_argument("--alpha", type=float, default=64.0)
     ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--weight-decay", type=float, default=0.01,
+                    help="AdamW weight decay on the LoRA params (default 0.01).")
+    ap.add_argument("--scheduler", choices=["none", "linear", "cosine"],
+                    default="none",
+                    help="LR schedule after warmup: none/linear/cosine (to 0).")
+    ap.add_argument("--warmup-ratio", type=float, default=0.0,
+                    help="Fraction of total steps to warm up the LR from 0 "
+                         "(e.g. 0.05-0.1). Ignored if --warmup-steps>0.")
+    ap.add_argument("--warmup-steps", type=int, default=0,
+                    help="Absolute warmup steps; overrides --warmup-ratio when >0.")
+    ap.add_argument("--epochs", type=float, default=0.0,
+                    help="If >0, set --steps to cover this many passes over the "
+                         "FULL training set (one step = batch*world*grad-accum "
+                         "examples), so the schedule matches the epoch count.")
     ap.add_argument("--steps", type=int, default=800)
     ap.add_argument("--batch", type=int, default=16, help="Per-GPU micro-batch")
     ap.add_argument("--grad-accum", type=int, default=1)
@@ -84,6 +100,11 @@ def main():
     ap.add_argument("--instruction-key", default="instruction")
     ap.add_argument("--context-key", default="input")
     ap.add_argument("--response-key", default="output")
+    ap.add_argument("--messages-key", default=None,
+                    help="Column holding OpenAI-style single-turn messages (e.g. "
+                         "'messages' for UnstableLlama/semancy). When set, the user "
+                         "turn is the prompt and the assistant turn the supervised "
+                         "response; the flat instruction/response keys are ignored.")
     ap.add_argument("--no-clean-text", action="store_true")
     ap.add_argument("--min-response-words", type=int, default=3)
     ap.add_argument("--uppercase-response", action="store_true",
@@ -98,10 +119,18 @@ def main():
     ap.add_argument("--ce-chunk", type=int, default=1024)
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
     ap.add_argument("--save-every", type=int, default=0)
+    ap.add_argument("--eval-split", default=None,
+                    help="Use this split of the dataset (e.g. 'test') as the "
+                         "held-out eval set, instead of carving --val-frac off "
+                         "train. Real held-out data; takes precedence over "
+                         "--val-frac. Built identically on every rank.")
+    ap.add_argument("--eval-dataset", default=None,
+                    help="Dataset id/path for --eval-split (defaults to --dataset).")
     ap.add_argument("--val-frac", type=float, default=0.0,
-                    help="Hold out this fraction for held-out eval loss; the SAME "
-                         "deterministic split as the single-GPU / BNB arms. Held "
-                         "out before sharding so it never leaks into training.")
+                    help="Hold out this fraction of train for held-out eval loss; "
+                         "the SAME deterministic split as the single-GPU / BNB "
+                         "arms. Held out before sharding so it never leaks into "
+                         "training. Ignored if --eval-split is set.")
     ap.add_argument("--eval-every", type=int, default=0,
                     help="Report held-out loss every N steps (needs --val-frac>0).")
     ap.add_argument("--save-best", action="store_true",
@@ -159,20 +188,42 @@ def main():
         clean_text=not args.no_clean_text,
         min_response_words=args.min_response_words,
         uppercase_response=args.uppercase_response,
+        messages_key=args.messages_key,
     )
-    # Hold out the val split (first val_frac) on every rank BEFORE sharding, so
-    # those rows are excluded from all training shards and match the other arms.
+    # Held-out eval set, built identically on every rank. Prefer the dataset's own
+    # eval split (real held-out data); otherwise carve the first val_frac off
+    # train BEFORE sharding so those rows never leak into any training shard.
     val_examples = []
-    if args.val_frac > 0:
+    if args.eval_split:
+        val_examples = build_sft_examples(
+            model, tokenizer, args.eval_dataset or args.dataset, 0, args.seq_len,
+            instruction_key=args.instruction_key, context_key=args.context_key,
+            response_key=args.response_key, split=args.eval_split,
+            clean_text=not args.no_clean_text,
+            min_response_words=args.min_response_words,
+            uppercase_response=args.uppercase_response,
+            messages_key=args.messages_key,
+        )
+    elif args.val_frac > 0:
         n_val = max(1, int(len(examples) * args.val_frac))
         val_examples, examples = examples[:n_val], examples[n_val:]
     shard = examples[rank::world_size]
     assert shard, "no training examples on this rank"
+
+    # Finalize step count (from --epochs over the FULL train set) and warmup.
+    eff_batch = args.batch * world_size * args.grad_accum
+    args.steps, warmup_steps = resolve_steps_and_warmup(args, len(examples), eff_batch)
     if is_main(rank):
         print(f" -- {len(examples)} train examples total, ~{len(shard)} per rank; "
-              f"{len(val_examples)} held out for eval")
+              f"{len(val_examples)} held out for eval "
+              f"({'split ' + args.eval_split if args.eval_split else 'val_frac'})")
+        print(f" -- {args.steps} steps, eff_batch {eff_batch}, "
+              f"scheduler={args.scheduler}, warmup={warmup_steps}, "
+              f"weight_decay={args.weight_decay}")
 
-    opt = torch.optim.AdamW(net.lora_parameters(), lr=args.lr)
+    opt = torch.optim.AdamW(net.lora_parameters(), lr=args.lr,
+                            weight_decay=args.weight_decay)
+    sched = make_lr_scheduler(opt, args.scheduler, args.steps, warmup_steps)
 
     def batches():
         order = list(range(len(shard)))
@@ -238,6 +289,7 @@ def main():
                 net.lora_parameters(), args.max_grad_norm or float("inf")
             ).item()
             opt.step()
+            sched.step()
             opt.zero_grad(set_to_none=True)
 
             # Average the loss across ranks just for a representative log line.
@@ -247,7 +299,8 @@ def main():
             ema = global_loss if ema is None else 0.9 * ema + 0.1 * global_loss
             if is_main(rank):
                 print(f"  step {step:>5}/{args.steps} | loss {global_loss:6.4f} | "
-                      f"ema {ema:6.4f} | grad {gnorm:7.4f}")
+                      f"ema {ema:6.4f} | grad {gnorm:7.4f} | "
+                      f"lr {sched.get_last_lr()[0]:.2e}")
 
             if args.eval_every and val_examples and step % args.eval_every == 0:
                 vl = evaluate()
