@@ -105,10 +105,13 @@ def main():
                          "'messages' for UnstableLlama/semancy). When set, the user "
                          "turn is the prompt and the assistant turn the supervised "
                          "response; the flat instruction/response keys are ignored.")
-    ap.add_argument("--prompt-format", choices=["auto", "metharme"], default="auto",
+    ap.add_argument("--prompt-format", choices=["auto", "mistral", "metharme"],
+                    default="auto",
                     help="Chat format. auto: the model's native template "
-                         "(Llama-3, Mistral [INST], ...). metharme: Pygmalion "
-                         "<|user|>{q}<|model|>{a}</s> (EOS ends the turn).")
+                         "(Llama-3, Mistral [INST], mistral3 [SYSTEM_PROMPT]/[INST]). "
+                         "mistral: explicit <s>[INST]{q}[/INST]{a}</s> (= auto for "
+                         "the mistral3 arch, e.g. Mistral-Medium-3.5). metharme: "
+                         "Pygmalion <|user|>{q}<|model|>{a}</s>.")
     ap.add_argument("--no-clean-text", action="store_true")
     ap.add_argument("--min-response-words", type=int, default=3)
     ap.add_argument("--uppercase-response", action="store_true",

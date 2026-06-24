@@ -70,24 +70,35 @@ def format_prompt_and_eot(model, tokenizer, prompt_format):
     """Return ``(build_prompt(user) -> str, eot_str)`` for the chosen chat format.
 
     - ``auto`` (default): the model's own template (``default_chat_prompt`` --
-      Llama-3, Mistral ``[INST]``, etc.) and the architecture-correct turn-end
-      token (:func:`turn_end_token`). Unchanged from prior behavior.
+      Llama-3, Mistral ``[INST]``, mistral3 ``[SYSTEM_PROMPT]``/``[INST]``, etc.)
+      and the architecture-correct turn-end token (:func:`turn_end_token`).
+      Unchanged from prior behavior.
+    - ``mistral``: the explicit Mistral V7+/V13 instruct format
+      ``<s>[INST]{user}[/INST]{response}</s>`` (no spaces; ``[INST]``/``[/INST]``
+      are control tokens). This is what ``auto`` already emits for the ``mistral3``
+      arch (Mistral Small/Medium 3.x, incl. Mistral-Medium-3.5-128B) -- the
+      explicit option just doesn't depend on arch detection. EOS ends the turn.
     - ``metharme``: the Pygmalion/Metharme format
-      ``<|system|>..<|user|>{user}<|model|>{response}</s>`` (system omitted here;
-      none in the data). The ``<|user|>``/``<|model|>`` markers are plain text on
-      a base model (not registered special tokens) -- the model learns them as a
-      literal pattern, which is the standard way these tunes are trained. The
-      turn ends with the model's EOS so generation stops. A literal BOS is
-      prepended so the sequence starts with one; the caller's BOS-normalization
-      then collapses any duplicate the tokenizer auto-adds.
+      ``<s><|user|>{user}<|model|>{response}</s>``. The ``<|user|>``/``<|model|>``
+      markers are plain text on a base model (not registered special tokens) --
+      the model learns them as a literal pattern, which is the standard way these
+      tunes are trained. EOS ends the turn.
+
+    For ``mistral``/``metharme`` a literal BOS is prepended so the sequence starts
+    with one; the caller's BOS-normalization then collapses any duplicate the
+    tokenizer auto-adds.
     """
+    if prompt_format == "mistral":
+        bos = tokenizer.bos_token or ""
+        eos = tokenizer.eos_token or ""
+        return (lambda user: f"{bos}[INST]{user}[/INST]"), eos
     if prompt_format == "metharme":
         bos = tokenizer.bos_token or ""
         eos = tokenizer.eos_token or ""
         return (lambda user: f"{bos}<|user|>{user}<|model|>"), eos
     if prompt_format == "auto":
         return (lambda user: model.default_chat_prompt(user)), turn_end_token(tokenizer)
-    raise ValueError(f"unknown prompt-format '{prompt_format}' (expected auto/metharme)")
+    raise ValueError(f"unknown prompt-format '{prompt_format}' (expected auto/mistral/metharme)")
 
 
 # Stage directions / inline actions, e.g. "[as CAMBIO]", "[TRINCULO grabs ...]",
@@ -366,11 +377,14 @@ def main():
                          "user turn is the prompt and the assistant turn the "
                          "supervised response; --instruction/context/response-key "
                          "are ignored.")
-    ap.add_argument("--prompt-format", choices=["auto", "metharme"], default="auto",
+    ap.add_argument("--prompt-format", choices=["auto", "mistral", "metharme"],
+                    default="auto",
                     help="Chat format. auto: the model's native template "
-                         "(Llama-3, Mistral [INST], ...). metharme: Pygmalion "
-                         "<|user|>{q}<|model|>{a}</s> (markers are plain text on a "
-                         "base model; the model learns them; EOS ends the turn).")
+                         "(Llama-3, Mistral [INST], mistral3 [SYSTEM_PROMPT]/[INST]). "
+                         "mistral: explicit <s>[INST]{q}[/INST]{a}</s> (= auto for "
+                         "the mistral3 arch, e.g. Mistral-Medium-3.5). metharme: "
+                         "Pygmalion <|user|>{q}<|model|>{a}</s>. EOS ends the turn "
+                         "for mistral/metharme.")
     ap.add_argument("--no-clean-text", action="store_true",
                     help="Disable stripping of [stage directions]/*actions* and "
                          "whitespace normalization (on by default; helps play-script "

@@ -495,11 +495,21 @@ capacity-bound on 1B — a 3B/8B base is the bigger lever than more 1B epochs.
 
 ### Prompt formats (`--prompt-format`) + Mistral
 
-`build_sft_examples` got a `--prompt-format {auto,metharme}` knob (single +
+`build_sft_examples` got a `--prompt-format {auto,mistral,metharme}` knob (single +
 DDP; `format_prompt_and_eot()` is the seam):
 - **auto** (default, unchanged): the model's own template via
   `default_chat_prompt` — Llama-3 headers, Mistral `<s>[INST] … [/INST]`, etc.,
   with the architecture-correct turn-end token.
+- **mistral**: explicit `<s>[INST]{q}[/INST]{a}</s>` (no spaces; `[INST]`/`[/INST]`
+  are control tokens). Identical to **auto** for the `mistral3` arch — which is
+  what **Mistral-Medium-3.5-128B** (and Small/Medium 3.x) loads as: its
+  `mistral3.py:243` `default_chat_prompt` already emits
+  `<s>[SYSTEM_PROMPT]{sys}[/SYSTEM_PROMPT][INST]{q}[/INST]` (the current V13
+  control-token format), so **Medium 3.5 needs no new format — auto already
+  covers it**; `mistral` just makes it explicit / arch-independent. (Caveats for
+  actually training it: it's a 128B — needs a multi-GPU EXL3 quant; and `--inspect`
+  doubles as the native-forward feasibility check since it builds the net and
+  `assert_block_supported` would reject an unsupported block.)
 - **metharme**: Pygmalion format `<s><|user|>{q}<|model|>{a}</s>`. On a base
   model the `<|user|>`/`<|model|>` markers are **plain text** (not registered
   special tokens) — the model learns them as a literal pattern, the standard way
