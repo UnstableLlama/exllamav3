@@ -472,6 +472,38 @@ class NativeLlamaQLoRA(nn.Module):
             hidden = hidden * ls
         return hidden
 
+    # --- attention backend selection -------------------------------------
+
+    def _attn_mode_for(self, meta, mem_eff: bool) -> str:
+        """Per-block attention backend: "flash" (FA2, head_dim<=256), "sdpa"
+        (head_dim>256 full-causal no-softcap), else "eager". mem_eff gates the
+        memory-efficient kernels (CUDA + fp16/bf16)."""
+        if not mem_eff:
+            return "eager"
+        hd = meta["head_dim"]
+        if hd <= 256 and hd % 8 == 0:
+            return "flash"
+        # head_dim > 256: FA2 unsupported. SDPA handles big heads + GQA but has no
+        # window/softcap knobs, so only the plain full-causal case goes there.
+        if meta["sliding_window"] <= 0 and not meta["softcap"]:
+            return "sdpa"
+        return "eager"
+
+    def describe_attn(self) -> str:
+        """One-line summary of the attention plan for the loaded model + dtype, so
+        a run can confirm flash/SDPA actually engage (vs a silent eager fallback)."""
+        from collections import Counter
+        dev = self._block_devices[0]
+        is_cuda = getattr(dev, "type", None) == "cuda"
+        mem_eff = (self._flash_ok and is_cuda
+                   and self.compute_dtype in (torch.float16, torch.bfloat16))
+        counts = Counter(self._attn_mode_for(m, mem_eff) for m in self._block_meta)
+        plan = ", ".join(f"{counts[k]}×{k}" for k in ("flash", "sdpa", "eager") if counts[k])
+        avail = "available" if _flash_attn_func() is not None else "NOT importable"
+        why = "" if mem_eff else "  (eager: needs CUDA + fp16/bf16" + \
+            ("" if self._flash_ok else " + flash_attn") + ")"
+        return f"attn: {plan}  [impl={self.attn_impl}, flash_attn {avail}]{why}"
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -522,18 +554,6 @@ class NativeLlamaQLoRA(nn.Module):
         mem_eff = (self._flash_ok and hidden.is_cuda
                    and self.compute_dtype in (torch.float16, torch.bfloat16))
 
-        def block_attn_mode(meta):
-            if not mem_eff:
-                return "eager"
-            hd = meta["head_dim"]
-            if hd <= 256 and hd % 8 == 0:
-                return "flash"
-            # head_dim > 256: FA2 unsupported. SDPA handles big heads + GQA but has
-            # no window/softcap knobs, so only the plain full-causal case goes there.
-            if meta["sliding_window"] <= 0 and not meta["softcap"]:
-                return "sdpa"
-            return "eager"
-
         # Attention bias per (window, device) for eager blocks only. Gemma alternates
         # sliding/full layers, so each distinct window needs its own mask; plain
         # archs have a single window (-1). Cached: built at most once per key.
@@ -556,7 +576,7 @@ class NativeLlamaQLoRA(nn.Module):
                 hidden = backbone.to_device(hidden, dev)
                 position_ids = backbone.to_device(position_ids, dev)
                 cur_device = dev
-            mode = block_attn_mode(meta)
+            mode = self._attn_mode_for(meta, mem_eff)
             attn_bias = get_bias(meta["sliding_window"], dev) if mode == "eager" else None
             if ckpt:
                 hidden = torch.utils.checkpoint.checkpoint(

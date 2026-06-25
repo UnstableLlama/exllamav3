@@ -163,6 +163,9 @@ def main():
                          "PRIMARY eval. Built identically on every rank.")
     ap.add_argument("--eval2-split", default="test",
                     help="Split for --eval2-dataset (default 'test').")
+    ap.add_argument("--eval2-config", default=None,
+                    help="HF dataset config for --eval2-dataset (e.g. "
+                         "'wikitext-2-raw-v1' for the 'wikitext' dataset).")
     ap.add_argument("--eval2-text-key", default=None,
                     help="If set, treat --eval2-dataset as PLAIN TEXT and compute "
                          "an LM loss over packed --seq-len blocks (e.g. 'text' for "
@@ -216,6 +219,7 @@ def main():
         print(f" -- world_size {world_size}, trainable params: "
               f"{net.num_trainable():,} (r={args.r}, alpha={args.alpha}"
               f"{', +modules_to_save (' + str(sum(p.numel() for p in ms)) + ')' if ms else ''})")
+        print(f" -- {net.describe_attn()}")
 
     # 3a. Optionally resume from a checkpoint (e.g. stop a single-GPU run, then
     #     continue on N GPUs). Every rank loads the same file; the broadcast below
@@ -271,7 +275,8 @@ def main():
         if args.eval2_text_key:
             val2_examples = build_lm_examples(
                 tokenizer, args.eval2_dataset, args.eval2_split, args.seq_len,
-                text_key=args.eval2_text_key, max_samples=args.eval2_max_samples)
+                text_key=args.eval2_text_key, max_samples=args.eval2_max_samples,
+                config_name=args.eval2_config)
         else:
             val2_examples = build_sft_examples(
                 model, tokenizer, args.eval2_dataset, args.eval2_max_samples,
@@ -280,7 +285,8 @@ def main():
                 split=args.eval2_split, clean_text=not args.no_clean_text,
                 min_response_words=args.min_response_words,
                 uppercase_response=args.uppercase_response,
-                messages_key=args.messages_key, prompt_format=args.prompt_format)
+                messages_key=args.messages_key, prompt_format=args.prompt_format,
+                config_name=args.eval2_config)
     shard = examples[rank::world_size]
     assert shard, "no training examples on this rank"
 
@@ -351,6 +357,7 @@ def main():
     best_val = float("inf")
     best_val_step = 0
     start_loss = end_loss = None
+    last_eval_step, last_val, last_eval2 = -1, None, None
     tok_seen, tot_seen, t0 = 0, 0, time.time()
     run_started = datetime.datetime.now().isoformat(timespec="seconds")
     status = "completed"
@@ -441,6 +448,7 @@ def main():
                     and (val_examples or val2_examples)):
                 vl = evaluate()
                 v2 = eval_loss(val2_examples)
+                last_eval_step, last_val, last_eval2 = step, vl, v2
                 if is_main(rank):
                     parts = []
                     if vl is not None:
@@ -479,8 +487,15 @@ def main():
     # Held-out loss (all ranks compute identically; rank 0 reports) + global
     # throughput (sum supervised tokens across ranks) + this rank's peak VRAM.
     dt = time.time() - t0
-    val_loss = evaluate()
-    val2_loss = eval_loss(val2_examples)
+    # Reuse the last in-loop eval if it landed on the final step (all ranks share
+    # it, computed in lockstep) instead of a duplicate full pass after the loop.
+    if last_eval_step == step:
+        val_loss, val2_loss = last_val, last_eval2
+    else:
+        if is_main(rank) and (val_examples or val2_examples):
+            print(" -- computing final held-out eval (GPU busy, not hung) ...")
+        val_loss = evaluate()
+        val2_loss = eval_loss(val2_examples)
     tok_t = torch.tensor([float(tok_seen), float(tot_seen)], device=device)
     dist.all_reduce(tok_t, op=dist.ReduceOp.SUM)
     if is_main(rank):

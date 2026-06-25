@@ -255,7 +255,8 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
                        response_key="response", split="train",
                        clean_text=True, min_response_words=3,
                        uppercase_response=False, messages_key=None,
-                       prompt_format="auto", shuffle=False, shuffle_seed=0):
+                       prompt_format="auto", shuffle=False, shuffle_seed=0,
+                       config_name=None):
     """
     Load an instruction dataset and tokenize for completion-only SFT using the
     model's native chat template (Llama-3, Mistral, etc. -- whatever
@@ -297,6 +298,8 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
         builder = {".json": "json", ".jsonl": "json",
                    ".parquet": "parquet", ".csv": "csv"}.get(ext, "json")
         ds = load_dataset(builder, data_files=dataset_name, split=split)
+    elif config_name:
+        ds = load_dataset(dataset_name, config_name, split=split)
     else:
         ds = load_dataset(dataset_name, split=split)
     # Shuffle the full set when asked, or (as before) when capping rows so the
@@ -372,7 +375,7 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
 
 
 def build_lm_examples(tokenizer, dataset_name, split, seq_len,
-                      text_key="text", max_samples=0):
+                      text_key="text", max_samples=0, config_name=None):
     """Plain-text language-modeling eval set (e.g. wikitext) for a second,
     task-independent held-out loss.
 
@@ -395,6 +398,9 @@ def build_lm_examples(tokenizer, dataset_name, split, seq_len,
         builder = {".json": "json", ".jsonl": "json",
                    ".parquet": "parquet", ".csv": "csv"}.get(ext, "json")
         ds = load_dataset(builder, data_files=dataset_name, split=split)
+    elif config_name:
+        # Many text corpora need a config (e.g. wikitext -> "wikitext-2-raw-v1").
+        ds = load_dataset(dataset_name, config_name, split=split)
     else:
         ds = load_dataset(dataset_name, split=split)
     if max_samples and max_samples < len(ds):
@@ -585,6 +591,9 @@ def main():
                          "wikitext). --save-best stays keyed on the PRIMARY eval.")
     ap.add_argument("--eval2-split", default="test",
                     help="Split for --eval2-dataset (default 'test').")
+    ap.add_argument("--eval2-config", default=None,
+                    help="HF dataset config for --eval2-dataset (e.g. "
+                         "'wikitext-2-raw-v1' for the 'wikitext' dataset).")
     ap.add_argument("--eval2-text-key", default=None,
                     help="If set, treat --eval2-dataset as PLAIN TEXT and compute "
                          "a language-modeling loss over packed --seq-len blocks "
@@ -659,6 +668,7 @@ def main():
     print(f" -- trainable params: {net.num_trainable():,} "
           f"(r={args.r}, alpha={args.alpha}, targets={net.target_modules}"
           f"{', modules_to_save=' + str(ms) if ms else ''})")
+    print(f" -- {net.describe_attn()}")
     if args.parallel == "split":
         from collections import Counter
         dist = Counter(str(d) for d in net._block_devices)
@@ -744,7 +754,8 @@ def main():
         if args.eval2_text_key:
             val2_examples = build_lm_examples(
                 tokenizer, args.eval2_dataset, args.eval2_split, args.seq_len,
-                text_key=args.eval2_text_key, max_samples=args.eval2_max_samples)
+                text_key=args.eval2_text_key, max_samples=args.eval2_max_samples,
+                config_name=args.eval2_config)
             kind = f"LM blocks over '{args.eval2_text_key}'"
         else:
             val2_examples = build_sft_examples(
@@ -754,7 +765,8 @@ def main():
                 split=args.eval2_split, clean_text=not args.no_clean_text,
                 min_response_words=args.min_response_words,
                 uppercase_response=args.uppercase_response,
-                messages_key=args.messages_key, prompt_format=args.prompt_format)
+                messages_key=args.messages_key, prompt_format=args.prompt_format,
+                config_name=args.eval2_config)
             kind = "SFT"
         print(f" -- eval2 ({eval2_label}): {len(val2_examples)} {kind} examples "
               f"from split '{args.eval2_split}'")
@@ -832,6 +844,7 @@ def main():
     best_val = float("inf")
     best_val_step = 0
     start_loss = end_loss = None
+    last_eval_step, last_val, last_eval2 = -1, None, None
     tok_seen, tot_seen, t0 = 0, 0, time.time()
     run_started = datetime.datetime.now().isoformat(timespec="seconds")
     meter = ThroughputMeter()
@@ -918,9 +931,11 @@ def main():
 
             if (args.eval_every and step % args.eval_every == 0
                     and (val_examples or val2_examples)):
+                vl = evaluate() if val_examples else None
+                v2 = eval_loss(val2_examples) if val2_examples else None
+                last_eval_step, last_val, last_eval2 = step, vl, v2
                 parts = []
-                if val_examples:
-                    vl = evaluate()
+                if vl is not None:
                     parts.append(f"held-out {vl:.4f}")
                     # Track best val for the run log regardless of --save-best;
                     # only write the checkpoint when --save-best is set.
@@ -929,8 +944,8 @@ def main():
                         best_val_step = step
                         if args.save_best:
                             save(f"[best step {step}, val {vl:.4f}]")
-                if val2_examples:
-                    parts.append(f"{eval2_label} {eval_loss(val2_examples):.4f}")
+                if v2 is not None:
+                    parts.append(f"{eval2_label} {v2:.4f}")
                 print(f"    [eval] step {step}: " + " | ".join(parts))
 
             if args.sample_every and step % args.sample_every == 0:
@@ -962,14 +977,23 @@ def main():
     #    With --save-best we already kept the best-val checkpoint; don't clobber
     #    it with the (likely overfit) final-step weights.
     dt = time.time() - t0
+    # Final held-out numbers. Reuse the last in-loop eval when it already ran on
+    # the final step (avoids a duplicate full pass that looks like a hang after
+    # "Done."); otherwise compute once, announcing it so the GPU churn is expected.
+    if last_eval_step == step:
+        val_loss, final_eval2 = last_val, last_eval2
+    elif val_examples or val2_examples:
+        print(" -- computing final held-out eval (GPU busy, not hung) ...")
+        val_loss = evaluate()
+        final_eval2 = eval_loss(val2_examples) if val2_examples else None
+    else:
+        val_loss, final_eval2 = None, None
     if not (args.save_best and val_examples):
         save("Done.")
-    val_loss = evaluate()
     if val_loss is not None:
         tag = f" (best kept: {best_val:.4f})" if args.save_best else ""
         print(f"\n[EVAL] held-out loss (EXL3 arm): {val_loss:.4f}{tag} "
               f"over {len(val_examples)} examples")
-    final_eval2 = eval_loss(val2_examples) if val2_examples else None
     if final_eval2 is not None:
         print(f"[EVAL] eval2 ({eval2_label}) loss: {final_eval2:.4f} "
               f"over {len(val2_examples)} examples")
