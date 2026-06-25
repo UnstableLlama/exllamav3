@@ -463,6 +463,13 @@ class NativeLlamaQLoRA(nn.Module):
             hidden = hidden + self._norm(mlp_out, entry.mlp_post_spec)
         else:
             hidden = hidden + mlp_out
+
+        # Gemma's learned per-layer scalar on the whole residual stream (block end).
+        # None for plain archs -> no-op. Compounds over layers, so omitting it on
+        # Gemma produces garbage even though each block is individually close.
+        ls = meta.get("layer_scalar")
+        if ls is not None:
+            hidden = hidden * ls
         return hidden
 
     def forward(
