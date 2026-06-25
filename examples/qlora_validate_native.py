@@ -41,7 +41,7 @@ DEFAULT_PROMPTS = [
 ]
 
 
-def check_backward(model, tokenizer, prompt, device, cdt):
+def check_backward(model, tokenizer, prompt, device, cdt, attn_impl="auto"):
     """
     Smoke-test cross-device gradient flow: attach a tiny adapter, run one
     loss.backward() with gradient checkpointing, and assert that gradients
@@ -53,7 +53,8 @@ def check_backward(model, tokenizer, prompt, device, cdt):
     print("backward smoke: cross-device gradient flow through the split")
     net = NativeLlamaQLoRA(model, r=4, alpha=8.0,
                            target_modules=["q_proj", "down_proj"],
-                           compute_dtype=cdt, gradient_checkpointing=True)
+                           compute_dtype=cdt, gradient_checkpointing=True,
+                           attn_impl=attn_impl)
     net.train()
     ids = tokenizer.encode(prompt, add_bos=True).to(device)
     loss = net.compute_loss(ids, ids.clone())
@@ -96,6 +97,10 @@ def main():
     ap.add_argument("--compute-dtype", default="float32",
                     choices=["float32", "float16", "bfloat16"],
                     help="dtype for the differentiable linears (float32 = closest to true math)")
+    ap.add_argument("--attn-impl", choices=["auto", "eager", "flash"], default="auto",
+                    help="auto/eager/flash. NOTE flash needs CUDA fp16/bf16, so the "
+                         "default float32 validate runs eager regardless; pass "
+                         "--compute-dtype bfloat16 to exercise/validate the flash path.")
     ap.add_argument("--prompts", nargs="*", default=None)
     ap.add_argument("--check-backward", action="store_true",
                     help="also smoke-test cross-device gradient flow (tiny adapter + backward)")
@@ -122,7 +127,7 @@ def main():
 
     # No adapters: a pure frozen forward, directly comparable to native inference.
     net = NativeLlamaQLoRA(model, target_modules=[], compute_dtype=cdt,
-                           gradient_checkpointing=False)
+                           gradient_checkpointing=False, attn_impl=args.attn_impl)
     net.eval()
 
     dist = Counter(str(d) for d in net._block_devices)
@@ -174,7 +179,8 @@ def main():
         print(f"  last-token logits: max|Δ|={max_abs:.4f}  cos={cos:.6f}")
 
     if args.check_backward:
-        all_ok &= check_backward(model, tokenizer, prompts[0], args.device, cdt)
+        all_ok &= check_backward(model, tokenizer, prompts[0], args.device, cdt,
+                                 attn_impl=args.attn_impl)
 
     print("\n" + "=" * 78)
     print("RESULT:", "PASS -- differentiable forward matches native"
