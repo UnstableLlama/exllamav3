@@ -651,8 +651,19 @@ support for all of these):**
 - **Qwen3 (3.0) dense** = standard transformer + **q/k-norm** only (falls out for
   free from the generalization).
 
-**What was changed (all write-confirmed; compiles + CPU logic checks pass; NOT yet
-run on the GPU box):**
+**RUN-CONFIRMED on the box (gemma-4-12B-it 4bpw, 1×GPU, fp32 eager):**
+`qlora_validate_native.py` **PASSED** — 100% per-position argmax agreement vs
+exllamav3's own forward on every prompt, last-token `cos ≈ 0.999998`,
+`max|Δ| ≈ 0.08` (just fp32-vs-native-fp16 rounding), `--check-backward` PASS.
+The decisive bug was the missing **per-layer `layer_scalar`** (below): without it
+the forward was per-block-correct but compounded to garbage over 48 layers (0%
+argmax, cos~0). The `sm_scale=1.0` question is settled — correct as-is (Gemma's
+query scaling is folded into the weights; the near-perfect cosine confirms it).
+Still to run: the bf16 flash/SDPA path (`--compute-dtype bfloat16`) and a real
+training run.
+
+**What was changed (compiles + CPU logic checks pass; forward now GPU-validated on
+gemma-4-12B as above):**
 - `training/backbone.py`: `assert_block_supported` relaxed to allow q/k/v-norm,
   GeGLU, sliding window, sandwich post-norms and softcap, while still rejecting
   GatedDeltaNet (linear attn), MoE, attention output gating, mRoPE, partial
