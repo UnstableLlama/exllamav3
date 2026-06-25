@@ -844,6 +844,7 @@ def main():
     best_val = float("inf")
     best_val_step = 0
     start_loss = end_loss = None
+    last_eval_step, last_val, last_eval2 = -1, None, None
     tok_seen, tot_seen, t0 = 0, 0, time.time()
     run_started = datetime.datetime.now().isoformat(timespec="seconds")
     meter = ThroughputMeter()
@@ -930,9 +931,11 @@ def main():
 
             if (args.eval_every and step % args.eval_every == 0
                     and (val_examples or val2_examples)):
+                vl = evaluate() if val_examples else None
+                v2 = eval_loss(val2_examples) if val2_examples else None
+                last_eval_step, last_val, last_eval2 = step, vl, v2
                 parts = []
-                if val_examples:
-                    vl = evaluate()
+                if vl is not None:
                     parts.append(f"held-out {vl:.4f}")
                     # Track best val for the run log regardless of --save-best;
                     # only write the checkpoint when --save-best is set.
@@ -941,8 +944,8 @@ def main():
                         best_val_step = step
                         if args.save_best:
                             save(f"[best step {step}, val {vl:.4f}]")
-                if val2_examples:
-                    parts.append(f"{eval2_label} {eval_loss(val2_examples):.4f}")
+                if v2 is not None:
+                    parts.append(f"{eval2_label} {v2:.4f}")
                 print(f"    [eval] step {step}: " + " | ".join(parts))
 
             if args.sample_every and step % args.sample_every == 0:
@@ -974,14 +977,23 @@ def main():
     #    With --save-best we already kept the best-val checkpoint; don't clobber
     #    it with the (likely overfit) final-step weights.
     dt = time.time() - t0
+    # Final held-out numbers. Reuse the last in-loop eval when it already ran on
+    # the final step (avoids a duplicate full pass that looks like a hang after
+    # "Done."); otherwise compute once, announcing it so the GPU churn is expected.
+    if last_eval_step == step:
+        val_loss, final_eval2 = last_val, last_eval2
+    elif val_examples or val2_examples:
+        print(" -- computing final held-out eval (GPU busy, not hung) ...")
+        val_loss = evaluate()
+        final_eval2 = eval_loss(val2_examples) if val2_examples else None
+    else:
+        val_loss, final_eval2 = None, None
     if not (args.save_best and val_examples):
         save("Done.")
-    val_loss = evaluate()
     if val_loss is not None:
         tag = f" (best kept: {best_val:.4f})" if args.save_best else ""
         print(f"\n[EVAL] held-out loss (EXL3 arm): {val_loss:.4f}{tag} "
               f"over {len(val_examples)} examples")
-    final_eval2 = eval_loss(val2_examples) if val2_examples else None
     if final_eval2 is not None:
         print(f"[EVAL] eval2 ({eval2_label}) loss: {final_eval2:.4f} "
               f"over {len(val2_examples)} examples")

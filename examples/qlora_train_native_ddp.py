@@ -357,6 +357,7 @@ def main():
     best_val = float("inf")
     best_val_step = 0
     start_loss = end_loss = None
+    last_eval_step, last_val, last_eval2 = -1, None, None
     tok_seen, tot_seen, t0 = 0, 0, time.time()
     run_started = datetime.datetime.now().isoformat(timespec="seconds")
     status = "completed"
@@ -447,6 +448,7 @@ def main():
                     and (val_examples or val2_examples)):
                 vl = evaluate()
                 v2 = eval_loss(val2_examples)
+                last_eval_step, last_val, last_eval2 = step, vl, v2
                 if is_main(rank):
                     parts = []
                     if vl is not None:
@@ -485,8 +487,15 @@ def main():
     # Held-out loss (all ranks compute identically; rank 0 reports) + global
     # throughput (sum supervised tokens across ranks) + this rank's peak VRAM.
     dt = time.time() - t0
-    val_loss = evaluate()
-    val2_loss = eval_loss(val2_examples)
+    # Reuse the last in-loop eval if it landed on the final step (all ranks share
+    # it, computed in lockstep) instead of a duplicate full pass after the loop.
+    if last_eval_step == step:
+        val_loss, val2_loss = last_val, last_eval2
+    else:
+        if is_main(rank) and (val_examples or val2_examples):
+            print(" -- computing final held-out eval (GPU busy, not hung) ...")
+        val_loss = evaluate()
+        val2_loss = eval_loss(val2_examples)
     tok_t = torch.tensor([float(tok_seen), float(tot_seen)], device=device)
     dist.all_reduce(tok_t, op=dist.ReduceOp.SUM)
     if is_main(rank):
