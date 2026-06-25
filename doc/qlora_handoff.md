@@ -902,6 +902,21 @@ reliance on a single best/endpoint adapter.
 scripts parse). Not yet exercised on the GPU box — smoke it with a small
 `--checkpoint-every` + `--keep-checkpoints` on the next run.
 
+**Big-run kickoff: `examples/train_gemma4_semancy.sh`** (NEW) — the gemma-4-31B-it
+QLoRA on semancy, **layer-split across 2×24GB** (`--parallel split`, single
+process — NOT ddp, which would replicate the ~17 GB base per card). Bakes in the
+Gemma4 specifics (`--sample-every 0`, `--no-clean-text`, `--messages-key`,
+`--eval-split test`, auto prompt/attn), the established r16/α32 lr1e-4 cosine
+profile, the wikitext dual-eval, and `--checkpoint-every`. Runs the
+forward-correctness gate **under the same split** first (`--check-backward`) —
+this is the first 31B Gemma4 on the device-aware split forward, so parity must be
+proven before the run. The **greedy-autosplit footgun** is the thing to watch:
+the 17 GB base fits one card, so without a per-device cap the whole model lands on
+cuda:0 and cuda:1 idles — `USE_PER_DEVICE="8 24"` caps cuda:0 near half the base
+to force the split; watch the per-card VRAM line and tune (the 262k-vocab head is
+end-heavy on cuda:1). **Not yet run** — the gate result + the held-out `test`
+floor (vs 1B ~3.09 / 12B 2.51) are the first things to record next session.
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)
