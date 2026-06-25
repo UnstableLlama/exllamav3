@@ -47,6 +47,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qlora_train_native import (  # noqa: E402
     build_sft_examples, build_lm_examples, collate, make_lr_scheduler,
     resolve_steps_and_warmup, ThroughputMeter, append_run_log,
+    checkpoint_dir, prune_checkpoints,
 )
 
 from exllamav3 import Config, Model, Tokenizer  # noqa: E402
@@ -148,7 +149,16 @@ def main():
                          "(reference, O(t^2) memory). Flash is O(t) -- long context.")
     ap.add_argument("--ce-chunk", type=int, default=1024)
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
-    ap.add_argument("--save-every", type=int, default=0)
+    ap.add_argument("--save-every", type=int, default=0,
+                    help="Overwrite the adapter at --out every N steps (rank 0). "
+                         "Single latest copy; use --checkpoint-every for history.")
+    ap.add_argument("--checkpoint-every", type=int, default=0,
+                    help="Every N steps, save a RETAINED checkpoint (rank 0) to "
+                         "--out/checkpoint-<step>, building a history. Independent "
+                         "of --save-every and --save-best. 0 disables.")
+    ap.add_argument("--keep-checkpoints", type=int, default=0,
+                    help="Cap --checkpoint-every dirs to keep, deleting the oldest "
+                         "(0 = keep all).")
     ap.add_argument("--eval-split", default=None,
                     help="Use this split of the dataset (e.g. 'test') as the "
                          "held-out eval set, instead of carving --val-frac off "
@@ -522,6 +532,17 @@ def main():
 
             if args.save_every and step % args.save_every == 0:
                 save(f"[checkpoint step {step}]")
+
+            if args.checkpoint_every and step % args.checkpoint_every == 0:
+                # Retained per-step checkpoint. Single writer (every rank holds
+                # identical adapters after the all-reduce), barrier so no rank
+                # races ahead of the write/prune.
+                if is_main(rank):
+                    cdir = checkpoint_dir(args.out, step)
+                    net.save_adapter(cdir, base_model_name_or_path=args.model)
+                    print(f"  [checkpoint] step {step} -> {cdir}")
+                    prune_checkpoints(args.out, args.keep_checkpoints)
+                dist.barrier()
     except KeyboardInterrupt:
         status = "interrupted"
         # Don't clobber the best-val checkpoint with the current (later, likely

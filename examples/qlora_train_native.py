@@ -44,6 +44,7 @@ import math
 import os
 import random
 import re
+import shutil
 import time
 from collections import deque
 import torch
@@ -121,6 +122,39 @@ def append_run_log(path, record):
             w.writeheader()
         w.writerow({k: record.get(k, "") for k in RUN_LOG_FIELDS})
     print(f"[run-log] appended 1 row to {path}")
+
+
+def checkpoint_dir(out, step):
+    """Path of the retained per-step checkpoint under ``out``. Zero-padded so the
+    lexicographic order matches the numeric order (handy for ``ls`` and for the
+    prune-by-age logic below). Distinct from ``out`` itself (which --save-every /
+    --save-best overwrite); these accumulate a history you can roll back to."""
+    return os.path.join(out, f"checkpoint-{step:08d}")
+
+
+def list_checkpoints(out):
+    """Existing ``checkpoint-<step>`` dirs under ``out``, oldest-step first."""
+    if not os.path.isdir(out):
+        return []
+    found = []
+    for name in os.listdir(out):
+        if name.startswith("checkpoint-") and os.path.isdir(os.path.join(out, name)):
+            tail = name[len("checkpoint-"):]
+            if tail.isdigit():
+                found.append((int(tail), os.path.join(out, name)))
+    return [p for _, p in sorted(found)]
+
+
+def prune_checkpoints(out, keep):
+    """Keep only the ``keep`` most-recent checkpoint dirs under ``out`` (delete the
+    oldest). ``keep <= 0`` means keep everything. Adapters are small, but
+    --train-embeddings/--train-head make a checkpoint large, so capping matters."""
+    if keep is None or keep <= 0:
+        return
+    existing = list_checkpoints(out)
+    for path in existing[:max(0, len(existing) - keep)]:
+        shutil.rmtree(path, ignore_errors=True)
+        print(f"  [checkpoint] pruned old {path}")
 
 
 def turn_end_token(tokenizer):
@@ -599,8 +633,21 @@ def main():
                     help="Generate a sample completion every N steps (0 to disable)")
     ap.add_argument("--sample-prompt", default="Tell me about your day.")
     ap.add_argument("--save-every", type=int, default=0,
-                    help="Checkpoint the adapter to --out every N steps (0 = only "
-                         "at the end). The adapter is also saved on Ctrl-C.")
+                    help="Overwrite the adapter at --out every N steps (0 = only "
+                         "at the end). The adapter is also saved on Ctrl-C. This "
+                         "keeps a single latest copy; use --checkpoint-every for a "
+                         "retained history.")
+    ap.add_argument("--checkpoint-every", type=int, default=0,
+                    help="Every N steps, save a RETAINED checkpoint to "
+                         "--out/checkpoint-<step> (kept; not overwritten), so you "
+                         "build a history to roll back to or pick from. Independent "
+                         "of --save-every (latest at --out) and --save-best (best at "
+                         "--out). 0 disables.")
+    ap.add_argument("--keep-checkpoints", type=int, default=0,
+                    help="Cap the number of --checkpoint-every dirs to keep, "
+                         "deleting the oldest (0 = keep all). Useful with "
+                         "--train-embeddings/--train-head, where each checkpoint is "
+                         "large.")
     ap.add_argument("--resume", default=None,
                     help="Adapter dir to resume from (continues training those "
                          "weights; optimizer state is NOT restored). --r/--targets "
@@ -1044,6 +1091,12 @@ def main():
 
             if args.save_every and step % args.save_every == 0:
                 save(f"[checkpoint step {step}]")
+
+            if args.checkpoint_every and step % args.checkpoint_every == 0:
+                cdir = checkpoint_dir(args.out, step)
+                net.save_adapter(cdir, base_model_name_or_path=args.model)
+                print(f"  [checkpoint] step {step} -> {cdir}")
+                prune_checkpoints(args.out, args.keep_checkpoints)
     except KeyboardInterrupt:
         # Stopping early at the loss plateau is a normal workflow; don't discard
         # the adapter trained so far -- unless --save-best already kept the
