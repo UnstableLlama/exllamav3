@@ -178,7 +178,7 @@ def resolve_steps_and_warmup(args, num_train_examples, effective_batch):
 
 
 def build_sft_examples(tok, args, split=None, dataset=None, max_samples=None,
-                       shuffle=False):
+                       shuffle=False, config_name=None):
     """Mirror of qlora_train_native.build_sft_examples using the HF tokenizer.
     The underlying Llama-3 tokenizer is the same, so token IDs match the EXL3
     arm for identical text; add_special_tokens=False (the chat string already
@@ -196,6 +196,8 @@ def build_sft_examples(tok, args, split=None, dataset=None, max_samples=None,
         builder = {".json": "json", ".jsonl": "json",
                    ".parquet": "parquet", ".csv": "csv"}.get(ext, "json")
         ds = load_dataset(builder, data_files=name, split=split)
+    elif config_name:
+        ds = load_dataset(name, config_name, split=split)
     else:
         ds = load_dataset(name, split=split)
     # Match qlora_train_native: shuffle the full set when asked (or, as before,
@@ -238,7 +240,7 @@ def build_sft_examples(tok, args, split=None, dataset=None, max_samples=None,
 
 
 def build_lm_examples(tok, dataset_name, split, seq_len, text_key="text",
-                      max_samples=0):
+                      max_samples=0, config_name=None):
     """Plain-text LM eval set (e.g. wikitext), mirror of
     qlora_train_native.build_lm_examples using the HF tokenizer. Packs the text
     column into non-overlapping seq_len blocks, every token supervised. Same
@@ -250,6 +252,8 @@ def build_lm_examples(tok, dataset_name, split, seq_len, text_key="text",
         builder = {".json": "json", ".jsonl": "json",
                    ".parquet": "parquet", ".csv": "csv"}.get(ext, "json")
         ds = load_dataset(builder, data_files=dataset_name, split=split)
+    elif config_name:
+        ds = load_dataset(dataset_name, config_name, split=split)
     else:
         ds = load_dataset(dataset_name, split=split)
     if max_samples and max_samples < len(ds):
@@ -351,6 +355,9 @@ def main():
                          "PRIMARY eval. Matches the EXL3 arm's --eval2-*.")
     ap.add_argument("--eval2-split", default="test",
                     help="Split for --eval2-dataset (default 'test').")
+    ap.add_argument("--eval2-config", default=None,
+                    help="HF dataset config for --eval2-dataset (e.g. "
+                         "'wikitext-2-raw-v1' for 'wikitext').")
     ap.add_argument("--eval2-text-key", default=None,
                     help="If set, treat --eval2-dataset as PLAIN TEXT and compute "
                          "an LM loss over packed --seq-len blocks (e.g. 'text' for "
@@ -455,11 +462,12 @@ def main():
         if args.eval2_text_key:
             val2_examples = build_lm_examples(
                 tok, args.eval2_dataset, args.eval2_split, args.seq_len,
-                text_key=args.eval2_text_key, max_samples=args.eval2_max_samples)
+                text_key=args.eval2_text_key, max_samples=args.eval2_max_samples,
+                config_name=args.eval2_config)
         else:
             val2_examples = build_sft_examples(
                 tok, args, split=args.eval2_split, dataset=args.eval2_dataset,
-                max_samples=args.eval2_max_samples)
+                max_samples=args.eval2_max_samples, config_name=args.eval2_config)
     shard = examples[rank::world_size] if ddp else examples
 
     # Finalize step count (from --epochs over the FULL train set) and warmup.

@@ -163,6 +163,9 @@ def main():
                          "PRIMARY eval. Built identically on every rank.")
     ap.add_argument("--eval2-split", default="test",
                     help="Split for --eval2-dataset (default 'test').")
+    ap.add_argument("--eval2-config", default=None,
+                    help="HF dataset config for --eval2-dataset (e.g. "
+                         "'wikitext-2-raw-v1' for the 'wikitext' dataset).")
     ap.add_argument("--eval2-text-key", default=None,
                     help="If set, treat --eval2-dataset as PLAIN TEXT and compute "
                          "an LM loss over packed --seq-len blocks (e.g. 'text' for "
@@ -272,7 +275,8 @@ def main():
         if args.eval2_text_key:
             val2_examples = build_lm_examples(
                 tokenizer, args.eval2_dataset, args.eval2_split, args.seq_len,
-                text_key=args.eval2_text_key, max_samples=args.eval2_max_samples)
+                text_key=args.eval2_text_key, max_samples=args.eval2_max_samples,
+                config_name=args.eval2_config)
         else:
             val2_examples = build_sft_examples(
                 model, tokenizer, args.eval2_dataset, args.eval2_max_samples,
@@ -281,7 +285,8 @@ def main():
                 split=args.eval2_split, clean_text=not args.no_clean_text,
                 min_response_words=args.min_response_words,
                 uppercase_response=args.uppercase_response,
-                messages_key=args.messages_key, prompt_format=args.prompt_format)
+                messages_key=args.messages_key, prompt_format=args.prompt_format,
+                config_name=args.eval2_config)
     shard = examples[rank::world_size]
     assert shard, "no training examples on this rank"
 
