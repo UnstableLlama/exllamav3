@@ -862,6 +862,46 @@ reconstruction ×3 under checkpointing + SDPA on the big-head global layers). Th
    SDPA-big-head cost; a fused/ cached reconstruction or training-time flash for
    head_dim>256 (when a kernel supports it) are the levers.
 
+### Session 7 — retained checkpoint history (`--checkpoint-every`) + the three save modes clarified
+
+> Goal: keep a rollback-able history of the LoRA across a run, not just one
+> latest/best/endpoint copy. Also pinned down the "is it still saving the lowest
+> held-out val?" question.
+
+**The three save modes are now distinct (single-GPU + DDP):**
+| Flag | Where it writes | Behavior |
+|---|---|---|
+| `--save-every N` | `--out` (overwritten) | One **latest** copy, refreshed every N steps. |
+| `--save-best` | `--out` (overwritten) | One **best-val** copy; only rewritten when the **PRIMARY** held-out eval improves (`val_examples` from `--eval-split`/`--val-frac`; eval2/wikitext does NOT drive it). |
+| **`--checkpoint-every N`** (NEW) | `--out/checkpoint-<step>` (retained) | A **history** — each is kept, never overwritten. Roll back / pick from any. |
+
+- **`--checkpoint-every N`** saves the adapter to `--out/checkpoint-<step>`
+  (zero-padded 8-wide so `ls` sorts numerically) every N steps, independent of the
+  other two modes. **`--keep-checkpoints K`** caps retention (delete oldest;
+  `0` = keep all) — matters under `--train-embeddings/--train-head` where each
+  checkpoint carries the big embed/head matrices, not just the few-MB LoRA.
+- Resume from any of them: `--resume --out/checkpoint-<step>` already works (a
+  checkpoint dir is just a normal adapter dir; optimizer state still not restored).
+- Shared helpers `checkpoint_dir()`/`list_checkpoints()`/`prune_checkpoints()` live
+  in `qlora_train_native.py`; the DDP script imports them and writes from rank 0
+  only with a `dist.barrier()` (same single-writer pattern as `save()`). Not yet
+  mirrored into the BNB arm (separate venv; add if a matched run needs it).
+
+**Re "was it still only saving the lowest held-out val?" — diagnosis (no
+regression):** saving the lowest val is **opt-in via `--save-best`**, not the
+default; without it a run saves the **endpoint** ("Done."). With `--save-best`
+the logic is intact (`qlora_train_native_ddp.py` best-tracking branch), but the
+`[best step N, val …]` line only prints when the val *improves*, so once the
+held-out curve plateaus/rises (the Gemma4 run flattened ~step 30) it stops
+printing those lines even though the earlier best checkpoint is correctly kept.
+So a DDP run "not indicating it anymore" = either `--save-best` wasn't passed, or
+it was and the eval had already plateaued. `--checkpoint-every` sidesteps the
+reliance on a single best/endpoint adapter.
+
+**Status: write-confirmed** (helpers unit-tested for ordering + prune; both
+scripts parse). Not yet exercised on the GPU box — smoke it with a small
+`--checkpoint-every` + `--keep-checkpoints` on the next run.
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)
