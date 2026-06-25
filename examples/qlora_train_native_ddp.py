@@ -116,7 +116,11 @@ def main():
                          "mistral: explicit <s>[INST]{q}[/INST]{a}</s> (= auto for "
                          "the mistral3 arch, e.g. Mistral-Medium-3.5). metharme: "
                          "Pygmalion <|user|>{q}<|model|>{a}</s>.")
-    ap.add_argument("--no-clean-text", action="store_true")
+    ap.add_argument("--clean-text", action="store_true",
+                    help="Strip [stage directions]/*actions* + normalize whitespace "
+                         "(OFF by default; leave off for reasoning/code/markdown).")
+    ap.add_argument("--no-clean-text", action="store_true",
+                    help=argparse.SUPPRESS)  # deprecated: cleaning is now opt-in
     ap.add_argument("--min-response-words", type=int, default=3)
     ap.add_argument("--uppercase-response", action="store_true",
                     help="Smoke test: train to RESPOND IN ALL CAPS (dense, "
@@ -183,6 +187,9 @@ def main():
                          "wikitext). If unset, built as a second SFT eval.")
     ap.add_argument("--eval2-max-samples", type=int, default=0,
                     help="Cap source rows for --eval2-dataset (0 = all).")
+    ap.add_argument("--eval2-max-blocks", type=int, default=0,
+                    help="Cap packed LM blocks for --eval2-text-key (0 = all); size "
+                         "eval2 to roughly match the primary eval set.")
     ap.add_argument("--val-frac", type=float, default=0.0,
                     help="Hold out this fraction of train for held-out eval loss; "
                          "the SAME deterministic split as the single-GPU / BNB "
@@ -210,8 +217,15 @@ def main():
                          "Same schema as the single-GPU arm. Empty string disables.")
     args = ap.parse_args()
 
+    # Cleaning is opt-in (--clean-text); --no-clean-text is now a no-op kept for
+    # backward compatibility (warned once, on rank 0, below after setup).
+    clean_text = args.clean_text
+
     rank, local_rank, world_size = ddp_setup()
     device = f"cuda:{local_rank}"
+    if args.no_clean_text and is_main(rank):
+        print(" -- note: --no-clean-text is deprecated; cleaning is now OFF by "
+              "default (use --clean-text to enable).")
     cdt = {"float32": torch.float32, "float16": torch.float16,
            "bfloat16": torch.bfloat16}[args.compute_dtype]
 
@@ -258,7 +272,7 @@ def main():
         model, tokenizer, args.dataset, args.max_samples, args.seq_len,
         instruction_key=args.instruction_key, context_key=args.context_key,
         response_key=args.response_key, split=args.dataset_split,
-        clean_text=not args.no_clean_text,
+        clean_text=clean_text,
         min_response_words=args.min_response_words,
         uppercase_response=args.uppercase_response,
         messages_key=args.messages_key,
@@ -274,7 +288,7 @@ def main():
             model, tokenizer, args.eval_dataset or args.dataset, 0, args.seq_len,
             instruction_key=args.instruction_key, context_key=args.context_key,
             response_key=args.response_key, split=args.eval_split,
-            clean_text=not args.no_clean_text,
+            clean_text=clean_text,
             min_response_words=args.min_response_words,
             uppercase_response=args.uppercase_response,
             messages_key=args.messages_key,
@@ -294,13 +308,14 @@ def main():
             val2_examples = build_lm_examples(
                 tokenizer, args.eval2_dataset, args.eval2_split, args.seq_len,
                 text_key=args.eval2_text_key, max_samples=args.eval2_max_samples,
+                max_blocks=args.eval2_max_blocks,
                 config_name=args.eval2_config)
         else:
             val2_examples = build_sft_examples(
                 model, tokenizer, args.eval2_dataset, args.eval2_max_samples,
                 args.seq_len, instruction_key=args.instruction_key,
                 context_key=args.context_key, response_key=args.response_key,
-                split=args.eval2_split, clean_text=not args.no_clean_text,
+                split=args.eval2_split, clean_text=clean_text,
                 min_response_words=args.min_response_words,
                 uppercase_response=args.uppercase_response,
                 messages_key=args.messages_key, prompt_format=args.prompt_format,

@@ -906,6 +906,23 @@ all-reduce). `torch.load(weights_only=False)` since it's our own trusted file.
 box: run a few steps with `--checkpoint-every`, Ctrl-C, then `--resume
 <out>` and confirm the printed `continuing at step N` + LR match where it stopped.
 
+**Two ergonomics fixes (during the live gemma-4-31B run):**
+- **`--eval2-max-blocks N`** — caps the number of packed eval2 LM blocks directly
+  (wikitext packed into 285 blocks at seq-len 1024, swamping the 116-example
+  primary `test` set). `--eval2-max-samples` only caps *source rows*, which is
+  unpredictable after packing; `--eval2-max-blocks 116` sizes eval2 to ~match the
+  primary set. Added to `build_lm_examples` (shared, so DDP gets it via import) +
+  both trainers' CLI. (BNB arm inlines `build_lm_examples` — mirror there if a
+  matched run needs it.)
+- **Text cleaning is now opt-in (`--clean-text`), was opt-out (`--no-clean-text`).**
+  The default is now **no cleaning** — right for the reasoning/code/markdown data
+  these runs mostly use (brackets and paragraph structure are content). Pass
+  `--clean-text` to strip `[stage directions]`/`*actions*` + normalize whitespace
+  for play-script style sets. `--no-clean-text` is kept as a **deprecated no-op**
+  (warns once) so existing commands don't break — drop it from new commands. Both
+  trainers; the BNB arm still has the old `--no-clean-text`-on-by-default (flip it
+  there too for a matched run).
+
 **Re "was it still only saving the lowest held-out val?" — diagnosis (no
 regression):** saving the lowest val is **opt-in via `--save-best`**, not the
 default; without it a run saves the **endpoint** ("Done."). With `--save-best`
