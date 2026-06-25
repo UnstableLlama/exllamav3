@@ -216,6 +216,7 @@ def main():
         print(f" -- world_size {world_size}, trainable params: "
               f"{net.num_trainable():,} (r={args.r}, alpha={args.alpha}"
               f"{', +modules_to_save (' + str(sum(p.numel() for p in ms)) + ')' if ms else ''})")
+        print(f" -- {net.describe_attn()}")
 
     # 3a. Optionally resume from a checkpoint (e.g. stop a single-GPU run, then
     #     continue on N GPUs). Every rank loads the same file; the broadcast below

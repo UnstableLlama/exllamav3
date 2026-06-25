@@ -659,6 +659,7 @@ def main():
     print(f" -- trainable params: {net.num_trainable():,} "
           f"(r={args.r}, alpha={args.alpha}, targets={net.target_modules}"
           f"{', modules_to_save=' + str(ms) if ms else ''})")
+    print(f" -- {net.describe_attn()}")
     if args.parallel == "split":
         from collections import Counter
         dist = Counter(str(d) for d in net._block_devices)

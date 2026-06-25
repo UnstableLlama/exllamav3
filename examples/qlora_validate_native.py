@@ -129,6 +129,7 @@ def main():
     net = NativeLlamaQLoRA(model, target_modules=[], compute_dtype=cdt,
                            gradient_checkpointing=False, attn_impl=args.attn_impl)
     net.eval()
+    print(f" -- {net.describe_attn()}")
 
     dist = Counter(str(d) for d in net._block_devices)
     print(f" -- decoder block devices: {dict(dist)}  (final norm + head on {net.device})")
