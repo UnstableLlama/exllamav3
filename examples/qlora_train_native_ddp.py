@@ -48,6 +48,7 @@ from qlora_train_native import (  # noqa: E402
     build_sft_examples, build_lm_examples, collate, make_lr_scheduler,
     resolve_steps_and_warmup, ThroughputMeter, append_run_log,
     checkpoint_dir, prune_checkpoints,
+    save_trainer_state, load_trainer_state, restore_optimizer_state,
 )
 
 from exllamav3 import Config, Model, Tokenizer  # noqa: E402
@@ -195,8 +196,15 @@ def main():
                          "instead of an overfit endpoint.")
     ap.add_argument("--resume", default=None,
                     help="Adapter dir to resume from (e.g. a single-GPU checkpoint). "
-                         "Loaded on every rank before the broadcast. --r/--targets "
-                         "must match the checkpoint; optimizer state is not restored.")
+                         "Loaded on every rank before the broadcast. If the dir has "
+                         "a trainer_state.pt (from --checkpoint-every / --save-*), "
+                         "the optimizer, LR schedule and step are ALSO restored on "
+                         "every rank so the run continues seamlessly (DDP ranks "
+                         "hold identical synced state). --r/--targets must match.")
+    ap.add_argument("--reset-optimizer", action="store_true",
+                    help="With --resume, restore weights only and start the "
+                         "optimizer/schedule/step fresh (use when changing "
+                         "LR/schedule or the GPU count).")
     ap.add_argument("--run-log", default="qlora_runs.csv",
                     help="Append one metadata row per run to this CSV (rank 0 only). "
                          "Same schema as the single-GPU arm. Empty string disables.")
@@ -314,6 +322,25 @@ def main():
     opt = torch.optim.AdamW(net.param_groups(args.weight_decay), lr=args.lr)
     sched = make_lr_scheduler(opt, args.scheduler, args.steps, warmup_steps)
 
+    # Restore optimizer/schedule/step from the resumed checkpoint (every rank loads
+    # the same trainer_state.pt; ranks hold identical synced state after each
+    # all-reduce, so this keeps them in lockstep). --reset-optimizer skips it.
+    resume_step, resume_state = 0, None
+    if args.resume and not args.reset_optimizer:
+        resume_state = load_trainer_state(args.resume)
+        if resume_state is not None:
+            restore_optimizer_state(opt, resume_state["optimizer"])
+            if resume_state.get("scheduler") is not None:
+                sched.load_state_dict(resume_state["scheduler"])
+            resume_step = int(resume_state["step"])
+            if is_main(rank):
+                print(f" -- resumed trainer state from {args.resume}: continuing at "
+                      f"step {resume_step + 1}/{args.steps} (best_val "
+                      f"{resume_state['best_val']}, lr {sched.get_last_lr()[0]:.2e})")
+        elif is_main(rank):
+            print(f" -- {args.resume} has no trainer_state.pt; resuming weights "
+                  f"only (cold optimizer + schedule from step 0).")
+
     def batches():
         order = list(range(len(shard)))
         # Per-rank RNG so shards reshuffle independently each epoch.
@@ -337,6 +364,8 @@ def main():
         # Single writer; every rank holds identical adapters after the all-reduce.
         if is_main(rank):
             net.save_adapter(args.out, base_model_name_or_path=args.model)
+            save_trainer_state(args.out, step=step, opt=opt, sched=sched,
+                               best_val=best_val, best_val_step=best_val_step, ema=ema)
             print(f"{tag} adapter -> {args.out}")
         dist.barrier()
 
@@ -362,10 +391,12 @@ def main():
 
     bgen = batches()
     opt.zero_grad(set_to_none=True)
-    ema = None
-    step = 0
-    best_val = float("inf")
-    best_val_step = 0
+    # Seed from the resumed state so best-tracking / EMA continue (None under
+    # --reset-optimizer or a weights-only dir).
+    ema = resume_state["ema"] if resume_state else None
+    step = resume_step
+    best_val = resume_state["best_val"] if resume_state else float("inf")
+    best_val_step = resume_state["best_val_step"] if resume_state else 0
     start_loss = end_loss = None
     start_val = start_eval2 = None
     last_eval_step, last_val, last_eval2 = -1, None, None
@@ -466,7 +497,7 @@ def main():
             "notes": "",
         })
     try:
-        for step in range(1, args.steps + 1):
+        for step in range(resume_step + 1, args.steps + 1):
             step_t0 = time.time()
             accum_loss = 0.0
             step_sup = step_tot = 0
@@ -540,7 +571,10 @@ def main():
                 if is_main(rank):
                     cdir = checkpoint_dir(args.out, step)
                     net.save_adapter(cdir, base_model_name_or_path=args.model)
-                    print(f"  [checkpoint] step {step} -> {cdir}")
+                    save_trainer_state(cdir, step=step, opt=opt, sched=sched,
+                                       best_val=best_val, best_val_step=best_val_step,
+                                       ema=ema)
+                    print(f"  [checkpoint] step {step} -> {cdir} (resumable)")
                     prune_checkpoints(args.out, args.keep_checkpoints)
                 dist.barrier()
     except KeyboardInterrupt:
