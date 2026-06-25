@@ -33,6 +33,8 @@ Multi-GPU (DDP; --batch is PER-GPU, effective = batch * nproc * grad-accum):
 """
 
 import argparse
+import csv
+import datetime
 import json
 import math
 import os
@@ -60,6 +62,39 @@ class ThroughputMeter:  # identical to qlora_train_native.ThroughputMeter
         if tt <= 0:
             return 0.0, 0.0
         return sum(b[1] for b in self.buf) / tt, sum(b[2] for b in self.buf) / tt
+
+
+# Run-log schema + writer: identical to qlora_train_native (inlined -- the BNB arm
+# runs in a separate venv and can't import the exllamav3 path), so both arms append
+# to the same "mega CSV" with the same columns for a matched EXL3-vs-NF4 comparison.
+RUN_LOG_FIELDS = [
+    "timestamp", "arm", "status", "model", "arch", "out",
+    "dataset", "eval_split", "eval_dataset", "eval2_dataset",
+    "r", "alpha", "lr", "scheduler", "warmup_steps", "weight_decay",
+    "batch", "grad_accum", "world_size", "eff_batch",
+    "epochs", "steps_planned", "steps_done", "seq_len",
+    "targets", "compute_dtype", "attn_impl", "parallel", "shuffle",
+    "max_samples", "train_embeddings", "train_head", "prompt_format",
+    "trainable_params", "n_train", "n_val", "n_eval2",
+    "start_loss", "end_loss", "best_val", "best_val_step",
+    "final_val", "final_eval2",
+    "total_s", "s_per_step", "sup_tok_s", "tot_tok_s", "peak_vram_gb",
+    "notes",
+]
+
+
+def append_run_log(path, record):
+    if not path:
+        return
+    path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    is_new = not os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=RUN_LOG_FIELDS, extrasaction="ignore")
+        if is_new:
+            w.writeheader()
+        w.writerow({k: record.get(k, "") for k in RUN_LOG_FIELDS})
+    print(f"[run-log] appended 1 row to {path}")
 
 
 EOT = "<|eot_id|>"
@@ -337,6 +372,10 @@ def main():
                     help="Write greedy generations on the eval prompts here "
                          "(jsonl, 'output' field) for score_style_density.py")
     ap.add_argument("--gen-max-new-tokens", type=int, default=120)
+    ap.add_argument("--run-log", default="qlora_runs.csv",
+                    help="Append one metadata row per run to this CSV (rank 0). "
+                         "Same schema as the EXL3 arm, so both append to the same "
+                         "mega-CSV for matched comparison. Empty string disables.")
     args = ap.parse_args()
 
     from transformers import (AutoModelForCausalLM, AutoTokenizer,
@@ -478,8 +517,14 @@ def main():
     opt.zero_grad(set_to_none=True)
     torch.cuda.reset_peak_memory_stats(device)
     ema, tok_seen, tot_seen, t0, best_val = None, 0, 0, time.time(), float("inf")
+    step = 0
+    best_val_step = 0
+    start_loss = end_loss = None
+    run_started = datetime.datetime.now().isoformat(timespec="seconds")
+    status = "completed"
     meter = ThroughputMeter()
-    for step in range(1, args.steps + 1):
+    try:
+      for step in range(1, args.steps + 1):
         step_t0 = time.time()
         accum = 0.0
         step_sup = step_tot = 0
@@ -508,6 +553,9 @@ def main():
         tot_seen += step_tot
         meter.update(time.time() - step_t0, step_sup, step_tot)
         _, tot_tps = meter.rates()
+        if start_loss is None:
+            start_loss = accum
+        end_loss = accum
         ema = accum if ema is None else 0.9 * ema + 0.1 * accum
         if is_main:
             print(f"  step {step:>5}/{args.steps} | loss {accum:6.4f} | "
@@ -525,9 +573,13 @@ def main():
                 if v2 is not None:
                     parts.append(f"{eval2_label} {v2:.4f}")
                 print(f"    [eval] step {step}: " + " | ".join(parts))
-            if args.save_best and vl is not None and vl < best_val:
+            if vl is not None and vl < best_val:
                 best_val = vl
-                save(f"[best step {step}, val {vl:.4f}]")
+                best_val_step = step
+                if args.save_best:
+                    save(f"[best step {step}, val {vl:.4f}]")
+    except KeyboardInterrupt:
+        status = "interrupted"
 
     dt = time.time() - t0
     if not (args.save_best and val_examples):
@@ -551,6 +603,38 @@ def main():
               f"{tok_t[1].item() / dt if dt else 0:,.0f} tot tok/s "
               f"({'all ranks' if ddp else '1 GPU'}) | peak VRAM/GPU {peak_gb:.2f} "
               f"GB | {dt:.0f}s, {args.steps} steps, world_size {world_size}")
+
+    if is_main:
+        rnd = lambda x, n=6: round(x, n) if isinstance(x, (int, float)) else ""
+        archs = getattr(model.config, "architectures", None) or [""]
+        append_run_log(args.run_log, {
+            "timestamp": run_started, "arm": "bnb-nf4", "status": status,
+            "model": args.model, "arch": archs[0], "out": args.out,
+            "dataset": args.dataset, "eval_split": args.eval_split or "",
+            "eval_dataset": args.eval_dataset or "", "eval2_dataset": args.eval2_dataset or "",
+            "r": args.r, "alpha": args.alpha, "lr": args.lr,
+            "scheduler": args.scheduler, "warmup_steps": warmup_steps,
+            "weight_decay": args.weight_decay, "batch": args.batch,
+            "grad_accum": args.grad_accum, "world_size": world_size,
+            "eff_batch": eff_batch, "epochs": args.epochs,
+            "steps_planned": args.steps, "steps_done": step, "seq_len": args.seq_len,
+            "targets": " ".join(TARGET_MODULES), "compute_dtype": "bfloat16",
+            "attn_impl": "hf-sdpa", "parallel": "ddp" if ddp else "single",
+            "shuffle": int(bool(args.shuffle)), "max_samples": args.max_samples,
+            "train_embeddings": 0, "train_head": 0, "prompt_format": "llama3",
+            "trainable_params": sum(p.numel() for p in params),
+            "n_train": len(examples), "n_val": len(val_examples),
+            "n_eval2": len(val2_examples),
+            "start_loss": rnd(start_loss), "end_loss": rnd(end_loss),
+            "best_val": rnd(best_val) if best_val != float("inf") else "",
+            "best_val_step": best_val_step or "",
+            "final_val": rnd(val_loss), "final_eval2": rnd(val2_loss),
+            "total_s": rnd(dt, 1), "s_per_step": rnd(dt / step, 4) if step else "",
+            "sup_tok_s": round(tok_t[0].item() / dt) if dt else "",
+            "tot_tok_s": round(tok_t[1].item() / dt) if dt else "",
+            "peak_vram_gb": rnd(torch.cuda.max_memory_allocated(device) / 1e9, 3),
+            "notes": "",
+        })
 
     if args.gen_out and is_main:
         model.eval()

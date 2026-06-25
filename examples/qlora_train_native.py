@@ -38,7 +38,10 @@ The adapter is saved in PEFT format, loadable by exllamav3.model.lora.LoRA
 """
 
 import argparse
+import csv
+import datetime
 import math
+import os
 import random
 import re
 import time
@@ -71,6 +74,44 @@ class ThroughputMeter:
         if tt <= 0:
             return 0.0, 0.0
         return sum(b[1] for b in self.buf) / tt, sum(b[2] for b in self.buf) / tt
+
+
+# Canonical schema for the per-run CSV log. Fixed order so the "mega CSV" stays
+# consistent across runs/arms; the BNB arm inlines an identical copy (separate
+# venv) and the DDP script imports these. Unknown keys are ignored and missing
+# fields written blank, so adding a column later only needs an entry here.
+RUN_LOG_FIELDS = [
+    "timestamp", "arm", "status", "model", "arch", "out",
+    "dataset", "eval_split", "eval_dataset", "eval2_dataset",
+    "r", "alpha", "lr", "scheduler", "warmup_steps", "weight_decay",
+    "batch", "grad_accum", "world_size", "eff_batch",
+    "epochs", "steps_planned", "steps_done", "seq_len",
+    "targets", "compute_dtype", "attn_impl", "parallel", "shuffle",
+    "max_samples", "train_embeddings", "train_head", "prompt_format",
+    "trainable_params", "n_train", "n_val", "n_eval2",
+    "start_loss", "end_loss", "best_val", "best_val_step",
+    "final_val", "final_eval2",
+    "total_s", "s_per_step", "sup_tok_s", "tot_tok_s", "peak_vram_gb",
+    "notes",
+]
+
+
+def append_run_log(path, record):
+    """Append one run's metadata as a row to a CSV (header written once on
+    create). Pure stdlib so the DDP script imports it and the BNB arm inlines a
+    copy. Keys outside RUN_LOG_FIELDS are ignored and missing fields left blank,
+    so the column layout is stable run-to-run."""
+    if not path:
+        return
+    path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    is_new = not os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=RUN_LOG_FIELDS, extrasaction="ignore")
+        if is_new:
+            w.writeheader()
+        w.writerow({k: record.get(k, "") for k in RUN_LOG_FIELDS})
+    print(f"[run-log] appended 1 row to {path}")
 
 
 def turn_end_token(tokenizer):
@@ -564,6 +605,11 @@ def main():
                     help="Save the adapter only when held-out loss improves "
                          "(needs --val-frac + --eval-every), so a long run keeps "
                          "the best checkpoint instead of an overfit endpoint.")
+    ap.add_argument("--run-log", default="qlora_runs.csv",
+                    help="Append one metadata row per run to this CSV (model, "
+                         "hyperparameters, start/end/best-val loss, timing, tok/s, "
+                         "peak VRAM, ...). Written on normal finish AND on Ctrl-C. "
+                         "Empty string disables.")
     args = ap.parse_args()
 
     cdt = {"float32": torch.float32, "float16": torch.float16,
@@ -784,11 +830,53 @@ def main():
     ema = None
     step = 0
     best_val = float("inf")
+    best_val_step = 0
+    start_loss = end_loss = None
     tok_seen, tot_seen, t0 = 0, 0, time.time()
+    run_started = datetime.datetime.now().isoformat(timespec="seconds")
     meter = ThroughputMeter()
     if torch.cuda.is_available():
         for d in active_devices:
             torch.cuda.reset_peak_memory_stats(d)
+
+    def peak_vram_gb():
+        if not torch.cuda.is_available():
+            return 0.0
+        return max((torch.cuda.max_memory_allocated(d) / 1e9 for d in active_devices),
+                   default=0.0)
+
+    def log_run(status, dt, final_val, final_eval2):
+        # One CSV row capturing the run's identity, hyperparameters and results.
+        # Called on normal finish and on Ctrl-C so interrupted runs are recorded.
+        rnd = lambda x, n=6: round(x, n) if isinstance(x, (int, float)) else ""
+        append_run_log(args.run_log, {
+            "timestamp": run_started, "arm": "exl3-native", "status": status,
+            "model": args.model, "arch": getattr(config, "architecture", ""),
+            "out": args.out, "dataset": args.dataset,
+            "eval_split": args.eval_split or "", "eval_dataset": args.eval_dataset or "",
+            "eval2_dataset": args.eval2_dataset or "",
+            "r": args.r, "alpha": args.alpha, "lr": args.lr,
+            "scheduler": args.scheduler, "warmup_steps": warmup_steps,
+            "weight_decay": args.weight_decay, "batch": args.batch,
+            "grad_accum": args.grad_accum, "world_size": 1,
+            "eff_batch": args.batch * args.grad_accum, "epochs": args.epochs,
+            "steps_planned": args.steps, "steps_done": step, "seq_len": args.seq_len,
+            "targets": " ".join(net.target_modules), "compute_dtype": args.compute_dtype,
+            "attn_impl": args.attn_impl, "parallel": args.parallel,
+            "shuffle": int(bool(args.shuffle)), "max_samples": args.max_samples,
+            "train_embeddings": int(bool(args.train_embeddings)),
+            "train_head": int(bool(args.train_head)), "prompt_format": args.prompt_format,
+            "trainable_params": net.num_trainable(), "n_train": len(examples),
+            "n_val": len(val_examples), "n_eval2": len(val2_examples),
+            "start_loss": rnd(start_loss), "end_loss": rnd(end_loss),
+            "best_val": rnd(best_val) if best_val != float("inf") else "",
+            "best_val_step": best_val_step or "",
+            "final_val": rnd(final_val), "final_eval2": rnd(final_eval2),
+            "total_s": rnd(dt, 1), "s_per_step": rnd(dt / step, 4) if step else "",
+            "sup_tok_s": round(tok_seen / dt) if dt else "",
+            "tot_tok_s": round(tot_seen / dt) if dt else "",
+            "peak_vram_gb": rnd(peak_vram_gb(), 3), "notes": "",
+        })
     try:
         for step in range(1, args.steps + 1):
             step_t0 = time.time()
@@ -820,6 +908,9 @@ def main():
             meter.update(time.time() - step_t0, step_sup, step_tot)
             _, tot_tps = meter.rates()
 
+            if start_loss is None:
+                start_loss = accum_loss
+            end_loss = accum_loss
             ema = accum_loss if ema is None else 0.9 * ema + 0.1 * accum_loss
             print(f"  step {step:>5}/{args.steps} | loss {accum_loss:6.4f} | "
                   f"ema {ema:6.4f} | grad {gnorm:7.4f} | lr {sched.get_last_lr()[0]:.2e} | "
@@ -831,9 +922,13 @@ def main():
                 if val_examples:
                     vl = evaluate()
                     parts.append(f"held-out {vl:.4f}")
-                    if args.save_best and vl < best_val:
+                    # Track best val for the run log regardless of --save-best;
+                    # only write the checkpoint when --save-best is set.
+                    if vl < best_val:
                         best_val = vl
-                        save(f"[best step {step}, val {vl:.4f}]")
+                        best_val_step = step
+                        if args.save_best:
+                            save(f"[best step {step}, val {vl:.4f}]")
                 if val2_examples:
                     parts.append(f"{eval2_label} {eval_loss(val2_examples):.4f}")
                 print(f"    [eval] step {step}: " + " | ".join(parts))
@@ -860,6 +955,7 @@ def main():
             print(f"\nInterrupted at step {step}; saving adapter before exit.")
             if step > 0:
                 save("[interrupted]")
+        log_run("interrupted", time.time() - t0, None, None)
         raise SystemExit(0)
 
     # 6. Save adapter (PEFT format; loadable by exllamav3.model.lora.LoRA).
@@ -873,8 +969,9 @@ def main():
         tag = f" (best kept: {best_val:.4f})" if args.save_best else ""
         print(f"\n[EVAL] held-out loss (EXL3 arm): {val_loss:.4f}{tag} "
               f"over {len(val_examples)} examples")
-    if val2_examples:
-        print(f"[EVAL] eval2 ({eval2_label}) loss: {eval_loss(val2_examples):.4f} "
+    final_eval2 = eval_loss(val2_examples) if val2_examples else None
+    if final_eval2 is not None:
+        print(f"[EVAL] eval2 ({eval2_label}) loss: {final_eval2:.4f} "
               f"over {len(val2_examples)} examples")
     if torch.cuda.is_available():
         peak_str = " / ".join(
@@ -886,6 +983,7 @@ def main():
     print(f"[PERF] {tok_seen / dt if dt else 0:,.0f} sup tok/s, "
           f"{tot_seen / dt if dt else 0:,.0f} tot tok/s | "
           f"peak VRAM {peak_str} | {dt:.0f}s for {step} steps")
+    log_run("completed", dt, val_loss, final_eval2)
     print("Verify with: python examples/qlora_infer_native.py "
           f"--model {args.model} --adapter {args.out}")
 
