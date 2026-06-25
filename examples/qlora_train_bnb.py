@@ -77,7 +77,7 @@ RUN_LOG_FIELDS = [
     "max_samples", "train_embeddings", "train_head", "prompt_format",
     "trainable_params", "n_train", "n_val", "n_eval2",
     "start_loss", "end_loss", "best_val", "best_val_step",
-    "final_val", "final_eval2",
+    "start_val", "start_eval2", "final_val", "final_eval2",
     "total_s", "s_per_step", "sup_tok_s", "tot_tok_s", "peak_vram_gb",
     "notes",
 ]
@@ -88,6 +88,13 @@ def append_run_log(path, record):
         return
     path = os.path.abspath(path)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if os.path.exists(path):
+        with open(path, newline="", encoding="utf-8") as f:
+            header = next(csv.reader(f), None)
+        if header is not None and header != RUN_LOG_FIELDS:
+            bak = path + ".bak"
+            os.replace(path, bak)
+            print(f"[run-log] schema changed; moved old log to {bak}")
     is_new = not os.path.exists(path)
     with open(path, "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=RUN_LOG_FIELDS, extrasaction="ignore")
@@ -260,6 +267,10 @@ def build_lm_examples(tok, dataset_name, split, seq_len, text_key="text",
         ds = ds.select(range(max_samples))
 
     bos = tok.bos_token_id
+    # One leading BOS per block (independent sequence), only for models that use
+    # one -- gated on bos_token_id like the EXL3 arm so both pack identically.
+    add_block_bos = bos is not None
+    content_len = seq_len - 1 if add_block_bos else seq_len
     buf, examples = [], []
     for row in ds:
         text = row.get(text_key) or ""
@@ -269,9 +280,11 @@ def build_lm_examples(tok, dataset_name, split, seq_len, text_key="text",
         if bos is not None and ids and ids[0] == bos:
             ids = ids[1:]
         buf.extend(ids)
-        while len(buf) >= seq_len:
-            block = buf[:seq_len]
-            buf = buf[seq_len:]
+        while len(buf) >= content_len:
+            block = buf[:content_len]
+            buf = buf[content_len:]
+            if add_block_bos:
+                block = [bos] + block
             examples.append({"input_ids": block, "labels": list(block)})
     return examples
 
@@ -523,15 +536,30 @@ def main():
     bgen = batches()
     model.train()
     opt.zero_grad(set_to_none=True)
-    torch.cuda.reset_peak_memory_stats(device)
     ema, tok_seen, tot_seen, t0, best_val = None, 0, 0, time.time(), float("inf")
     step = 0
     best_val_step = 0
     start_loss = end_loss = None
+    start_val = start_eval2 = None
     last_eval_step, last_val, last_eval2 = -1, None, None
     run_started = datetime.datetime.now().isoformat(timespec="seconds")
     status = "completed"
     meter = ThroughputMeter()
+
+    # Baseline eval at step 0 (no-op adapter = base NF4 model); rank 0 prints.
+    if val_examples or val2_examples:
+        start_val = evaluate()
+        start_eval2 = eval_loss(val2_examples)
+        if is_main:
+            parts = []
+            if start_val is not None:
+                parts.append(f"held-out {start_val:.4f}")
+            if start_eval2 is not None:
+                parts.append(f"{eval2_label} {start_eval2:.4f}")
+            print("    [eval] step 0 (baseline): " + " | ".join(parts))
+
+    t0 = time.time()                       # training timer after the baseline eval
+    torch.cuda.reset_peak_memory_stats(device)
     try:
       for step in range(1, args.steps + 1):
         step_t0 = time.time()
@@ -644,6 +672,7 @@ def main():
             "start_loss": rnd(start_loss), "end_loss": rnd(end_loss),
             "best_val": rnd(best_val) if best_val != float("inf") else "",
             "best_val_step": best_val_step or "",
+            "start_val": rnd(start_val), "start_eval2": rnd(start_eval2),
             "final_val": rnd(val_loss), "final_eval2": rnd(val2_loss),
             "total_s": rnd(dt, 1), "s_per_step": rnd(dt / step, 4) if step else "",
             "sup_tok_s": round(tok_t[0].item() / dt) if dt else "",

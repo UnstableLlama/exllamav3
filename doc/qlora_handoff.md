@@ -751,8 +751,116 @@ sampling on GPU, hit while running the gate on gemma-4-12B):**
   paths. (xformers is NOT required — it's optional and was ABI-mismatched in the
   venv; the SDPA fallback is correct, just slower.)
 
-Status: write-confirmed, compiles, CPU logic checks pass (eager unchanged; flash
-is GPU-only so the CPU suite still covers the eager reference). NOT yet run on GPU.
+Status: flash/SDPA path is GPU-only (CPU suite covers the eager reference). The
+bf16 flash/SDPA path itself is **run-confirmed indirectly** — the Gemma4-12B
+training run below descends cleanly in bf16 (which engages flash+SDPA) — but the
+dedicated bf16 `qlora_validate_native.py --compute-dtype bfloat16` parity pass is
+still worth running once (see Session 6 open items).
+
+---
+
+### Session 6 — Gemma4 run-confirmed end-to-end; tooling (logging, dual-eval, UX)
+
+> Branch `claude/confident-goodall-9bnuwp`. Long session. Turned the Gemma4
+> support into a confirmed working trainer on real hardware (gemma-4-12B-it 4bpw)
+> and built out the run-quality tooling. Everything below is **run-confirmed on
+> the box (1×GPU and 2×GPU DDP)** unless marked otherwise.
+
+**Headline: QLoRA-on-EXL3 works on Gemma4-12B.**
+- Forward parity gate PASSED (fp32): `qlora_validate_native.py` on gemma-4-12B-it
+  4bpw → **100% per-position argmax agreement** vs exllamav3's own forward,
+  last-token `cos ≈ 0.999998`, `max|Δ| ≈ 0.08`.
+- Training run confirmed (semancy, 1×GPU r16/α32 lr1e-4 cosine, and 2×GPU DDP
+  lr5e-5 eff-batch16): clean descent (train 5.1→2.4), held-out `test` **2.51**
+  (vs the 1B's ~3.09 floor — bigger base is the lever, as predicted). The
+  wikitext dual-eval *also* dropped during the philosophy SFT = **positive
+  transfer, not forgetting** (watch for the eventual crossover under harder/longer
+  training — that's the forgetting signal the dual-eval exists to catch).
+
+**The decisive Gemma4 bug (and two upstream fixes):**
+- **`layer_scalar`** — Gemma4's `TransformerBlock` carries
+  `key_layer_scalar="layer_scalar"` and multiplies the whole residual stream by a
+  learned per-layer scalar at block end (`transformer.py:222`). Omitting it made
+  the forward per-block-correct but **garbage over 48 layers** (0% argmax,
+  cos~0). Now read via `backbone.block_metadata["layer_scalar"]` and applied in
+  `_block_forward`. This was *the* fix that took the validate from FAIL → PASS.
+- **`architecture/gemma4.py`** — `_prepare_noncausal_mm_spans` built boundary
+  tensors with CPU literals and `cat`'d them with a CUDA tensor → device-mismatch
+  crash on any GPU text forward. Build on `ids.device`.
+- **`modules/attn.py`** — the no-cache SDPA fallback (reached for `head_dim>256`;
+  Gemma4 global layers, since the `bighead` kernel is paged/cache-only) returns a
+  transposed non-contiguous tensor; `o.view(...)` → `o.reshape(...)` in both
+  `decode_flash_attn` paths. (xformers is **not** required — it was ABI-mismatched
+  in the venv; the SDPA fallback is correct, just slower.)
+- `sm_scale=1.0` for Gemma4 (vs Gemma2/3 `query_pre_attn_scalar**-0.5`) is
+  confirmed correct as-is (read from the module; the ~perfect cosine proves the
+  query scaling is folded into the weights).
+
+**FlashAttention-2 fast path is now per-block + visible:**
+- `_block_forward` picks **flash** (head_dim≤256), **SDPA** (head_dim>256
+  full-causal no-softcap — keeps Gemma's big-head global layers O(t)), or **eager**
+  per block; `describe_attn()` prints the plan at startup (e.g.
+  `attn: 40×flash, 8×sdpa [impl=auto, flash_attn available]`). `--attn-impl
+  {auto,eager,flash}` on the trainers + validate. (Fixed a cosmetic bug where the
+  summary mislabeled everything `eager` because it tested `block.device.type`
+  on a device *string*; the forward itself keys off the live `hidden.is_cuda` and
+  was always correct.)
+
+**Run-quality tooling added this session (all three arms — native single, DDP,
+BNB — unless noted):**
+- **`--run-log` CSV (default `qlora_runs.csv`)** — one metadata row per run,
+  written on normal finish AND Ctrl-C (`status=completed|interrupted`): model,
+  arch, all hyperparameters, eff-batch, train/val/eval2 sizes, start/end train
+  loss, **start_val/start_eval2 (baseline)**, best_val + best_val_step,
+  final_val/final_eval2, total_s, s_per_step, sup/tot tok/s, peak VRAM. Shared
+  `append_run_log`+`RUN_LOG_FIELDS` in `qlora_train_native.py` (DDP imports; BNB
+  inlines an identical copy). **Self-heals** on schema change: if an existing
+  file's header differs it moves the old file to `<path>.bak` and starts fresh.
+- **Live rolling tok/s** on the per-step line (`ThroughputMeter`, train-step
+  compute only); `[PERF]` now reports both supervised and total tok/s.
+- **`--shuffle` / `--shuffle-seed`** — deterministically shuffle rows before the
+  `--val-frac` carve. With `--eval-split` (a real test split) train is shuffled
+  and the split is preserved (they're separate `load_dataset` calls).
+- **Second eval set** — `--eval2-dataset` (+ `--eval2-split` / `--eval2-config` /
+  `--eval2-text-key` / `--eval2-max-samples`). With `--eval2-text-key` it's a
+  plain-text LM loss over packed `seq_len` blocks (e.g. wikitext); `--eval2-config`
+  supplies the HF config (`wikitext-2-raw-v1`). Each block now starts with **one
+  BOS** when the model uses one (gated on `bos_token_id`; Qwen → none), so the
+  absolute LM number is meaningful, not just the trend. `build_lm_examples` shared
+  (native) / inlined (BNB) with matched tokenization, so EXL3-vs-NF4 is comparable.
+- **Baseline (step-0) eval** — when an eval set is selected, the held-out (and
+  eval2) loss is computed once before step 1 (no-op adapter = base model) and
+  printed `[eval] step 0 (baseline): ...`; logged as `start_val`/`start_eval2`.
+  Training timer + VRAM peak (re)start after it.
+- **No more "looks hung after Done."** — the post-loop final eval is reused from
+  the last in-loop eval when it landed on the final step (else computed once with
+  a `-- computing final held-out eval (GPU busy, not hung) ...` notice). Was a
+  duplicate full pass on a big model.
+- **torchrun redirect** — `qlora_train_native.py` launched under torchrun
+  (RANK/WORLD_SIZE in env) exits with a one-line pointer to the DDP script instead
+  of an argparse wall (the intuitive `--parallel ddp` footgun).
+
+**Throughput note:** native EXL3 training is ~136 tok/s (1×) / ~215 tok/s (2×GPU
+DDP, all-ranks est) on the 12B — correctness-first, not speed-tuned (trellis
+reconstruction ×3 under checkpointing + SDPA on the big-head global layers). The
+`[PERF]`/`s_per_step` CSV columns are there to track this across configs.
+
+**Open items / next day:**
+1. **Run the bf16 parity pass**: `qlora_validate_native.py --compute-dtype
+   bfloat16` on gemma-4-12B to formally confirm the flash/SDPA logits vs native
+   (expect looser than fp32 — ~0.99x cos — but high argmax). Confirms the
+   `attn:` line shows flash actually engaging.
+2. **Matched EXL3-vs-NF4 Gemma4 run** (the flagship): same flags on
+   `qlora_train_bnb.py` (point `--model` at bf16 HF Gemma4); compare held-out
+   floors + the run-log rows. Note BNB lacks `--prompt-format`/Gemma specifics —
+   verify the chat formatting matches.
+3. **Qwen3.5 / 3.6** remain unsupported — they need a differentiable **Gated
+   DeltaNet** (linear/recurrent attention; ~3/4 of layers). This is the open
+   research frontier; start with a single-layer forward-parity check against
+   exllamav3's `GatedDeltaNet` before committing to the backward.
+4. Speed: if wall-clock matters for long runs, profile trellis-reconstruction vs
+   SDPA-big-head cost; a fused/ cached reconstruction or training-time flash for
+   head_dim>256 (when a kernel supports it) are the levers.
 
 ---
 

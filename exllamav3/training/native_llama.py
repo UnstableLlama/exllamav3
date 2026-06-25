@@ -493,8 +493,11 @@ class NativeLlamaQLoRA(nn.Module):
         """One-line summary of the attention plan for the loaded model + dtype, so
         a run can confirm flash/SDPA actually engage (vs a silent eager fallback)."""
         from collections import Counter
+        # block.device may be a torch.device OR the string passed to load
+        # ("cuda:0"); match the forward's intent (hidden lands on this device)
+        # with a string test rather than a .type attribute that strings lack.
         dev = self._block_devices[0]
-        is_cuda = getattr(dev, "type", None) == "cuda"
+        is_cuda = "cuda" in str(dev)
         mem_eff = (self._flash_ok and is_cuda
                    and self.compute_dtype in (torch.float16, torch.bfloat16))
         counts = Counter(self._attn_mode_for(m, mem_eff) for m in self._block_meta)
