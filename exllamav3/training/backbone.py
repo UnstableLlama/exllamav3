@@ -259,6 +259,38 @@ def head_weight_closure(lm_head) -> Callable[[], torch.Tensor]:
     return lambda: inner.get_weight_tensor()
 
 
+def head_weight_slice_closure(lm_head):
+    """
+    For chunked-vocab head loss: return ``(slice_fn, out_features, granularity)``
+    where ``slice_fn(n_start, n_features) -> [hidden, n_features]`` reconstructs only
+    those output columns, or ``None`` if the head can't slice efficiently.
+
+    An EXL3 head reconstructs just the requested columns (``get_weight_tensor_slice``)
+    so the fused CE never materializes the full ``[hidden, vocab]`` weight + its fp32
+    upcast -- the dominant memory spike on the output device for large vocabularies.
+    Other head types (e.g. an unquantized ``[hidden, vocab]`` tensor) fall back to a
+    plain column index, which still avoids the full-vocab fp32 logits/softmax.
+    """
+    inner = lm_head.inner
+    sliced = getattr(inner, "get_weight_tensor_slice", None)
+    if sliced is not None:
+        gran = getattr(inner, "RECONSTRUCT_SLICE_GRANULARITY_N", None)
+        if gran is None:
+            # Module-level constant on the EXL3 linear's module.
+            import exllamav3.modules.quant.exl3 as _exl3
+            gran = _exl3.RECONSTRUCT_SLICE_GRANULARITY_N
+        return (lambda s, n: sliced(s, n)), inner.out_features, gran
+    # Generic fallback: index the full (already-resident) weight. No reconstruction
+    # spike to avoid, but the chunked CE still bounds the logits/softmax memory.
+    get_full = getattr(inner, "get_weight_tensor", None)
+    if get_full is None:
+        return None
+    out_features = getattr(inner, "out_features", None)
+    if out_features is None:
+        return None
+    return (lambda s, n: get_full()[:, s:s + n]), out_features, 1
+
+
 # --- token embedding -------------------------------------------------------
 
 def embed_weight(embed) -> torch.Tensor:
