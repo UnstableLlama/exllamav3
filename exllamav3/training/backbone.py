@@ -115,6 +115,9 @@ def block_metadata(block) -> dict:
         "activation": block.mlp.activation_fn,
         # Some Gemma layers reuse the K projection as V (no separate v_proj).
         "use_k_as_v": bool(getattr(attn, "use_k_as_v", False)),
+        # Gemma applies a learned per-layer scalar to the whole residual stream at
+        # block end (TransformerBlock.forward: x *= layer_scalar_f). None elsewhere.
+        "layer_scalar": getattr(block, "layer_scalar_f", None),
     }
 
 

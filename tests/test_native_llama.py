@@ -203,12 +203,15 @@ def _ref_block_gemma(meta, weights, hidden, positions, feats):
         hidden = hidden + _ref_rmsnorm_b(mlp_out, weights["mlp_post"], eps_m, bias)
     else:
         hidden = hidden + mlp_out
+    if meta.get("layer_scalar") is not None:
+        hidden = hidden * meta["layer_scalar"]
     return hidden
 
 
 def _build_block(d, nq, nkv, hd, inter, dtype=torch.float64, r=0, *,
                  qk_norm=False, v_norm=False, post_norm=False,
-                 activation="silu", window=-1, softcap=0.0, norm_bias=0.0):
+                 activation="silu", window=-1, softcap=0.0, norm_bias=0.0,
+                 layer_scalar=None):
     """Build a synthetic block + matching reference weights. Flags toggle the
     Gemma/Qwen3 features so one builder covers the plain and extended paths."""
     norm_a = _ns_norm(d, dtype)
@@ -250,7 +253,7 @@ def _build_block(d, nq, nkv, hd, inter, dtype=torch.float64, r=0, *,
         "sm_scale": hd ** -0.5, "attn_eps": 1e-5, "mlp_eps": 1e-5,
         "inv_freq": inv_freq, "attn_factor": 1.0,
         "sliding_window": window, "softcap": softcap, "activation": activation,
-        "use_k_as_v": False,
+        "use_k_as_v": False, "layer_scalar": layer_scalar,
     }
     ref_weights = {
         "attn_norm": norm_a.weight, "mlp_norm": norm_m.weight,
@@ -330,6 +333,7 @@ def test_gemma_block_matches_reference():
         d, nq, nkv, hd, inter, dtype=torch.float32, r=0,
         qk_norm=True, v_norm=True, post_norm=True,
         activation="gelu", window=3, softcap=50.0, norm_bias=1.0,
+        layer_scalar=0.7,
     )
     net = _headless_net()
 
