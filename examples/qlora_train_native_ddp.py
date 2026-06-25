@@ -33,6 +33,7 @@ multi-GPU box. Validate the first run carefully (see the checklist at the bottom
 """
 
 import argparse
+import datetime
 import os
 import random
 import sys
@@ -45,7 +46,7 @@ import torch.distributed as dist
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qlora_train_native import (  # noqa: E402
     build_sft_examples, build_lm_examples, collate, make_lr_scheduler,
-    resolve_steps_and_warmup, ThroughputMeter,
+    resolve_steps_and_warmup, ThroughputMeter, append_run_log,
 )
 
 from exllamav3 import Config, Model, Tokenizer  # noqa: E402
@@ -183,6 +184,9 @@ def main():
                     help="Adapter dir to resume from (e.g. a single-GPU checkpoint). "
                          "Loaded on every rank before the broadcast. --r/--targets "
                          "must match the checkpoint; optimizer state is not restored.")
+    ap.add_argument("--run-log", default="qlora_runs.csv",
+                    help="Append one metadata row per run to this CSV (rank 0 only). "
+                         "Same schema as the single-GPU arm. Empty string disables.")
     args = ap.parse_args()
 
     rank, local_rank, world_size = ddp_setup()
@@ -345,9 +349,50 @@ def main():
     ema = None
     step = 0
     best_val = float("inf")
+    best_val_step = 0
+    start_loss = end_loss = None
     tok_seen, tot_seen, t0 = 0, 0, time.time()
+    run_started = datetime.datetime.now().isoformat(timespec="seconds")
+    status = "completed"
     meter = ThroughputMeter()
     torch.cuda.reset_peak_memory_stats(device)
+
+    def log_run(status, dt, final_val, final_eval2, sup_tok_s, tot_tok_s):
+        # Rank 0 writes one CSV row (same schema as the single-GPU arm). tok/s are
+        # passed in: the caller has the all-reduced totals at normal finish, or a
+        # per-rank x world_size estimate on interrupt (no collective there).
+        if not is_main(rank):
+            return
+        rnd = lambda x, n=6: round(x, n) if isinstance(x, (int, float)) else ""
+        append_run_log(args.run_log, {
+            "timestamp": run_started, "arm": "exl3-native-ddp", "status": status,
+            "model": args.model, "arch": getattr(config, "architecture", ""),
+            "out": args.out, "dataset": args.dataset,
+            "eval_split": args.eval_split or "", "eval_dataset": args.eval_dataset or "",
+            "eval2_dataset": args.eval2_dataset or "",
+            "r": args.r, "alpha": args.alpha, "lr": args.lr,
+            "scheduler": args.scheduler, "warmup_steps": warmup_steps,
+            "weight_decay": args.weight_decay, "batch": args.batch,
+            "grad_accum": args.grad_accum, "world_size": world_size,
+            "eff_batch": eff_batch, "epochs": args.epochs,
+            "steps_planned": args.steps, "steps_done": step, "seq_len": args.seq_len,
+            "targets": " ".join(net.target_modules), "compute_dtype": args.compute_dtype,
+            "attn_impl": args.attn_impl, "parallel": "ddp",
+            "shuffle": int(bool(args.shuffle)), "max_samples": args.max_samples,
+            "train_embeddings": int(bool(args.train_embeddings)),
+            "train_head": int(bool(args.train_head)), "prompt_format": args.prompt_format,
+            "trainable_params": net.num_trainable(), "n_train": len(examples),
+            "n_val": len(val_examples), "n_eval2": len(val2_examples),
+            "start_loss": rnd(start_loss), "end_loss": rnd(end_loss),
+            "best_val": rnd(best_val) if best_val != float("inf") else "",
+            "best_val_step": best_val_step or "",
+            "final_val": rnd(final_val), "final_eval2": rnd(final_eval2),
+            "total_s": rnd(dt, 1), "s_per_step": rnd(dt / step, 4) if step else "",
+            "sup_tok_s": round(sup_tok_s) if sup_tok_s else "",
+            "tot_tok_s": round(tot_tok_s) if tot_tok_s else "",
+            "peak_vram_gb": rnd(torch.cuda.max_memory_allocated(device) / 1e9, 3),
+            "notes": "",
+        })
     try:
         for step in range(1, args.steps + 1):
             step_t0 = time.time()
@@ -375,6 +420,9 @@ def main():
             lt = torch.tensor(accum_loss, device=device)
             dist.all_reduce(lt, op=dist.ReduceOp.SUM)
             global_loss = lt.item() / world_size
+            if start_loss is None:
+                start_loss = global_loss
+            end_loss = global_loss
             # Live tok/s is this rank's only (no per-step collective); shards are
             # balanced so multiply by world_size for an aggregate estimate. The
             # final [PERF] line all-reduces the true total.
@@ -400,13 +448,19 @@ def main():
                     if v2 is not None:
                         parts.append(f"{eval2_label} {v2:.4f}")
                     print(f"    [eval] step {step}: " + " | ".join(parts))
-                if args.save_best and vl is not None and vl < best_val:
+                # Track best val for the run log regardless of --save-best; all
+                # ranks evaluate identically so they branch in lockstep (save()
+                # has a barrier). Only checkpoint when --save-best.
+                if vl is not None and vl < best_val:
                     best_val = vl
-                    save(f"[best step {step}, val {vl:.4f}]")
+                    best_val_step = step
+                    if args.save_best:
+                        save(f"[best step {step}, val {vl:.4f}]")
 
             if args.save_every and step % args.save_every == 0:
                 save(f"[checkpoint step {step}]")
     except KeyboardInterrupt:
+        status = "interrupted"
         # Don't clobber the best-val checkpoint with the current (later, likely
         # worse) weights when --save-best is on; it's already saved.
         if args.save_best and val_examples:
@@ -442,6 +496,9 @@ def main():
               f"{tok_t[1].item() / dt if dt else 0:,.0f} tot tok/s (all ranks) | "
               f"peak VRAM/GPU {peak_gb:.2f} GB | {dt:.0f}s, "
               f"{step} steps, world_size {world_size}")
+    # Record the run (rank 0 only, inside log_run) with all-reduced tok/s totals.
+    log_run(status, dt, val_loss, val2_loss,
+            tok_t[0].item() / dt if dt else 0, tok_t[1].item() / dt if dt else 0)
     dist.destroy_process_group()
 
 
