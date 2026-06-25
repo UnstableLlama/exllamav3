@@ -157,6 +157,49 @@ def prune_checkpoints(out, keep):
         print(f"  [checkpoint] pruned old {path}")
 
 
+TRAINER_STATE_FILE = "trainer_state.pt"
+
+
+def save_trainer_state(directory, *, step, opt, sched, best_val, best_val_step, ema):
+    """Persist resumable training state next to the adapter so --resume continues
+    the optimizer + LR schedule instead of cold-restarting them (which would
+    wrongly replay warmup/cosine from step 0). Small for LoRA (AdamW moments are a
+    few MB at low rank). Written into every save target, so any checkpoint dir --
+    the best at --out, a --save-every copy, or a --checkpoint-every history dir --
+    is a complete resume point."""
+    torch.save({
+        "step": int(step),
+        "optimizer": opt.state_dict(),
+        "scheduler": sched.state_dict() if sched is not None else None,
+        "best_val": best_val,
+        "best_val_step": best_val_step,
+        "ema": ema,
+    }, os.path.join(directory, TRAINER_STATE_FILE))
+
+
+def load_trainer_state(directory):
+    """Load the trainer-state dict written by ``save_trainer_state`` (to CPU; the
+    caller moves optimizer tensors onto each param's device). Returns ``None`` when
+    the dir has only adapter weights (e.g. a checkpoint from before this existed,
+    or a foreign PEFT adapter) so resume falls back to weights-only."""
+    path = os.path.join(directory, TRAINER_STATE_FILE)
+    if not os.path.exists(path):
+        return None
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def restore_optimizer_state(opt, opt_state):
+    """Load an optimizer state_dict and move each state tensor onto its param's
+    current device -- params can be split across GPUs under --parallel split, so a
+    single map_location won't do. Matches saved state to params by order, so the
+    param_groups must be built identically (same --r/--targets/--train-*)."""
+    opt.load_state_dict(opt_state)
+    for p, st in opt.state.items():
+        for k, v in st.items():
+            if isinstance(v, torch.Tensor):
+                st[k] = v.to(p.device)
+
+
 def turn_end_token(tokenizer):
     """End-of-assistant-turn marker for completion-only SFT, per chat format.
 
@@ -649,9 +692,18 @@ def main():
                          "--train-embeddings/--train-head, where each checkpoint is "
                          "large.")
     ap.add_argument("--resume", default=None,
-                    help="Adapter dir to resume from (continues training those "
-                         "weights; optimizer state is NOT restored). --r/--targets "
-                         "must match the checkpoint.")
+                    help="Adapter dir to resume from (continues those weights). If "
+                         "the dir holds a trainer_state.pt (any --checkpoint-every / "
+                         "--save-* dir from this trainer), the optimizer, LR "
+                         "schedule and step counter are ALSO restored so the run "
+                         "continues seamlessly; pass --reset-optimizer to skip that "
+                         "(cold AdamW, schedule from step 0). --r/--targets must "
+                         "match the checkpoint.")
+    ap.add_argument("--reset-optimizer", action="store_true",
+                    help="With --resume, load only the weights and start the "
+                         "optimizer/LR-schedule/step fresh (the old resume "
+                         "behavior). Use when changing LR/schedule or resuming "
+                         "across a different device topology.")
     ap.add_argument("--eval-split", default=None,
                     help="Use this split of the dataset (e.g. 'test') as the "
                          "held-out eval set, instead of carving --val-frac off "
@@ -871,6 +923,27 @@ def main():
     opt = torch.optim.AdamW(net.param_groups(args.weight_decay), lr=args.lr)
     sched = make_lr_scheduler(opt, args.scheduler, args.steps, warmup_steps)
 
+    # 5a. Optionally restore optimizer/schedule/step from the resumed checkpoint so
+    #     the run continues instead of cold-restarting warmup/cosine. resume_state
+    #     seeds best_val/ema below; resume_step shifts the loop's start.
+    resume_step, resume_state = 0, None
+    if args.resume and not args.reset_optimizer:
+        resume_state = load_trainer_state(args.resume)
+        if resume_state is not None:
+            restore_optimizer_state(opt, resume_state["optimizer"])
+            if resume_state.get("scheduler") is not None:
+                sched.load_state_dict(resume_state["scheduler"])
+            resume_step = int(resume_state["step"])
+            print(f" -- resumed trainer state from {args.resume}: continuing at "
+                  f"step {resume_step + 1}/{args.steps} (best_val "
+                  f"{resume_state['best_val']}, lr {sched.get_last_lr()[0]:.2e})")
+            if resume_step >= args.steps:
+                print(f" -- WARNING: resume step {resume_step} >= --steps "
+                      f"{args.steps}; nothing to do. Raise --steps/--epochs.")
+        else:
+            print(f" -- {args.resume} has no trainer_state.pt; resuming weights "
+                  f"only (cold optimizer + schedule from step 0).")
+
     def batches():
         order = list(range(len(examples)))
         while True:
@@ -889,6 +962,8 @@ def main():
     def save(tag):
         # Always leave net in train mode after; saving touches the adapter only.
         net.save_adapter(args.out, base_model_name_or_path=args.model)
+        save_trainer_state(args.out, step=step, opt=opt, sched=sched,
+                           best_val=best_val, best_val_step=best_val_step, ema=ema)
         print(f"{tag} Adapter written to {args.out}")
 
     def eval_loss(exs):
@@ -914,10 +989,12 @@ def main():
 
     bgen = batches()
     opt.zero_grad(set_to_none=True)
-    ema = None
-    step = 0
-    best_val = float("inf")
-    best_val_step = 0
+    # Seed from the resumed state so best-tracking and the EMA continue rather than
+    # reset (resume_state is None under --reset-optimizer / a weights-only dir).
+    ema = resume_state["ema"] if resume_state else None
+    step = resume_step
+    best_val = resume_state["best_val"] if resume_state else float("inf")
+    best_val_step = resume_state["best_val_step"] if resume_state else 0
     start_loss = end_loss = None
     start_val = start_eval2 = None
     last_eval_step, last_val, last_eval2 = -1, None, None
@@ -1023,7 +1100,7 @@ def main():
             "peak_vram_gb": rnd(peak_vram_gb(), 3), "notes": "",
         })
     try:
-        for step in range(1, args.steps + 1):
+        for step in range(resume_step + 1, args.steps + 1):
             step_t0 = time.time()
             accum_loss = 0.0
             step_sup = step_tot = 0
@@ -1095,7 +1172,10 @@ def main():
             if args.checkpoint_every and step % args.checkpoint_every == 0:
                 cdir = checkpoint_dir(args.out, step)
                 net.save_adapter(cdir, base_model_name_or_path=args.model)
-                print(f"  [checkpoint] step {step} -> {cdir}")
+                save_trainer_state(cdir, step=step, opt=opt, sched=sched,
+                                   best_val=best_val, best_val_step=best_val_step,
+                                   ema=ema)
+                print(f"  [checkpoint] step {step} -> {cdir} (resumable)")
                 prune_checkpoints(args.out, args.keep_checkpoints)
     except KeyboardInterrupt:
         # Stopping early at the loss plateau is a normal workflow; don't discard

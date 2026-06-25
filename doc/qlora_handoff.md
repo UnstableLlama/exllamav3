@@ -880,12 +880,31 @@ reconstruction ×3 under checkpointing + SDPA on the big-head global layers). Th
   other two modes. **`--keep-checkpoints K`** caps retention (delete oldest;
   `0` = keep all) — matters under `--train-embeddings/--train-head` where each
   checkpoint carries the big embed/head matrices, not just the few-MB LoRA.
-- Resume from any of them: `--resume --out/checkpoint-<step>` already works (a
-  checkpoint dir is just a normal adapter dir; optimizer state still not restored).
 - Shared helpers `checkpoint_dir()`/`list_checkpoints()`/`prune_checkpoints()` live
   in `qlora_train_native.py`; the DDP script imports them and writes from rank 0
   only with a `dist.barrier()` (same single-writer pattern as `save()`). Not yet
   mirrored into the BNB arm (separate venv; add if a matched run needs it).
+
+**Full resume (`--resume` now restores optimizer + LR schedule + step):** every
+save target (the best at `--out`, a `--save-every` copy, and each
+`--checkpoint-every` dir) now also writes a small **`trainer_state.pt`** beside
+the adapter (AdamW state_dict + `LambdaLR` state + `step` + `best_val`/`ema`). On
+`--resume <dir>` the trainer loads it (when present) and **continues**: the
+optimizer moments, the warmup/cosine position, and the step counter all pick up
+where they left off, instead of the old behavior of cold-restarting the schedule
+from step 0 (which would replay warmup mid-run — wrong for the short 56-step
+semancy cosine). `--reset-optimizer` keeps the old weights-only behavior (use when
+changing LR/schedule or resuming across a different GPU count / device topology).
+A dir with only adapter weights (a pre-Session-7 checkpoint or a foreign PEFT
+adapter) falls back to weights-only automatically. Helpers
+`save_trainer_state()`/`load_trainer_state()`/`restore_optimizer_state()` are
+shared (DDP imports them); under `--parallel split` `restore_optimizer_state`
+moves each AdamW tensor onto its param's device (params span GPUs); under DDP
+every rank loads the same rank-0 state (ranks are identical after each
+all-reduce). `torch.load(weights_only=False)` since it's our own trusted file.
+**Write-confirmed only** (no torch in the container) — smoke a stop/resume on the
+box: run a few steps with `--checkpoint-every`, Ctrl-C, then `--resume
+<out>` and confirm the printed `continuing at step N` + LR match where it stopped.
 
 **Re "was it still only saving the lowest held-out val?" — diagnosis (no
 regression):** saving the lowest val is **opt-in via `--save-best`**, not the
