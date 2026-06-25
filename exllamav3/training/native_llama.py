@@ -373,7 +373,7 @@ class NativeLlamaQLoRA(nn.Module):
         return bias
 
     def _block_forward(self, meta, entry, hidden, position_ids, attn_bias,
-                       use_flash=False):
+                       attn_mode="eager"):
         bsz, t, _ = hidden.shape
         nq, nkv, hd = meta["num_q_heads"], meta["num_kv_heads"], meta["head_dim"]
 
@@ -396,14 +396,15 @@ class NativeLlamaQLoRA(nn.Module):
         q = self._apply_rope(q, meta["inv_freq"], meta["attn_factor"], position_ids)
         k = self._apply_rope(k, meta["inv_freq"], meta["attn_factor"], position_ids)
 
-        if use_flash:
+        if attn_mode == "flash":
             # FlashAttention-2 (autograd-capable upstream flash_attn): O(t) memory,
             # never materializes the [b, nq, t, t] score matrix. Takes [b, t, nh, hd]
             # (no transpose), handles GQA (nkv < nq) and the causal / sliding-window
             # mask and softcap via flags -- so the eager [t, t] bias is not built at
             # all. Right-padding (collate) means a real-token query never attends to
             # trailing pad keys under `causal`, matching the eager mask for every
-            # loss-bearing position. Runs in compute_dtype (fp16/bf16).
+            # loss-bearing position. FA2 supports head_dim <= 256; larger heads take
+            # the SDPA branch. Runs in compute_dtype (fp16/bf16).
             window = meta["sliding_window"]
             ws = (window - 1, 0) if window and window > 0 else (-1, -1)
             o = _flash_attn_func()(
@@ -412,6 +413,17 @@ class NativeLlamaQLoRA(nn.Module):
                 window_size=ws, softcap=float(meta["softcap"] or 0.0),
             )                                                   # [b, t, nq, hd]
             ctx = o.reshape(bsz, t, nq * hd).float()
+        elif attn_mode == "sdpa":
+            # head_dim > 256 (e.g. Gemma global layers): FA2 can't, but torch SDPA's
+            # memory-efficient backend handles large heads and is differentiable and
+            # O(t) -- so these layers don't re-impose the t^2 peak. Used only for the
+            # full-causal, no-softcap case (chosen in forward()); GQA via enable_gqa.
+            qh, kh, vh = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            o = F.scaled_dot_product_attention(
+                qh.to(self.compute_dtype), kh.to(self.compute_dtype), vh.to(self.compute_dtype),
+                is_causal=True, scale=meta["sm_scale"], enable_gqa=(nq != nkv),
+            )                                                   # [b, nq, t, hd]
+            ctx = o.transpose(1, 2).reshape(bsz, t, nq * hd).float()
         else:
             # Eager reference: materializes [b, nq, t, t]. [b, n_heads, t, hd]
             q = q.transpose(1, 2)
@@ -494,17 +506,30 @@ class NativeLlamaQLoRA(nn.Module):
         if ckpt and not hidden.requires_grad:
             hidden = hidden.detach().requires_grad_(True)
 
-        # FlashAttention is used only on CUDA in fp16/bf16 (its kernels need both);
-        # fp32 / CPU / gradcheck fall back to the eager reference. When flash is
-        # active the [t, t] mask is handled by causal/window flags, so the eager
-        # bias is never built -- that omission is what realizes the O(t²) saving.
-        use_flash = (self._flash_ok and hidden.is_cuda
-                     and self.compute_dtype in (torch.float16, torch.bfloat16))
+        # Memory-efficient attention is used only on CUDA in fp16/bf16 (the kernels
+        # need both); fp32 / CPU / gradcheck fall back to eager. The mode is chosen
+        # PER BLOCK because Gemma mixes head sizes: FA2 (head_dim <= 256) covers the
+        # sliding/full layers, SDPA covers head_dim > 256 full-causal layers (still
+        # O(t)), and eager is the fallback. Only eager blocks build the [t, t] bias
+        # -- skipping it for flash/sdpa is what realizes the O(t²) saving.
+        mem_eff = (self._flash_ok and hidden.is_cuda
+                   and self.compute_dtype in (torch.float16, torch.bfloat16))
 
-        # Attention bias per (window, device): Gemma alternates sliding-window and
-        # full-causal layers, so each distinct window needs its own mask; plain
-        # archs have a single window (-1) and this builds one bias per device,
-        # same as before. Cached so it is built at most once per (window, device).
+        def block_attn_mode(meta):
+            if not mem_eff:
+                return "eager"
+            hd = meta["head_dim"]
+            if hd <= 256 and hd % 8 == 0:
+                return "flash"
+            # head_dim > 256: FA2 unsupported. SDPA handles big heads + GQA but has
+            # no window/softcap knobs, so only the plain full-causal case goes there.
+            if meta["sliding_window"] <= 0 and not meta["softcap"]:
+                return "sdpa"
+            return "eager"
+
+        # Attention bias per (window, device) for eager blocks only. Gemma alternates
+        # sliding/full layers, so each distinct window needs its own mask; plain
+        # archs have a single window (-1). Cached: built at most once per key.
         bias_cache: dict = {}
 
         def get_bias(window, dev):
@@ -524,15 +549,16 @@ class NativeLlamaQLoRA(nn.Module):
                 hidden = backbone.to_device(hidden, dev)
                 position_ids = backbone.to_device(position_ids, dev)
                 cur_device = dev
-            attn_bias = None if use_flash else get_bias(meta["sliding_window"], dev)
+            mode = block_attn_mode(meta)
+            attn_bias = get_bias(meta["sliding_window"], dev) if mode == "eager" else None
             if ckpt:
                 hidden = torch.utils.checkpoint.checkpoint(
                     self._block_forward, meta, entry, hidden, position_ids, attn_bias,
-                    use_flash, use_reentrant=False,
+                    mode, use_reentrant=False,
                 )
             else:
                 hidden = self._block_forward(meta, entry, hidden, position_ids,
-                                             attn_bias, use_flash)
+                                             attn_bias, mode)
 
         # Final norm + head live on the output device (the last split device).
         hidden = backbone.to_device(hidden, self.device)

@@ -718,12 +718,27 @@ training path now uses the upstream **`flash_attn` package's autograd-capable
   roughly 4–8× more context (or batch) on the same card in the t=4k–16k range.
   Flash does NOT touch the residual-stream checkpoints (`~layers · b · t · d · 4`),
   which become the next term at extreme context.
+- **Per-block mode (Gemma mixes head sizes).** FA2 only supports `head_dim <= 256`,
+  but Gemma4's *global* layers exceed that. So the mode is chosen per block:
+  **flash** (head_dim ≤ 256, % 8 — the sliding/local layers), **SDPA**
+  (`F.scaled_dot_product_attention`, head_dim > 256 full-causal no-softcap — keeps
+  the big-head global layers O(t) too, so they don't re-impose the t² peak), else
+  **eager**. Only eager blocks build the `[t, t]` bias.
 - **Validation:** the default fp32 `qlora_validate_native.py` exercises *eager*
-  (flash needs fp16/bf16). To validate the flash path, run it with
-  `--compute-dtype bfloat16` and confirm logits parity vs native; expect a slightly
-  looser match than fp32 eager (bf16 + flash accumulation), still high argmax
-  agreement. Caveats: flash needs `head_dim <= 256` & multiple of 8 (Gemma's 256
-  is fine), and relies on right-padding (which `collate` guarantees).
+  (mem-efficient kernels need fp16/bf16). To validate flash+SDPA, run with
+  `--compute-dtype bfloat16`; expect a slightly looser match than fp32 eager, still
+  high argmax agreement. Relies on right-padding (which `collate` guarantees).
+
+**Two upstream Gemma4 native-forward fixes (needed for the validate oracle / live
+sampling on GPU, hit while running the gate on gemma-4-12B):**
+- `architecture/gemma4.py` `_prepare_noncausal_mm_spans`: built boundary tensors
+  with CPU literals and cat'd them with a CUDA tensor → device-mismatch crash on
+  any GPU text forward. Now built on `ids.device`.
+- `modules/attn.py`: the no-cache SDPA fallback (taken for `head_dim > 256` since
+  the `bighead` kernel is paged/cache-only) returns a transposed, non-contiguous
+  `[b, t, nh, hd]`; `o.view(...)` → `o.reshape(...)` in both `decode_flash_attn`
+  paths. (xformers is NOT required — it's optional and was ABI-mismatched in the
+  venv; the SDPA fallback is correct, just slower.)
 
 Status: write-confirmed, compiles, CPU logic checks pass (eager unchanged; flash
 is GPU-only so the CPU suite still covers the eager reference). NOT yet run on GPU.
