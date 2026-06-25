@@ -461,7 +461,8 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
 
 
 def build_lm_examples(tokenizer, dataset_name, split, seq_len,
-                      text_key="text", max_samples=0, config_name=None):
+                      text_key="text", max_samples=0, config_name=None,
+                      max_blocks=0):
     """Plain-text language-modeling eval set (e.g. wikitext) for a second,
     task-independent held-out loss.
 
@@ -518,6 +519,12 @@ def build_lm_examples(tokenizer, dataset_name, split, seq_len,
             if add_block_bos:
                 block = [bos] + block
             examples.append({"input_ids": block, "labels": list(block)})
+            # Cap the number of packed blocks directly (independent of seq_len),
+            # so eval2 can be sized to roughly match the primary eval set rather
+            # than ballooning -- max_samples only caps source rows, which is
+            # unpredictable after packing.
+            if max_blocks and len(examples) >= max_blocks:
+                return examples
     return examples
 
 
@@ -623,10 +630,13 @@ def main():
                          "the mistral3 arch, e.g. Mistral-Medium-3.5). metharme: "
                          "Pygmalion <|user|>{q}<|model|>{a}</s>. EOS ends the turn "
                          "for mistral/metharme.")
+    ap.add_argument("--clean-text", action="store_true",
+                    help="Strip [stage directions]/*actions* and normalize "
+                         "whitespace before training (OFF by default). Helps "
+                         "play-script style sets; leave off for reasoning / code / "
+                         "markdown data, where brackets and structure are content.")
     ap.add_argument("--no-clean-text", action="store_true",
-                    help="Disable stripping of [stage directions]/*actions* and "
-                         "whitespace normalization (on by default; helps play-script "
-                         "style sets, leave off for code/markdown datasets)")
+                    help=argparse.SUPPRESS)  # deprecated: cleaning is now opt-in
     ap.add_argument("--min-response-words", type=int, default=3,
                     help="Drop rows whose cleaned response is shorter than this")
     ap.add_argument("--uppercase-response", action="store_true",
@@ -729,6 +739,13 @@ def main():
                          "using the same instruction/messages keys.")
     ap.add_argument("--eval2-max-samples", type=int, default=0,
                     help="Cap source rows for --eval2-dataset (0 = all).")
+    ap.add_argument("--eval2-max-blocks", type=int, default=0,
+                    help="Cap the number of packed LM blocks for --eval2-text-key "
+                         "(0 = all). Use this to size eval2 to roughly match the "
+                         "primary eval set (e.g. wikitext packs into far more "
+                         "blocks than your test set has examples); --eval2-max-"
+                         "samples caps source rows, which is unpredictable after "
+                         "packing.")
     ap.add_argument("--val-frac", type=float, default=0.0,
                     help="Hold out this fraction of train for held-out eval loss "
                          "(deterministic; the SAME split as qlora_train_bnb.py "
@@ -747,6 +764,13 @@ def main():
                          "peak VRAM, ...). Written on normal finish AND on Ctrl-C. "
                          "Empty string disables.")
     args = ap.parse_args()
+
+    # Text cleaning is opt-in (--clean-text). --no-clean-text is the old default
+    # and now a no-op, kept so existing commands don't break.
+    if args.no_clean_text:
+        print(" -- note: --no-clean-text is deprecated; cleaning is now OFF by "
+              "default. Drop the flag, or use --clean-text to enable cleaning.")
+    clean_text = args.clean_text
 
     cdt = {"float32": torch.float32, "float16": torch.float16,
            "bfloat16": torch.bfloat16}[args.compute_dtype]
@@ -806,7 +830,7 @@ def main():
         model, tokenizer, args.dataset, args.max_samples, args.seq_len,
         instruction_key=args.instruction_key, context_key=args.context_key,
         response_key=args.response_key, split=args.dataset_split,
-        clean_text=not args.no_clean_text,
+        clean_text=clean_text,
         min_response_words=args.min_response_words,
         uppercase_response=args.uppercase_response,
         messages_key=args.messages_key,
@@ -857,7 +881,7 @@ def main():
             model, tokenizer, args.eval_dataset or args.dataset, 0, args.seq_len,
             instruction_key=args.instruction_key, context_key=args.context_key,
             response_key=args.response_key, split=args.eval_split,
-            clean_text=not args.no_clean_text,
+            clean_text=clean_text,
             min_response_words=args.min_response_words,
             uppercase_response=args.uppercase_response,
             messages_key=args.messages_key,
@@ -882,14 +906,14 @@ def main():
             val2_examples = build_lm_examples(
                 tokenizer, args.eval2_dataset, args.eval2_split, args.seq_len,
                 text_key=args.eval2_text_key, max_samples=args.eval2_max_samples,
-                config_name=args.eval2_config)
+                config_name=args.eval2_config, max_blocks=args.eval2_max_blocks)
             kind = f"LM blocks over '{args.eval2_text_key}'"
         else:
             val2_examples = build_sft_examples(
                 model, tokenizer, args.eval2_dataset, args.eval2_max_samples,
                 args.seq_len, instruction_key=args.instruction_key,
                 context_key=args.context_key, response_key=args.response_key,
-                split=args.eval2_split, clean_text=not args.no_clean_text,
+                split=args.eval2_split, clean_text=clean_text,
                 min_response_words=args.min_response_words,
                 uppercase_response=args.uppercase_response,
                 messages_key=args.messages_key, prompt_format=args.prompt_format,
