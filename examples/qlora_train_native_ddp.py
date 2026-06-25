@@ -418,6 +418,43 @@ def main():
     # Start the training timer + VRAM peak after the baseline eval.
     t0 = time.time()
     torch.cuda.reset_peak_memory_stats(device)
+
+    def log_run(status, dt, final_val, final_eval2, sup_tok_s, tot_tok_s):
+        # Rank 0 writes one CSV row (same schema as the single-GPU arm). tok/s are
+        # passed in: the caller has the all-reduced totals at normal finish, or a
+        # per-rank x world_size estimate on interrupt (no collective there).
+        if not is_main(rank):
+            return
+        rnd = lambda x, n=6: round(x, n) if isinstance(x, (int, float)) else ""
+        append_run_log(args.run_log, {
+            "timestamp": run_started, "arm": "exl3-native-ddp", "status": status,
+            "model": args.model, "arch": getattr(config, "architecture", ""),
+            "out": args.out, "dataset": args.dataset,
+            "eval_split": args.eval_split or "", "eval_dataset": args.eval_dataset or "",
+            "eval2_dataset": args.eval2_dataset or "",
+            "r": args.r, "alpha": args.alpha, "lr": args.lr,
+            "scheduler": args.scheduler, "warmup_steps": warmup_steps,
+            "weight_decay": args.weight_decay, "batch": args.batch,
+            "grad_accum": args.grad_accum, "world_size": world_size,
+            "eff_batch": eff_batch, "epochs": args.epochs,
+            "steps_planned": args.steps, "steps_done": step, "seq_len": args.seq_len,
+            "targets": " ".join(net.target_modules), "compute_dtype": args.compute_dtype,
+            "attn_impl": args.attn_impl, "parallel": "ddp",
+            "shuffle": int(bool(args.shuffle)), "max_samples": args.max_samples,
+            "train_embeddings": int(bool(args.train_embeddings)),
+            "train_head": int(bool(args.train_head)), "prompt_format": args.prompt_format,
+            "trainable_params": net.num_trainable(), "n_train": len(examples),
+            "n_val": len(val_examples), "n_eval2": len(val2_examples),
+            "start_loss": rnd(start_loss), "end_loss": rnd(end_loss),
+            "best_val": rnd(best_val) if best_val != float("inf") else "",
+            "best_val_step": best_val_step or "",
+            "final_val": rnd(final_val), "final_eval2": rnd(final_eval2),
+            "total_s": rnd(dt, 1), "s_per_step": rnd(dt / step, 4) if step else "",
+            "sup_tok_s": round(sup_tok_s) if sup_tok_s else "",
+            "tot_tok_s": round(tot_tok_s) if tot_tok_s else "",
+            "peak_vram_gb": rnd(torch.cuda.max_memory_allocated(device) / 1e9, 3),
+            "notes": "",
+        })
     try:
         for step in range(1, args.steps + 1):
             step_t0 = time.time()
