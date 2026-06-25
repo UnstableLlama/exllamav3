@@ -267,6 +267,10 @@ def build_lm_examples(tok, dataset_name, split, seq_len, text_key="text",
         ds = ds.select(range(max_samples))
 
     bos = tok.bos_token_id
+    # One leading BOS per block (independent sequence), only for models that use
+    # one -- gated on bos_token_id like the EXL3 arm so both pack identically.
+    add_block_bos = bos is not None
+    content_len = seq_len - 1 if add_block_bos else seq_len
     buf, examples = [], []
     for row in ds:
         text = row.get(text_key) or ""
@@ -276,9 +280,11 @@ def build_lm_examples(tok, dataset_name, split, seq_len, text_key="text",
         if bos is not None and ids and ids[0] == bos:
             ids = ids[1:]
         buf.extend(ids)
-        while len(buf) >= seq_len:
-            block = buf[:seq_len]
-            buf = buf[seq_len:]
+        while len(buf) >= content_len:
+            block = buf[:content_len]
+            buf = buf[content_len:]
+            if add_block_bos:
+                block = [bos] + block
             examples.append({"input_ids": block, "labels": list(block)})
     return examples
 

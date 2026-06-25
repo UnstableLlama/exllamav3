@@ -416,6 +416,13 @@ def build_lm_examples(tokenizer, dataset_name, split, seq_len,
         ds = ds.select(range(max_samples))
 
     bos = tokenizer.bos_token_id
+    # Each packed block is scored as an independent sequence (batch-1, no KV
+    # carryover), so it should begin like a real sequence does. Match how the SFT
+    # path / the model expects input: exactly one leading BOS -- but only for
+    # models that actually use one (bos_token_id is None, e.g. Qwen -> none). The
+    # block stays seq_len long: one BOS + (seq_len-1) content tokens.
+    add_block_bos = bos is not None
+    content_len = seq_len - 1 if add_block_bos else seq_len
     buf, examples = [], []
     for row in ds:
         text = row.get(text_key) or ""
@@ -423,14 +430,16 @@ def build_lm_examples(tokenizer, dataset_name, split, seq_len,
             continue
         ids = tokenizer.encode(text, add_bos=False,
                                encode_special_tokens=False)[0].tolist()
-        # The tokenizer may auto-prepend BOS; drop it so packing doesn't inject a
-        # BOS at every row boundary (mid-stream BOS would distort the LM loss).
+        # Drop any BOS the tokenizer auto-prepended; we re-add exactly one per
+        # block below, never mid-stream.
         if bos is not None and ids and ids[0] == bos:
             ids = ids[1:]
         buf.extend(ids)
-        while len(buf) >= seq_len:
-            block = buf[:seq_len]
-            buf = buf[seq_len:]
+        while len(buf) >= content_len:
+            block = buf[:content_len]
+            buf = buf[content_len:]
+            if add_block_bos:
+                block = [bos] + block
             examples.append({"input_ids": block, "labels": list(block)})
     return examples
 
