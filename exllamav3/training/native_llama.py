@@ -48,6 +48,28 @@ from .qlora_linear import EXL3LoRAFunction
 from .fused_ce import fused_linear_cross_entropy, DEFAULT_CHUNK, IGNORE_INDEX
 
 
+# FlashAttention-2 fast path. exllamav3's own FA2 usage is inference-only
+# (@torch.inference_mode kernels), so we use the upstream `flash_attn` package's
+# autograd-capable flash_attn_func instead -- it has a real backward. Imported
+# lazily and cached: the import pulls a CUDA extension, so it must not run at
+# module-import time (CPU tests / no-GPU boxes). Returns None when unavailable,
+# in which case the forward falls back to eager attention.
+_FLASH_FN = None
+_FLASH_TRIED = False
+
+
+def _flash_attn_func():
+    global _FLASH_FN, _FLASH_TRIED
+    if not _FLASH_TRIED:
+        _FLASH_TRIED = True
+        try:
+            from flash_attn import flash_attn_func
+            _FLASH_FN = flash_attn_func
+        except Exception:
+            _FLASH_FN = None
+    return _FLASH_FN
+
+
 DEFAULT_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
                           "gate_proj", "up_proj", "down_proj"]
 
@@ -168,11 +190,26 @@ class NativeLlamaQLoRA(nn.Module):
         gradient_checkpointing: bool = True,
         train_embeddings: bool = False,
         train_head: bool = False,
+        attn_impl: str = "auto",
     ):
         super().__init__()
         self.model = model
         self.compute_dtype = compute_dtype
         self.gradient_checkpointing = gradient_checkpointing
+        # Attention implementation. "auto": use FlashAttention-2 when the
+        # flash_attn package imports AND the run is on CUDA in fp16/bf16 (decided
+        # per-forward), else eager. "flash": require it. "eager": never (the
+        # reference path; fp32 / CPU / gradcheck always land here).
+        self.attn_impl = attn_impl
+        _fn = _flash_attn_func()
+        if attn_impl == "flash":
+            assert _fn is not None, \
+                "attn_impl='flash' but the flash_attn package is not importable"
+            self._flash_ok = True
+        elif attn_impl == "eager":
+            self._flash_ok = False
+        else:
+            self._flash_ok = _fn is not None
         targets = set(target_modules) if target_modules is not None else set(DEFAULT_TARGET_MODULES)
         self.target_modules = sorted(targets)
         self.r = r
@@ -335,7 +372,8 @@ class NativeLlamaQLoRA(nn.Module):
             bias = bias.masked_fill(key_pad, neg)
         return bias
 
-    def _block_forward(self, meta, entry, hidden, position_ids, attn_bias):
+    def _block_forward(self, meta, entry, hidden, position_ids, attn_bias,
+                       use_flash=False):
         bsz, t, _ = hidden.shape
         nq, nkv, hd = meta["num_q_heads"], meta["num_kv_heads"], meta["head_dim"]
 
@@ -358,23 +396,40 @@ class NativeLlamaQLoRA(nn.Module):
         q = self._apply_rope(q, meta["inv_freq"], meta["attn_factor"], position_ids)
         k = self._apply_rope(k, meta["inv_freq"], meta["attn_factor"], position_ids)
 
-        # [b, n_heads, t, hd]
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        if nq != nkv:                                            # GQA: expand KV groups
-            rep = nq // nkv
-            k = k.repeat_interleave(rep, dim=1)
-            v = v.repeat_interleave(rep, dim=1)
+        if use_flash:
+            # FlashAttention-2 (autograd-capable upstream flash_attn): O(t) memory,
+            # never materializes the [b, nq, t, t] score matrix. Takes [b, t, nh, hd]
+            # (no transpose), handles GQA (nkv < nq) and the causal / sliding-window
+            # mask and softcap via flags -- so the eager [t, t] bias is not built at
+            # all. Right-padding (collate) means a real-token query never attends to
+            # trailing pad keys under `causal`, matching the eager mask for every
+            # loss-bearing position. Runs in compute_dtype (fp16/bf16).
+            window = meta["sliding_window"]
+            ws = (window - 1, 0) if window and window > 0 else (-1, -1)
+            o = _flash_attn_func()(
+                q.to(self.compute_dtype), k.to(self.compute_dtype), v.to(self.compute_dtype),
+                softmax_scale=meta["sm_scale"], causal=True,
+                window_size=ws, softcap=float(meta["softcap"] or 0.0),
+            )                                                   # [b, t, nq, hd]
+            ctx = o.reshape(bsz, t, nq * hd).float()
+        else:
+            # Eager reference: materializes [b, nq, t, t]. [b, n_heads, t, hd]
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            if nq != nkv:                                       # GQA: expand KV groups
+                rep = nq // nkv
+                k = k.repeat_interleave(rep, dim=1)
+                v = v.repeat_interleave(rep, dim=1)
 
-        scores = torch.matmul(q, k.transpose(-1, -2)) * meta["sm_scale"]  # [b,nq,t,t]
-        softcap = meta["softcap"]
-        if softcap:                                              # tanh logit softcap (Gemma2)
-            scores = softcap * torch.tanh(scores / softcap)
-        scores = scores + attn_bias.to(scores.dtype)
-        probs = torch.softmax(scores, dim=-1)
-        ctx = torch.matmul(probs, v)                            # [b,nq,t,hd]
-        ctx = ctx.transpose(1, 2).reshape(bsz, t, nq * hd)
+            scores = torch.matmul(q, k.transpose(-1, -2)) * meta["sm_scale"]  # [b,nq,t,t]
+            softcap = meta["softcap"]
+            if softcap:                                         # tanh logit softcap (Gemma2)
+                scores = softcap * torch.tanh(scores / softcap)
+            scores = scores + attn_bias.to(scores.dtype)
+            probs = torch.softmax(scores, dim=-1)
+            ctx = torch.matmul(probs, v)                        # [b,nq,t,hd]
+            ctx = ctx.transpose(1, 2).reshape(bsz, t, nq * hd)
         attn_out = entry.o_proj(ctx).float()
         # Sandwich post-norm (Gemma): x = x + post_norm(attn_out). Plain pre-norm
         # archs have no post-norm -> straight residual add.
@@ -439,6 +494,13 @@ class NativeLlamaQLoRA(nn.Module):
         if ckpt and not hidden.requires_grad:
             hidden = hidden.detach().requires_grad_(True)
 
+        # FlashAttention is used only on CUDA in fp16/bf16 (its kernels need both);
+        # fp32 / CPU / gradcheck fall back to the eager reference. When flash is
+        # active the [t, t] mask is handled by causal/window flags, so the eager
+        # bias is never built -- that omission is what realizes the O(t²) saving.
+        use_flash = (self._flash_ok and hidden.is_cuda
+                     and self.compute_dtype in (torch.float16, torch.bfloat16))
+
         # Attention bias per (window, device): Gemma alternates sliding-window and
         # full-causal layers, so each distinct window needs its own mask; plain
         # archs have a single window (-1) and this builds one bias per device,
@@ -462,14 +524,15 @@ class NativeLlamaQLoRA(nn.Module):
                 hidden = backbone.to_device(hidden, dev)
                 position_ids = backbone.to_device(position_ids, dev)
                 cur_device = dev
-            attn_bias = get_bias(meta["sliding_window"], dev)
+            attn_bias = None if use_flash else get_bias(meta["sliding_window"], dev)
             if ckpt:
                 hidden = torch.utils.checkpoint.checkpoint(
                     self._block_forward, meta, entry, hidden, position_ids, attn_bias,
-                    use_reentrant=False,
+                    use_flash, use_reentrant=False,
                 )
             else:
-                hidden = self._block_forward(meta, entry, hidden, position_ids, attn_bias)
+                hidden = self._block_forward(meta, entry, hidden, position_ids,
+                                             attn_bias, use_flash)
 
         # Final norm + head live on the output device (the last split device).
         hidden = backbone.to_device(hidden, self.device)

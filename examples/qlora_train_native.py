@@ -512,6 +512,12 @@ def main():
     ap.add_argument("--compute-dtype", default="bfloat16",
                     choices=["float32", "float16", "bfloat16"])
     ap.add_argument("--no-grad-ckpt", action="store_true")
+    ap.add_argument("--attn-impl", choices=["auto", "eager", "flash"], default="auto",
+                    help="Attention kernel: auto (FlashAttention-2 when the "
+                         "flash_attn package is importable and the run is CUDA "
+                         "fp16/bf16, else eager), flash (require it), or eager "
+                         "(the reference; O(t^2) memory). Flash is O(t) memory -- "
+                         "the lever for long-context training.")
     ap.add_argument("--ce-chunk", type=int, default=1024)
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
     ap.add_argument("--sample-every", type=int, default=25,
@@ -598,6 +604,7 @@ def main():
         model, r=args.r, alpha=args.alpha, target_modules=args.targets,
         compute_dtype=cdt, gradient_checkpointing=not args.no_grad_ckpt,
         train_embeddings=args.train_embeddings, train_head=args.train_head,
+        attn_impl=args.attn_impl,
     )
     net.train()
     if args.resume:

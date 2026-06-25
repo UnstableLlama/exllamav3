@@ -694,6 +694,40 @@ norm-then-RoPE, mathematically equal) — the validate gate is what confirms it 
 real weights. Gemma4's `sm_scale=1.0` (vs Gemma2/3 `query_pre_attn_scalar**-0.5`)
 is read from the module, so no special-casing — but eyeball it in validation.
 
+#### FlashAttention-2 fast path (long-context training)
+
+The native block forward was **eager** — it materialized the `[b, n_q, t, t]`
+score matrix in fp32 — which is the O(t²) memory wall at long context.
+exllamav3's own FA2 is inference-only (`@torch.inference_mode` kernels), so the
+training path now uses the upstream **`flash_attn` package's autograd-capable
+`flash_attn_func`** instead (already installed in the qlora-venv, 2.8.3).
+
+- `native_llama._block_forward` gained a `use_flash` branch: flash takes
+  `[b, t, nh, hd]` directly (no transpose / no GQA expand), and the causal mask,
+  Gemma sliding window (`window_size=(W-1, 0)`) and softcap go through flags — so
+  the eager `[t, t]` bias is **not built** when flash is active (that omission is
+  what realizes the saving). Eager stays as the reference / CPU / fp32 / gradcheck
+  path.
+- `--attn-impl {auto,eager,flash}` on both trainers + the validate script
+  (`NativeLlamaQLoRA(attn_impl=...)`). **auto** = flash when the package imports
+  AND the run is CUDA fp16/bf16, decided per-forward; fp32 / CPU always run eager.
+- **VRAM saved ≈ ~2 × b · n_q · t² · 4 bytes** (the eliminated score matrix +
+  softmax). With grad-checkpointing on (default) that is the **per-block** peak —
+  independent of model depth / hidden size, only `b · n_q · t²`. Examples (b=1):
+  n_q=32 → ~4 GB at t=4k, ~16 GB at t=8k; n_q=16 (Gemma) → half. Net effect:
+  roughly 4–8× more context (or batch) on the same card in the t=4k–16k range.
+  Flash does NOT touch the residual-stream checkpoints (`~layers · b · t · d · 4`),
+  which become the next term at extreme context.
+- **Validation:** the default fp32 `qlora_validate_native.py` exercises *eager*
+  (flash needs fp16/bf16). To validate the flash path, run it with
+  `--compute-dtype bfloat16` and confirm logits parity vs native; expect a slightly
+  looser match than fp32 eager (bf16 + flash accumulation), still high argmax
+  agreement. Caveats: flash needs `head_dim <= 256` & multiple of 8 (Gemma's 256
+  is fine), and relies on right-padding (which `collate` guarantees).
+
+Status: write-confirmed, compiles, CPU logic checks pass (eager unchanged; flash
+is GPU-only so the CPU suite still covers the eager reference). NOT yet run on GPU.
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)
