@@ -902,20 +902,32 @@ reliance on a single best/endpoint adapter.
 scripts parse). Not yet exercised on the GPU box — smoke it with a small
 `--checkpoint-every` + `--keep-checkpoints` on the next run.
 
-**Big-run kickoff: `examples/train_gemma4_semancy.sh`** (NEW) — the gemma-4-31B-it
-QLoRA on semancy, **layer-split across 2×24GB** (`--parallel split`, single
-process — NOT ddp, which would replicate the ~17 GB base per card). Bakes in the
-Gemma4 specifics (`--sample-every 0`, `--no-clean-text`, `--messages-key`,
-`--eval-split test`, auto prompt/attn), the established r16/α32 lr1e-4 cosine
-profile, the wikitext dual-eval, and `--checkpoint-every`. Runs the
-forward-correctness gate **under the same split** first (`--check-backward`) —
-this is the first 31B Gemma4 on the device-aware split forward, so parity must be
-proven before the run. The **greedy-autosplit footgun** is the thing to watch:
-the 17 GB base fits one card, so without a per-device cap the whole model lands on
-cuda:0 and cuda:1 idles — `USE_PER_DEVICE="8 24"` caps cuda:0 near half the base
-to force the split; watch the per-card VRAM line and tune (the 262k-vocab head is
-end-heavy on cuda:1). **Not yet run** — the gate result + the held-out `test`
-floor (vs 1B ~3.09 / 12B 2.51) are the first things to record next session.
+**Big-run plan: gemma-4-31B-it on semancy, layer-split across 2×24GB**
+(`qlora_train_native.py --parallel split`, single process — NOT ddp, which would
+replicate the ~17 GB base per card). The recommended invocation reuses the
+established r16/α32 lr1e-4 cosine profile + the Gemma4 specifics
+(`--sample-every 0` to avoid the SWA/recurrent cache path, `--no-clean-text`,
+`--messages-key messages`, `--eval-split test`, auto prompt/attn) + the wikitext
+dual-eval + `--checkpoint-every`. Run the forward-correctness gate **under the
+same split** first (`qlora_validate_native.py --parallel split --use-per-device
+8 24 --check-backward`) — first 31B Gemma4 on the device-aware split forward, so
+prove parity before the run. **Greedy-autosplit footgun:** the 17 GB base fits
+one card, so without a per-device cap the whole model lands on cuda:0 and cuda:1
+idles — `--use-per-device 8 24` caps cuda:0 near half the base to force the split;
+watch the per-card VRAM line and tune (the 262k-vocab head is end-heavy on
+cuda:1). **Not yet run** — the gate result + the held-out `test` floor (vs 1B
+~3.09 / 12B 2.51) are the first things to record next session.
+
+**MTP note:** gemma-4-31B's checkpoint may carry MTP tensors, but exllamav3's
+`gemma4.py` registers only `{"text", "vision"}` components (no `"mtp"`), so MTP is
+**not loaded** — our training path (`component="text"`) never touches it, and it's
+not wired for inference on this arch either. No special handling needed; nothing
+breaks. The real consideration is downstream: fine-tuning the trunk shifts its
+hidden states, so a *frozen* MTP draft head's speculative-acceptance rate would
+drift — retraining MTP alongside would need (a) a Gemma4 `"mtp"` component in
+exllamav3 and (b) a differentiable MTP forward + multi-token loss in our path
+(neither exists). MTP speeds up *inference* (self-speculative decoding), not
+training.
 
 ---
 
