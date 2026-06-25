@@ -398,6 +398,7 @@ def test_modules_to_save_param_groups():
     # from weight decay (decaying a whole embedding table is harmful), while LoRA
     # params keep it. Build a headless net and set only the attrs the helpers read.
     net = NativeLlamaQLoRA.__new__(NativeLlamaQLoRA)
+    torch.nn.Module.__init__(net)                       # set up _parameters/_buffers
     net._wrappers = []                                  # no LoRA wrappers here
     net.embed_weight = torch.nn.Parameter(torch.zeros(5, 3))
     net.head_weight = torch.nn.Parameter(torch.zeros(3, 5))
