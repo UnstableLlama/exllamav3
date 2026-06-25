@@ -455,6 +455,16 @@ def sample(model, cache, tokenizer, generator, build_prompt, prompt, max_new_tok
 
 
 def main():
+    # This is the single-process trainer (--parallel single|split). Launched under
+    # torchrun (RANK/WORLD_SIZE in env) it would silently run N independent copies,
+    # so redirect to the DDP entry point with a clear one-liner instead of the
+    # confusing argparse error you'd get from a stray --parallel ddp.
+    if os.environ.get("RANK") is not None or os.environ.get("WORLD_SIZE") is not None:
+        raise SystemExit(
+            "qlora_train_native.py is single-process (--parallel single|split). "
+            "For multi-GPU DDP under torchrun use examples/qlora_train_native_ddp.py "
+            "(note: --lora-r not --r; no --parallel / --sample-every)."
+        )
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="Path to a local EXL3 model dir")
     ap.add_argument("--out", default="out/exl3_qlora_adapter")
