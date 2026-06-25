@@ -357,12 +357,12 @@ def main():
     best_val = float("inf")
     best_val_step = 0
     start_loss = end_loss = None
+    start_val = start_eval2 = None
     last_eval_step, last_val, last_eval2 = -1, None, None
     tok_seen, tot_seen, t0 = 0, 0, time.time()
     run_started = datetime.datetime.now().isoformat(timespec="seconds")
     status = "completed"
     meter = ThroughputMeter()
-    torch.cuda.reset_peak_memory_stats(device)
 
     def log_run(status, dt, final_val, final_eval2, sup_tok_s, tot_tok_s):
         # Rank 0 writes one CSV row (same schema as the single-GPU arm). tok/s are
@@ -393,6 +393,7 @@ def main():
             "start_loss": rnd(start_loss), "end_loss": rnd(end_loss),
             "best_val": rnd(best_val) if best_val != float("inf") else "",
             "best_val_step": best_val_step or "",
+            "start_val": rnd(start_val), "start_eval2": rnd(start_eval2),
             "final_val": rnd(final_val), "final_eval2": rnd(final_eval2),
             "total_s": rnd(dt, 1), "s_per_step": rnd(dt / step, 4) if step else "",
             "sup_tok_s": round(sup_tok_s) if sup_tok_s else "",
@@ -400,6 +401,23 @@ def main():
             "peak_vram_gb": rnd(torch.cuda.max_memory_allocated(device) / 1e9, 3),
             "notes": "",
         })
+
+    # Baseline eval at step 0 (no-op adapter = base model); all ranks compute in
+    # lockstep, rank 0 prints. Reference point for the trained numbers.
+    if val_examples or val2_examples:
+        start_val = evaluate()
+        start_eval2 = eval_loss(val2_examples)
+        if is_main(rank):
+            parts = []
+            if start_val is not None:
+                parts.append(f"held-out {start_val:.4f}")
+            if start_eval2 is not None:
+                parts.append(f"{eval2_label} {start_eval2:.4f}")
+            print("    [eval] step 0 (baseline): " + " | ".join(parts))
+
+    # Start the training timer + VRAM peak after the baseline eval.
+    t0 = time.time()
+    torch.cuda.reset_peak_memory_stats(device)
     try:
         for step in range(1, args.steps + 1):
             step_t0 = time.time()

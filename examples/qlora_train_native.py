@@ -90,7 +90,7 @@ RUN_LOG_FIELDS = [
     "max_samples", "train_embeddings", "train_head", "prompt_format",
     "trainable_params", "n_train", "n_val", "n_eval2",
     "start_loss", "end_loss", "best_val", "best_val_step",
-    "final_val", "final_eval2",
+    "start_val", "start_eval2", "final_val", "final_eval2",
     "total_s", "s_per_step", "sup_tok_s", "tot_tok_s", "peak_vram_gb",
     "notes",
 ]
@@ -99,12 +99,21 @@ RUN_LOG_FIELDS = [
 def append_run_log(path, record):
     """Append one run's metadata as a row to a CSV (header written once on
     create). Pure stdlib so the DDP script imports it and the BNB arm inlines a
-    copy. Keys outside RUN_LOG_FIELDS are ignored and missing fields left blank,
-    so the column layout is stable run-to-run."""
+    copy. Keys outside RUN_LOG_FIELDS are ignored and missing fields left blank.
+    If an existing file's header doesn't match the current schema (columns were
+    added/removed), the old file is moved aside to ``<path>.bak`` and a fresh one
+    started, so the CSV never ends up with misaligned rows."""
     if not path:
         return
     path = os.path.abspath(path)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if os.path.exists(path):
+        with open(path, newline="", encoding="utf-8") as f:
+            header = next(csv.reader(f), None)
+        if header is not None and header != RUN_LOG_FIELDS:
+            bak = path + ".bak"
+            os.replace(path, bak)
+            print(f"[run-log] schema changed; moved old log to {bak}")
     is_new = not os.path.exists(path)
     with open(path, "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=RUN_LOG_FIELDS, extrasaction="ignore")
@@ -854,13 +863,11 @@ def main():
     best_val = float("inf")
     best_val_step = 0
     start_loss = end_loss = None
+    start_val = start_eval2 = None
     last_eval_step, last_val, last_eval2 = -1, None, None
     tok_seen, tot_seen, t0 = 0, 0, time.time()
     run_started = datetime.datetime.now().isoformat(timespec="seconds")
     meter = ThroughputMeter()
-    if torch.cuda.is_available():
-        for d in active_devices:
-            torch.cuda.reset_peak_memory_stats(d)
 
     def peak_vram_gb():
         if not torch.cuda.is_available():
@@ -894,12 +901,32 @@ def main():
             "start_loss": rnd(start_loss), "end_loss": rnd(end_loss),
             "best_val": rnd(best_val) if best_val != float("inf") else "",
             "best_val_step": best_val_step or "",
+            "start_val": rnd(start_val), "start_eval2": rnd(start_eval2),
             "final_val": rnd(final_val), "final_eval2": rnd(final_eval2),
             "total_s": rnd(dt, 1), "s_per_step": rnd(dt / step, 4) if step else "",
             "sup_tok_s": round(tok_seen / dt) if dt else "",
             "tot_tok_s": round(tot_seen / dt) if dt else "",
             "peak_vram_gb": rnd(peak_vram_gb(), 3), "notes": "",
         })
+
+    # Baseline eval at step 0 (the adapter is a no-op at init, B=0, so this is the
+    # base model's held-out loss) -- a reference point for the trained numbers.
+    if val_examples or val2_examples:
+        start_val = evaluate()
+        start_eval2 = eval_loss(val2_examples) if val2_examples else None
+        parts = []
+        if start_val is not None:
+            parts.append(f"held-out {start_val:.4f}")
+        if start_eval2 is not None:
+            parts.append(f"{eval2_label} {start_eval2:.4f}")
+        print("    [eval] step 0 (baseline): " + " | ".join(parts))
+
+    # Start the training timer + VRAM peak AFTER the baseline eval so neither is
+    # counted against training throughput.
+    t0 = time.time()
+    if torch.cuda.is_available():
+        for d in active_devices:
+            torch.cuda.reset_peak_memory_stats(d)
     try:
         for step in range(1, args.steps + 1):
             step_t0 = time.time()
