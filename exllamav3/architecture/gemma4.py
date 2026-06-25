@@ -462,7 +462,14 @@ def _prepare_noncausal_mm_spans(input_ids, params):
     ids = input_ids[0]
     mask = ids >= FIRST_MM_EMBEDDING_INDEX
     change_points = torch.nonzero(mask[1:] != mask[:-1], as_tuple=True)[0] + 1
-    boundaries = torch.cat([torch.tensor([0]), change_points, torch.tensor([l])])
+    # Build the boundary literals on the same device as input_ids; otherwise the
+    # cat (and the mask[] gather below) fail when input_ids is on CUDA.
+    dev = ids.device
+    boundaries = torch.cat([
+        torch.tensor([0], device=dev),
+        change_points,
+        torch.tensor([l], device=dev),
+    ])
     values = mask[boundaries[:-1]]
     spans = [
         (int(start), int(end), bool(val))
