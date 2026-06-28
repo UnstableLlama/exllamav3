@@ -226,12 +226,6 @@ class NativeLlamaQLoRA(nn.Module):
             self._flash_ok = False
         else:
             self._flash_ok = _fn is not None
-        # FlexAttention covers the big-head (head_dim > 256) layers at O(t) memory
-        # -- the layers FA2 can't take and SDPA runs as O(t^2) math. Enabled for
-        # any non-eager impl when torch's flex_attention is importable; the
-        # big-head layers fall back to the SDPA math path otherwise (correct, but
-        # OOMs at long context). Eager/fp32/CPU validate path never reaches it.
-        self._flex_ok = (attn_impl != "eager") and (_flex_attn() is not None)
         targets = set(target_modules) if target_modules is not None else set(DEFAULT_TARGET_MODULES)
         self.target_modules = sorted(targets)
         self.r = r
@@ -420,7 +414,7 @@ class NativeLlamaQLoRA(nn.Module):
         return bias
 
     def _block_forward(self, meta, entry, hidden, position_ids, attn_bias,
-                       attn_mode="eager", pack=None, flex_mask=None):
+                       attn_mode="eager", pack=None):
         bsz, t, _ = hidden.shape
         nq, nkv, hd = meta["num_q_heads"], meta["num_kv_heads"], meta["head_dim"]
 
@@ -482,20 +476,6 @@ class NativeLlamaQLoRA(nn.Module):
                     window_size=ws, softcap=float(meta["softcap"] or 0.0),
                 )                                               # [b, t, nq, hd]
                 ctx = o.reshape(bsz, t, nq * hd).float()
-        elif attn_mode == "flex":
-            # head_dim > 256, full-causal (optionally sample-packed): FlexAttention's
-            # compiled kernel handles any head dim at O(t) memory with a block-sparse
-            # mask (causal, or block-diagonal under packing -- prebuilt in forward()),
-            # and is autograd-capable. These are the big-head Gemma global layers
-            # FA2 can't take and SDPA would otherwise run as O(t^2) math. GQA
-            # (nkv < nq) goes through enable_gqa; runs in compute_dtype.
-            flex_fn, _ = _flex_attn()
-            qh, kh, vh = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            o = flex_fn(
-                qh.to(self.compute_dtype), kh.to(self.compute_dtype), vh.to(self.compute_dtype),
-                block_mask=flex_mask, scale=meta["sm_scale"], enable_gqa=(nq != nkv),
-            )                                               # [b, nq, t, hd]
-            ctx = o.transpose(1, 2).reshape(bsz, t, nq * hd).float()
         elif attn_mode == "sdpa":
             # head_dim > 256 (e.g. Gemma global layers): FA2 can't, and at head_dim
             # > 256 torch SDPA can only use the math backend (full [nq, t, t]
@@ -598,7 +578,7 @@ class NativeLlamaQLoRA(nn.Module):
         # bound the O(t^2) scores to the longest document); windowed/softcap big-head
         # stays eager.
         if meta["sliding_window"] <= 0 and not meta["softcap"]:
-            return "flex" if self._flex_ok else "sdpa"
+            return "sdpa"
         return "eager"
 
     def _build_pack_context(self, seg_ids, attention_mask, bsz, t, device):
@@ -639,7 +619,7 @@ class NativeLlamaQLoRA(nn.Module):
         mem_eff = (self._flash_ok and is_cuda
                    and self.compute_dtype in (torch.float16, torch.bfloat16))
         counts = Counter(self._attn_mode_for(m, mem_eff) for m in self._block_meta)
-        plan = ", ".join(f"{counts[k]}×{k}" for k in ("flash", "flex", "sdpa", "eager") if counts[k])
+        plan = ", ".join(f"{counts[k]}×{k}" for k in ("flash", "sdpa", "eager") if counts[k])
         avail = "available" if _flash_attn_func() is not None else "NOT importable"
         why = "" if mem_eff else "  (eager: needs CUDA + fp16/bf16" + \
             ("" if self._flash_ok else " + flash_attn") + ")"
@@ -731,34 +711,6 @@ class NativeLlamaQLoRA(nn.Module):
                                             first_device) if (seg_ids is not None
                                                               and mem_eff) else None
 
-        # FlexAttention block-sparse mask for the big-head (head_dim > 256) layers:
-        # causal, plus the sample-packing block-diagonal constraint (a query attends
-        # only within its own document, seg_ids[q] == seg_ids[k]). Built lazily per
-        # device (constant across the big-head layers) and only when a flex block
-        # actually runs. The BlockMask stores block-level sparsity, not a dense
-        # [t, t] buffer, so it stays O(t/BLOCK)^2 -- the O(t) packing primitive for
-        # head_dim > 256, mirroring what cu_seqlens does for the flash path.
-        flex_mask_cache: dict = {}
-
-        def get_flex_mask(dev):
-            m = flex_mask_cache.get(str(dev))
-            if m is None:
-                _, create_block_mask = _flex_attn()
-                if seg_ids is not None:
-                    seg = seg_ids.to(dev)
-
-                    def mask_mod(b, h, q_idx, kv_idx):
-                        return (q_idx >= kv_idx) & (seg[b, q_idx] == seg[b, kv_idx])
-
-                    m = create_block_mask(mask_mod, bsz, None, t, t, device=dev)
-                else:
-                    def mask_mod(b, h, q_idx, kv_idx):
-                        return q_idx >= kv_idx
-
-                    m = create_block_mask(mask_mod, None, None, t, t, device=dev)
-                flex_mask_cache[str(dev)] = m
-            return m
-
         cur_device = first_device
         for meta, entry, dev in zip(self._block_meta, self.blocks, self._block_devices):
             # Cross the device boundary if this block sits on another card. All
@@ -776,11 +728,11 @@ class NativeLlamaQLoRA(nn.Module):
             if ckpt:
                 hidden = torch.utils.checkpoint.checkpoint(
                     self._block_forward, meta, entry, hidden, position_ids, attn_bias,
-                    mode, pack, flex_mask, use_reentrant=False,
+                    mode, pack, use_reentrant=False,
                 )
             else:
                 hidden = self._block_forward(meta, entry, hidden, position_ids,
-                                             attn_bias, mode, pack, flex_mask)
+                                             attn_bias, mode, pack)
 
         # Final norm + head live on the output device (the last split device).
         hidden = backbone.to_device(hidden, self.device)
