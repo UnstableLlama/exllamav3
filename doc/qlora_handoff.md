@@ -1007,7 +1007,7 @@ training.
 
 ---
 
-### Session 8 — big-head (head_dim > 256) layers OOM at long context → per-document SDPA
+### Session 8 — big-head (head_dim > 256) layers OOM at long context → ride mem-efficient SDPA
 
 > Symptom: gemma-4-12B 3bpw, `--parallel split` 2×24GB, `--seq-len 8192 --pack`,
 > batch 1 — OOM at the **first training step** (baseline eval step 0 passed). Not
@@ -1027,38 +1027,44 @@ shorter seq-len. `--pack` made it strictly worse (handed SDPA an explicit
 `[1,1,t,t]` mask, guaranteeing the math backend). Eval step 0 survived because
 eval examples aren't packed to 8192.
 
-**FlexAttention was tried first and does NOT work on a 24GB consumer card at this
-head dim.** `torch.nn.attention.flex_attention`'s Triton kernel exceeds the
-GPU shared-memory limit (`No valid triton configs … Required: 200704, Hardware
-limit: 101376`) — ~196KB needed vs ~99KB available on an Ampere/Ada consumer SM.
-Shrinking the block sizes doesn't rescue it (the backward needs more SMEM still).
-Flex may be viable on an A100-class card (164KB SMEM); it is not here.
+The Gemma global layers genuinely have a larger `global_head_dim` (`gemma4.py:63,230`
+— full layers use it, sliding layers use the smaller `head_dim`), so head_dim > 256
+on those 8 layers is real, not a metadata bug.
 
-**Fix — per-document SDPA under packing.** `_block_forward`'s `sdpa` branch now,
-when packing is active, **loops SDPA per document**: gather the non-pad tokens
-(`pack["keep"]`), and for each document span in `pack["cu_seqlens"]` run one
-`is_causal` SDPA, scattering the result back. Each document attends only to
-itself, so the materialized `[nq, L, L]` scores are bounded by the **longest
-document**, not the full packed block — head-dim-agnostic (plain math backend,
-no Triton SMEM limit), autograd-clean, **O(Σ t_doc²)** instead of O(t²). With
-~4.3 docs/block (the run's pack stats) that is roughly a 4–6× cut on the big-head
-layers; a block that happens to hold one near-full document still costs ~the full
-matrix (drop `--seq-len` to 4096 if that bites). `pack_ctx` is now passed to both
-`flash` and `sdpa` modes; the explicit `[t,t]` SDPA mask path is gone, so no
-big-head layer builds an O(t²) buffer. Non-packed big-head falls back to one full
-`is_causal` pass (right-padding makes that correct). `describe_attn()` still reads
-`40×flash, 8×sdpa`; the difference is the sdpa blocks are now per-document.
-Eager/fp32/CPU validate path is untouched (the reference); reduces bit-identically
-to the old path when no layer exceeds head_dim 256.
+**The real fix is to ride torch's MEM-EFFICIENT SDPA backend (O(t)).** That backend
+handles head_dim > 256 at O(t) memory — it is exactly how HF/Axolotl fit head_dim
+> 256 at 8k on the same hardware (confirmed: Axolotl trains 8k LoRA on 2×3090).
+Our code was being kicked off it onto the **math** backend (full `[nq, t, t]`
+scores) by two things:
+1. the old `--pack` path passed an **explicit `[t,t]` mask** to SDPA — any
+   user mask disqualifies the mem-efficient backend; and
+2. `enable_gqa=True` **also** disqualifies the mem-efficient backend on torch's
+   C++ path.
+
+`_block_forward`'s `sdpa` branch now avoids both: under packing it runs **per
+document** with `is_causal` and **no mask** (isolation via `pack["cu_seqlens"]`),
+and it **expands GQA by hand** (`repeat_interleave` KV to `nq` heads) and drops
+`enable_gqa`, so the mem-efficient backend stays eligible. Default SDPA backend
+selection then prefers it over math; if it's somehow ineligible for this head_dim,
+the per-document split keeps the math fallback bounded to the longest document
+rather than the full packed block. `pack_ctx` feeds both `flash` and `sdpa`; the
+explicit-mask path is gone. Non-packed big-head: one full `is_causal` pass (GQA
+expanded). FlexAttention was tried first and does NOT fit a 24GB consumer SM at
+this head dim (`No valid triton configs … Required: 200704, limit: 101376`) —
+removed. `describe_attn()` still reads `40×flash, 8×sdpa`. Eager/fp32/CPU validate
+path untouched (the reference).
 
 **To verify on the box (no torch in the container — write-confirmed only):**
-- The run should clear the first training step without OOM (the prior failure
-  point). Watch the per-card VRAM line.
-- `qlora_validate_native.py --compute-dtype bfloat16` — the per-document sdpa path
-  runs only in fp16/bf16, so this is its parity gate (fp32 validate stays eager).
-- If a single very long document still OOMs a block, lower `--seq-len` (4096
-  halves the worst-case per-doc scores) — per-document attention can't go below
-  the longest document on its own.
+- Should clear the first training step at `--seq-len 8192 --pack` without OOM,
+  if the mem-efficient backend serves this head_dim (the premise — Axolotl fits
+  8k on the same cards). Watch the per-card VRAM line.
+- If it STILL OOMs, the mem-efficient backend isn't engaging for this head_dim and
+  it fell back to per-document math — check `global_head_dim`, and how Axolotl runs
+  *this* arch (its sample packing uses FA2-varlen, which caps at 256, so it may
+  handle the big-head layers unpacked). Then either run unpacked or add a
+  doc-chunked manual flash for head_dim > 256.
+- `qlora_validate_native.py --compute-dtype bfloat16` — the sdpa path runs only in
+  fp16/bf16, so this is its parity gate (fp32 validate stays eager).
 
 ---
 

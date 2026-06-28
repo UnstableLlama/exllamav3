@@ -477,40 +477,52 @@ class NativeLlamaQLoRA(nn.Module):
                 )                                               # [b, t, nq, hd]
                 ctx = o.reshape(bsz, t, nq * hd).float()
         elif attn_mode == "sdpa":
-            # head_dim > 256 (e.g. Gemma global layers): FA2 can't, and at head_dim
-            # > 256 torch SDPA can only use the math backend (full [nq, t, t]
-            # scores). To keep that from re-imposing the t^2 peak at long context,
-            # run SDPA PER DOCUMENT under packing: each document attends only to
-            # itself (is_causal), so the materialized scores are bounded by the
-            # longest document, not the whole packed block. GQA via enable_gqa;
-            # compute_dtype. Non-packed (pack is None) falls back to one full
-            # is_causal pass (right-padding makes that correct).
+            # head_dim > 256 (Gemma global layers): FA2 can't, but torch's
+            # MEM-EFFICIENT SDPA backend handles big heads at O(t) -- the same path
+            # HF/Axolotl ride to fit long context. Two things were forcing the O(t^2)
+            # math backend instead: (1) the old packed path passed an explicit [t,t]
+            # mask (any user mask disqualifies the mem-efficient backend), and
+            # (2) enable_gqa=True also disqualifies it on torch's C++ path. So here
+            # we (a) isolate documents by running PER DOCUMENT with is_causal and NO
+            # mask, and (b) expand GQA by hand (repeat KV to nq heads) and drop
+            # enable_gqa, so the mem-efficient backend stays eligible. Default SDPA
+            # backend selection then prefers it over math; if it's somehow ineligible
+            # for this head_dim, the per-document fallback keeps the math cost bounded
+            # to the longest document. Non-packed: one full is_causal pass.
             cd = self.compute_dtype
+            rep = nq // nkv
             if pack is not None:
                 keep = pack["keep"].to(hidden.device)           # [b, t] bool
                 cu = pack["cu_seqlens"].to(hidden.device)       # [num_docs + 1]
                 qf = q[keep].to(cd)                             # [total, nq, hd]
                 kf = k[keep].to(cd)                             # [total, nkv, hd]
                 vf = v[keep].to(cd)
+                if rep > 1:                                     # expand GQA -> nq heads
+                    kf = kf.repeat_interleave(rep, dim=1)
+                    vf = vf.repeat_interleave(rep, dim=1)
                 of = qf.new_zeros(qf.shape[0], nq, hd)
                 cul = cu.tolist()
                 for s, e in zip(cul[:-1], cul[1:]):
-                    # [1, heads, L, hd] for SDPA; isolate this document.
+                    # [1, nq, L, hd] for SDPA; isolate this document.
                     od = F.scaled_dot_product_attention(
                         qf[s:e].transpose(0, 1).unsqueeze(0),
                         kf[s:e].transpose(0, 1).unsqueeze(0),
                         vf[s:e].transpose(0, 1).unsqueeze(0),
-                        is_causal=True, scale=meta["sm_scale"], enable_gqa=(nq != nkv),
+                        is_causal=True, scale=meta["sm_scale"],
                     )                                           # [1, nq, L, hd]
                     of[s:e] = od.squeeze(0).transpose(0, 1)
                 o = q.new_zeros(bsz, t, nq, hd, dtype=of.dtype)
                 o[keep] = of
                 ctx = o.reshape(bsz, t, nq * hd).float()
             else:
-                qh, kh, vh = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+                qh = q.transpose(1, 2).to(cd)
+                kh = k.transpose(1, 2).to(cd)
+                vh = v.transpose(1, 2).to(cd)
+                if rep > 1:
+                    kh = kh.repeat_interleave(rep, dim=1)
+                    vh = vh.repeat_interleave(rep, dim=1)
                 o = F.scaled_dot_product_attention(
-                    qh.to(cd), kh.to(cd), vh.to(cd),
-                    is_causal=True, scale=meta["sm_scale"], enable_gqa=(nq != nkv),
+                    qh, kh, vh, is_causal=True, scale=meta["sm_scale"],
                 )                                               # [b, nq, t, hd]
                 ctx = o.transpose(1, 2).reshape(bsz, t, nq * hd).float()
         else:
@@ -565,18 +577,18 @@ class NativeLlamaQLoRA(nn.Module):
 
     def _attn_mode_for(self, meta, mem_eff: bool) -> str:
         """Per-block attention backend: "flash" (FA2, head_dim<=256), "sdpa"
-        (head_dim>256 full-causal no-softcap -- per-document under packing, else a
-        single full causal pass), else "eager". mem_eff gates the memory-efficient
-        kernels (CUDA + fp16/bf16)."""
+        (head_dim>256 full-causal no-softcap -- torch's mem-efficient backend, O(t),
+        per-document under packing for isolation), else "eager". mem_eff gates the
+        memory-efficient kernels (CUDA + fp16/bf16)."""
         if not mem_eff:
             return "eager"
         hd = meta["head_dim"]
         if hd <= 256 and hd % 8 == 0:
             return "flash"
-        # head_dim > 256: FA2 unsupported and SDPA can only use the math backend, so
-        # only the plain full-causal case goes there (per-document under packing to
-        # bound the O(t^2) scores to the longest document); windowed/softcap big-head
-        # stays eager.
+        # head_dim > 256 (Gemma global layers): FA2 unsupported, but torch's
+        # mem-efficient SDPA backend handles big heads at O(t). Only the plain
+        # full-causal case goes there (per-document under packing for isolation);
+        # windowed/softcap big-head stays eager.
         if meta["sliding_window"] <= 0 and not meta["softcap"]:
             return "sdpa"
         return "eager"
@@ -678,8 +690,8 @@ class NativeLlamaQLoRA(nn.Module):
         # Memory-efficient attention is used only on CUDA in fp16/bf16 (the kernels
         # need both); fp32 / CPU / gradcheck fall back to eager. The mode is chosen
         # PER BLOCK because Gemma mixes head sizes: FA2 (head_dim <= 256) covers the
-        # sliding/full layers, SDPA covers head_dim > 256 full-causal layers
-        # (per-document under packing to bound the scores to the longest document),
+        # sliding/full layers, SDPA's mem-efficient backend covers head_dim > 256
+        # full-causal layers at O(t) (per-document under packing for isolation),
         # and eager is the fallback. Only eager blocks build the [t, t] bias --
         # flash and sdpa both isolate documents via the packing descriptor instead.
         mem_eff = (self._flash_ok and hidden.is_cuda
