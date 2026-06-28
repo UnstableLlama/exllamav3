@@ -1007,6 +1007,51 @@ training.
 
 ---
 
+### Session 8 — FlexAttention for the big-head (head_dim > 256) layers (the long-context OOM)
+
+> Symptom: gemma-4-12B 3bpw, `--parallel split` 2×24GB, `--seq-len 8192 --pack`,
+> batch 1 — OOM at the **first training step** (baseline eval step 0 passed). Not
+> a weight-budget problem (12B@3bpw is ~4.5GB, split). The wall was the **8 Gemma
+> global layers** (`attn: 40×flash, 8×sdpa`).
+
+**Root cause.** Those 8 layers have **head_dim > 256**, for which there is *no*
+memory-efficient kernel in the training forward: FA2 caps at 256
+(`flash_attn_2.py`: `dim > 256 → None`), and exllamav3's `bighead_scalar` kernel
+is inference-only (needs a KV cache + `q_len < 8`, `bighead_scalar.py`). So they
+fell to `F.scaled_dot_product_attention`, which at head_dim > 256 can only pick
+the **math backend** — materializing the full `[b, nq, t, t]` fp32 score matrix.
+At `t=8192` that is multiple GB *per layer*; grad-checkpointing keeps one block
+live but a single big-head block tips the card. The old doc claim that "SDPA keeps
+the big-head layers O(t)" was wrong — it was only ever masked by running at
+shorter seq-len. `--pack` made it strictly worse (handed SDPA an explicit
+`[1,1,t,t]` mask, guaranteeing the math backend). Eval step 0 survived because
+eval examples aren't packed to 8192.
+
+**Fix — `flex` per-block mode.** New `_attn_mode_for` branch: head_dim > 256
+full-causal no-softcap layers now use **`torch.nn.attention.flex_attention`**
+(compiled Triton kernel, autograd-capable, any head dim, O(t) memory) when it
+imports, else fall back to the old `sdpa` math path. `_block_forward` gained a
+`flex` branch; `forward()` builds a **block-sparse `BlockMask`** per device —
+causal, plus the sample-packing **block-diagonal** constraint
+(`seg_ids[q] == seg_ids[k]`, the same per-document isolation cu_seqlens gives the
+flash path, but at head_dim > 256). `describe_attn()` now prints e.g.
+`attn: 40×flash, 8×flex`. Enabled for any non-eager `--attn-impl`; eager/fp32/CPU
+validate path is untouched (still the reference). Reduces bit-identically to the
+old path when no layer exceeds head_dim 256 (Llama/Qwen/Mistral → all flash, no
+flex built).
+
+**To verify on the box (no torch in the container — write-confirmed only):**
+- The `attn:` line should read `… , 8×flex` (confirms flex engaged, not the math
+  fallback). First training step pauses ~10-30s while flex compiles — not a hang.
+- `qlora_validate_native.py --compute-dtype bfloat16` — flex runs only in
+  fp16/bf16, so this is the parity gate for it (fp32 validate stays eager).
+- **Open risk:** FlexAttention's Triton kernel has shared-memory limits; if the
+  Gemma global head_dim is large enough that flex errors at compile/run, the
+  fallback is per-document `is_causal` SDPA (slice the packed block by `seg_ids`,
+  loop SDPA per doc — head-dim-agnostic math, but O(Σ t_doc²) ≪ O(t²)).
+
+---
+
 ## 0d. Multi-GPU strategy (rationale)
 
 "Multi-GPU" splits by *goal*, and QLoRA changes which tool fits, because only the
