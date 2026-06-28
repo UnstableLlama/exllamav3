@@ -159,6 +159,9 @@ def main():
                          "logits must match running each document alone (block-"
                          "diagonal attention + per-document RoPE reset). Run with "
                          "--compute-dtype bfloat16 to exercise the flash-varlen path.")
+    ap.add_argument("--skip-head-slice-check", action="store_true",
+                    help="skip the chunked-vocab head equality check (it gates "
+                         "--head-vocab-chunk; runs by default when the head can slice)")
     args = ap.parse_args()
 
     cdt = {"float32": torch.float32, "float16": torch.float16,
