@@ -31,6 +31,7 @@ from collections import Counter
 import torch
 
 from exllamav3 import Config, Model, Tokenizer
+from exllamav3.training import backbone
 from exllamav3.training.native_llama import NativeLlamaQLoRA
 
 
@@ -83,6 +84,45 @@ def check_backward(model, tokenizer, prompt, device, cdt, attn_impl="auto"):
     return ok
 
 
+def check_head_slice(net):
+    """
+    Gate the chunked-vocab head (--head-vocab-chunk): assert the column-sliced head
+    reconstruction equals the matching slice of the full reconstruction, bit-for-bit.
+    This is the GPU-only half the CPU gradcheck (tests/test_fused_ce.py) can't cover
+    -- if reconstruct_slice or the per-slice Hadamard/scale were wrong, a chunked
+    run would train against a subtly different head. Uses the same backbone seam the
+    trainer uses. SKIPs when the head can't slice (e.g. an unquantized head).
+    """
+    print("\n" + "-" * 78)
+    print("head-slice check: get_weight_tensor_slice == full reconstruction")
+    inner = net.lm_head.inner
+    if getattr(inner, "get_weight_tensor_slice", None) is None:
+        print("  SKIP -- this head does not support sliced reconstruction")
+        return True
+    sl = backbone.head_weight_slice_closure(net.lm_head)
+    slice_fn, vocab, gran = sl
+    full = backbone.head_weight_closure(net.lm_head)()        # [d, V]
+    chunk = max(gran, (min(32768, vocab) // gran) * gran)
+    # First, a middle, and the last aligned chunk -- exercise n_start=0, an interior
+    # offset, and the trailing slice.
+    starts = sorted({0,
+                     max(0, ((vocab // 2) // gran) * gran),
+                     max(0, vocab - chunk)})
+    max_d = 0.0
+    for a in starts:
+        a = min(a, vocab - chunk)
+        b = a + chunk
+        s = slice_fn(a, b - a).to(full.dtype).to(full.device)
+        max_d = max(max_d, (full[:, a:b] - s).abs().max().item())
+    del full
+    ok = max_d == 0.0
+    print(f"  vocab={vocab}, granularity={gran}, chunk={chunk}, "
+          f"slices@{starts}")
+    print(f"  max|full[:, a:b] - slice(a, b)| = {max_d:.3e}")
+    print("  head-slice check:", "PASS" if ok else "FAIL (sliced head != full head)")
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -104,6 +144,9 @@ def main():
     ap.add_argument("--prompts", nargs="*", default=None)
     ap.add_argument("--check-backward", action="store_true",
                     help="also smoke-test cross-device gradient flow (tiny adapter + backward)")
+    ap.add_argument("--skip-head-slice-check", action="store_true",
+                    help="skip the chunked-vocab head equality check (it gates "
+                         "--head-vocab-chunk; runs by default when the head can slice)")
     args = ap.parse_args()
 
     cdt = {"float32": torch.float32, "float16": torch.float16,
@@ -178,6 +221,9 @@ def main():
         print(f"  diff   next-token : {tok_diff}   {'OK' if match else 'MISMATCH'}")
         print(f"  per-position argmax agreement: {agree*100:.1f}%")
         print(f"  last-token logits: max|Δ|={max_abs:.4f}  cos={cos:.6f}")
+
+    if not args.skip_head_slice_check:
+        all_ok &= check_head_slice(net)
 
     if args.check_backward:
         all_ok &= check_backward(model, tokenizer, prompts[0], args.device, cdt,

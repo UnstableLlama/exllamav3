@@ -190,6 +190,42 @@ class LinearEXL3:
         return w
 
 
+    def get_weight_tensor_slice(self, n_start: int, n_features: int):
+        """Reconstruct ONLY output columns ``[n_start : n_start+n_features]`` of the
+        dequantized weight, shape ``[in_features, n_features]`` (half).
+
+        This is exact (bit-identical to the matching slice of ``get_weight_tensor``)
+        because every transform restricts cleanly to a column slice that is aligned
+        to ``RECONSTRUCT_SLICE_GRANULARITY_N``:
+          * ``reconstruct_slice`` dequantizes the inner weight for those columns;
+          * ``preapply_had_l`` / ``su`` mix only the *input* (row) dimension, so they
+            act per-output-column -- unaffected by slicing columns;
+          * ``preapply_had_r`` is block-diagonal over the output dim with block size
+            ``had_n`` (it reshapes ``[k, -1, had_n] @ had``), so a slice aligned to
+            ``had_n`` is self-contained;
+          * ``sv`` is a per-output-column scale, indexed by the slice.
+
+        Lets the fused-CE head reconstruct the big ``[in, vocab]`` weight in vocab
+        chunks instead of all at once -- the full reconstruction (and its fp32
+        upcast) is the dominant memory spike on the output device for large vocabs.
+        ``n_start`` and ``n_features`` must be multiples of
+        ``RECONSTRUCT_SLICE_GRANULARITY_N``."""
+        gran = RECONSTRUCT_SLICE_GRANULARITY_N
+        assert n_start % gran == 0 and n_features % gran == 0, \
+            f"slice must be aligned to {gran} (got n_start={n_start}, n_features={n_features})"
+        assert 0 <= n_start and n_start + n_features <= self.out_features, \
+            f"slice [{n_start}:{n_start + n_features}] out of range for out_features {self.out_features}"
+        suh = self.unpack_bf(self.su).unsqueeze(1) if self.su else self.suh.unsqueeze(1)
+        svh = self.unpack_bf(self.sv).unsqueeze(0) if self.sv else self.svh.unsqueeze(0)
+        w = torch.empty((self.in_features, n_features), dtype = torch.half, device = self.trellis.device)
+        ext.reconstruct_slice(w, self.trellis, self.K, self.mcg, self.mul1, n_start)
+        w = preapply_had_l(w, had_k)
+        w *= suh
+        w = preapply_had_r(w, had_n)
+        w *= svh[:, n_start:n_start + n_features]
+        return w
+
+
     def get_bias_tensor(self) -> torch.Tensor | None:
         return self.bias
 

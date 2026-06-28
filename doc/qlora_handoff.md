@@ -923,6 +923,46 @@ box: run a few steps with `--checkpoint-every`, Ctrl-C, then `--resume
   trainers; the BNB arm still has the old `--no-clean-text`-on-by-default (flip it
   there too for a matched run).
 
+**Chunked-vocab LM head (`--head-vocab-chunk N`) — relieves the output-card OOM
+on big-vocab models.** The gemma-4-31B split run OOM'd on cuda:1 at the **first
+training step**, inside the head-weight reconstruction (`get_weight_tensor` →
+`preapply_had_r`, a **5.25 GiB** fp32 spike for the 262k-vocab head): the fused CE
+reconstructed the whole `[hidden, vocab]` head at once on the output device, on
+top of the grad graph. (Eval survived because it ran under `no_grad`.)
+- **Fix:** reconstruct + matmul the head in **vocab-column tiles**. The EXL3 kernel
+  already slices (`ext.reconstruct_slice`, 128-aligned); the three head transforms
+  are all slice-safe at that granularity (`preapply_had_l`/`su` mix only the input
+  dim; `preapply_had_r` is **block-diagonal over the output dim at `had_n`=128**;
+  `sv` is per-column) — so a 128-aligned column slice reconstructs **bit-identically**
+  to the matching slice of the full weight. New `LinearEXL3.get_weight_tensor_slice`,
+  exposed via `backbone.head_weight_slice_closure` (falls back to plain column
+  indexing for a dense head).
+- **`FusedLinearCrossEntropyVocabChunked`** (fused_ce.py) computes the **same loss
+  and grad** via an **online softmax** (per-token running max/sum across vocab
+  chunks) + a two-pass backward that reuses the saved per-token LSE. Loop is
+  **vocab-outer, token-inner**, so each weight chunk is reconstructed exactly once
+  per forward and once per backward — **total dequant work = the single-shot path,
+  no extra cost**. Peak head memory drops from `~[hidden, vocab]` to
+  `~[hidden, chunk]` (+ a `[token_chunk, chunk]` logits tile): at `--head-vocab-chunk
+  32768` on the 31B that's the 5.25 GiB spike → ~0.7 GiB. Wired into `compute_loss`
+  (frozen-head path only; `train_head`/final-softcap still take the materialized
+  path) behind `--head-vocab-chunk` (single + DDP; `NativeLlamaQLoRA(head_vocab_chunk=)`).
+  **Default 0 (off)** — opt in after validating.
+- **Validation:** the loss + analytic grad were checked against naive CE
+  (finite-difference, all vocab/token-chunk combos, ignore-index) — **algorithm
+  confirmed**. The torch autograd Function is gradchecked in `tests/test_fused_ce.py`
+  (`test_vocab_chunked_*`, incl. *bit-identical to the single-shot fused head*) —
+  **run on the box** (no torch in the container). The EXL3 slice reconstruction is
+  GPU-only and is now gated automatically: **`qlora_validate_native.py` runs a
+  head-slice check** (`get_weight_tensor()[:, a:b]` vs `get_weight_tensor_slice(a, b)`
+  at the first/middle/last aligned chunk; expects bit-identical, folds into the
+  PASS/FAIL and the non-zero exit, SKIPs for an unsliceable head, `--skip-head-slice-check`
+  to opt out). So the standard pre-run gate already covers it; then run
+  `python tests/test_fused_ce.py` for the autograd gradcheck and a 1-step train
+  smoke with `--head-vocab-chunk 32768` (watch cuda:1 peak drop and the loss match
+  an off run). Once trusted it should let you **drop the `--use-per-device` juggling
+  and raise `--batch`/`--seq-len`**.
+
 **Re "was it still only saving the lowest held-out val?" — diagnosis (no
 regression):** saving the lowest val is **opt-in via `--save-best`**, not the
 default; without it a run saves the **endpoint** ("Done."). With `--save-best`

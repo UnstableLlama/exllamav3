@@ -153,6 +153,10 @@ def main():
                          "on CUDA fp16/bf16, else eager), flash (require), or eager "
                          "(reference, O(t^2) memory). Flash is O(t) -- long context.")
     ap.add_argument("--ce-chunk", type=int, default=1024)
+    ap.add_argument("--head-vocab-chunk", type=int, default=0,
+                    help="Reconstruct + matmul the frozen LM head in vocab-column "
+                         "chunks (0 = off). Bounds head peak memory on the output "
+                         "device for big-vocab models; same loss/grad. Try 32768.")
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
     ap.add_argument("--save-every", type=int, default=0,
                     help="Overwrite the adapter at --out every N steps (rank 0). "
@@ -243,7 +247,7 @@ def main():
         model, r=args.r, alpha=args.alpha, target_modules=args.targets,
         compute_dtype=cdt, gradient_checkpointing=not args.no_grad_ckpt,
         train_embeddings=args.train_embeddings, train_head=args.train_head,
-        attn_impl=args.attn_impl,
+        attn_impl=args.attn_impl, head_vocab_chunk=args.head_vocab_chunk,
     )
     net.train()
     if is_main(rank):

@@ -45,7 +45,10 @@ import torch.nn.functional as F
 
 from . import backbone
 from .qlora_linear import EXL3LoRAFunction
-from .fused_ce import fused_linear_cross_entropy, DEFAULT_CHUNK, IGNORE_INDEX
+from .fused_ce import (
+    fused_linear_cross_entropy, fused_linear_cross_entropy_vocab_chunked,
+    DEFAULT_CHUNK, DEFAULT_VOCAB_CHUNK, IGNORE_INDEX,
+)
 
 
 # FlashAttention-2 fast path. exllamav3's own FA2 usage is inference-only
@@ -191,6 +194,7 @@ class NativeLlamaQLoRA(nn.Module):
         train_embeddings: bool = False,
         train_head: bool = False,
         attn_impl: str = "auto",
+        head_vocab_chunk: int = 0,
     ):
         super().__init__()
         self.model = model
@@ -287,6 +291,16 @@ class NativeLlamaQLoRA(nn.Module):
         # on CPU (prefer_cpu) regardless.
         self.device = self.final_norm.weight.device
         self._head_device = backbone.linear_device(self.lm_head)
+
+        # Optional chunked-vocab head loss: reconstruct + matmul the head in
+        # vocab-column tiles so the full [hidden, vocab] weight (and its fp32 upcast
+        # + [tokens, vocab] logits) is never held at once -- the dominant memory
+        # spike on the output device for big vocabs (e.g. Gemma's 262k head). 0 =
+        # off (the single-shot fused head). Resolved to None if the head can't slice.
+        self.head_vocab_chunk = int(head_vocab_chunk)
+        self._head_slice = None
+        if self.head_vocab_chunk > 0:
+            self._head_slice = backbone.head_weight_slice_closure(self.lm_head)
 
         # Sanity: every requested target name actually matched something.
         matched = {w.key.split(".")[-1] for w in wrappers if w.r > 0}
@@ -651,6 +665,17 @@ class NativeLlamaQLoRA(nn.Module):
         # lives on the head's device; co-locate them (no-op single-device).
         hidden = backbone.to_device(hidden, self._head_device)
         labels = labels.to(hidden.device)
+        # Chunked-vocab head: reconstruct + matmul the head in vocab tiles so the
+        # full [hidden, vocab] weight is never built at once (frees the output card
+        # for big vocabs). Falls through to the single-shot fused head when off or
+        # when the head can't slice.
+        if self.head_vocab_chunk > 0 and self._head_slice is not None:
+            slice_fn, vocab_size, granularity = self._head_slice
+            return fused_linear_cross_entropy_vocab_chunked(
+                hidden, slice_fn, labels, vocab_size,
+                vocab_chunk=self.head_vocab_chunk, token_chunk=chunk,
+                ignore_index=ignore_index, granularity=granularity, shift=True,
+            )
         return fused_linear_cross_entropy(
             hidden, self.lm_head_weight_fn(), labels,
             chunk=chunk, ignore_index=ignore_index, shift=True,
