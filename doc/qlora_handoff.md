@@ -1066,6 +1066,22 @@ path untouched (the reference).
 - `qlora_validate_native.py --compute-dtype bfloat16` — the sdpa path runs only in
   fp16/bf16, so this is its parity gate (fp32 validate stays eager).
 
+**Follow-on (same session): 8-bit AdamW (`--optim`) — the optimizer-state lever.**
+The 8k run trained but sat ~750 MiB from the ceiling on the output card and then
+**OOM'd at the step-10 eval**. Cause: `torch.optim.AdamW` keeps `m`/`v` in fp32 =
+**8 bytes/param** = ~2.1 GB for the 262M-param r=64 adapter (split across cards),
+**allocated lazily on the first `optimizer.step()`** — so step-0 eval (no moments
+yet) fit, the first training steps fit barely, and the first *in-training* eval
+ran after the moments materialized and tipped cuda:1 over. New `--optim
+{adamw,adamw8bit,paged_adamw8bit}` (`build_optimizer`): the bitsandbytes 8-bit
+variants store moments at ~2 bytes/param (~4x less, ~1.6 GB freed at r=64;
+`paged_` also offloads state to host on a spike). Negligible quality cost (the
+QLoRA paper trains with paged 8-bit Adam) and almost certainly how the rank-128
+2×3090 runs fit. Default stays `adamw` (no behavior change); needs `bitsandbytes`
+importable in the venv. Native trainer only so far — mirror into the DDP/BNB arms
+if a matched run needs it. (`--resume` restoring an 8-bit optimizer state is
+untested; use `--reset-optimizer` if it misbehaves.)
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)

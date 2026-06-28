@@ -290,6 +290,35 @@ def extract_single_turn(messages):
     return user_text, asst_text
 
 
+def build_optimizer(param_groups, lr, optim="adamw"):
+    """Build the optimizer over the trainable param groups.
+
+    ``adamw`` is torch's AdamW: ``m``/``v`` in fp32 = 8 bytes per trainable param.
+    For a 262M-param r=64 adapter that is ~2.1 GB of optimizer state (split across
+    devices under ``--parallel split``), allocated lazily on the first
+    ``optimizer.step()`` -- which is why a run can pass step 0 / the first few
+    steps and then OOM once the moments materialize.
+
+    ``adamw8bit`` / ``paged_adamw8bit`` are bitsandbytes 8-bit AdamW: the moments
+    are quantized to ~2 bytes/param (~4x less state, ~1.6 GB freed at r=64), with
+    negligible quality cost (the QLoRA paper trains with paged 8-bit Adam). The
+    ``paged_`` variant additionally offloads optimizer state to host memory on a
+    spike, smoothing transient peaks. Both need ``bitsandbytes`` importable.
+    """
+    if optim == "adamw":
+        return torch.optim.AdamW(param_groups, lr=lr)
+    try:
+        import bitsandbytes as bnb
+    except Exception as e:
+        raise SystemExit(
+            f"--optim {optim} needs bitsandbytes, which is not importable "
+            f"({e}). Install it in this venv (pip install bitsandbytes) or use "
+            f"--optim adamw."
+        )
+    cls = bnb.optim.PagedAdamW8bit if optim == "paged_adamw8bit" else bnb.optim.AdamW8bit
+    return cls(param_groups, lr=lr)
+
+
 def make_lr_scheduler(optimizer, name, total_steps, warmup_steps):
     """A transformers-free LR scheduler (none/linear/cosine) with linear warmup.
 
@@ -658,6 +687,14 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--weight-decay", type=float, default=0.01,
                     help="AdamW weight decay on the LoRA params (default 0.01).")
+    ap.add_argument("--optim", choices=["adamw", "adamw8bit", "paged_adamw8bit"],
+                    default="adamw",
+                    help="Optimizer. 'adamw' = torch AdamW (fp32 moments, 8 "
+                         "bytes/param). 'adamw8bit' / 'paged_adamw8bit' = "
+                         "bitsandbytes 8-bit AdamW (~2 bytes/param) -- cuts "
+                         "optimizer state ~4x, the lever for fitting bigger r / "
+                         "longer context on tight VRAM. 'paged_' offloads optimizer "
+                         "state to host on spikes (needs bitsandbytes installed).")
     ap.add_argument("--scheduler", choices=["none", "linear", "cosine"],
                     default="none",
                     help="LR schedule after warmup: none (constant), linear "
@@ -1059,7 +1096,7 @@ def main():
 
     # 5. Optimizer over the trainable params, plus the LR schedule. Weight decay
     #    on the LoRA params only (param_groups puts embed/head in a 0-WD group).
-    opt = torch.optim.AdamW(net.param_groups(args.weight_decay), lr=args.lr)
+    opt = build_optimizer(net.param_groups(args.weight_decay), args.lr, args.optim)
     sched = make_lr_scheduler(opt, args.scheduler, args.steps, warmup_steps)
 
     # 5a. Optionally restore optimizer/schedule/step from the resumed checkpoint so
