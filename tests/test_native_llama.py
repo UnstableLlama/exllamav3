@@ -397,6 +397,63 @@ def test_block_backward_reaches_adapters_only():
     print("[block] backward reaches all adapters, base stays frozen PASSED")
 
 
+def test_packing_block_isolation():
+    # Sample packing: a packed block's per-document outputs must EQUAL running each
+    # document alone -- the block-diagonal mask (seg_ids) plus per-document RoPE
+    # position reset. This is the eager reference path (the flash-varlen path is
+    # GPU-only). A leak here would mean packed training silently mixes documents.
+    torch.manual_seed(5)
+    d, nq, nkv, hd, inter = 16, 4, 2, 8, 32
+    entry, meta, refw, lins = _build_block(d, nq, nkv, hd, inter, dtype=torch.float32, r=0)
+    net = _headless_net()
+
+    L0, L1 = 4, 3
+    doc0 = torch.randn(1, L0, d, dtype=torch.float32)
+    doc1 = torch.randn(1, L1, d, dtype=torch.float32)
+
+    def run_alone(doc):
+        t = doc.shape[1]
+        pos = torch.arange(t).unsqueeze(0)
+        bias = net._attn_bias(None, t, doc.device, torch.float32)
+        return net._block_forward(meta, entry, doc, pos, bias)
+
+    ref0, ref1 = run_alone(doc0), run_alone(doc1)
+
+    # Pack the two documents into one sequence: seg ids mark membership, positions
+    # reset per document, and the bias is built block-diagonal from seg_ids.
+    packed = torch.cat([doc0, doc1], dim=1)                  # [1, L0+L1, d]
+    seg = torch.tensor([[0] * L0 + [1] * L1])
+    pos = torch.tensor([list(range(L0)) + list(range(L1))])
+    bias = net._attn_bias(None, L0 + L1, packed.device, torch.float32, seg_ids=seg)
+    out = net._block_forward(meta, entry, packed, pos, bias)
+
+    e0 = (out[:, :L0] - ref0).abs().max().item()
+    e1 = (out[:, L0:] - ref1).abs().max().item()
+    assert e0 < 1e-5 and e1 < 1e-5, f"packing leak: doc0 max|Δ|={e0}, doc1 max|Δ|={e1}"
+    print(f"[packing] packed block == per-document (max|Δ|={max(e0, e1):.2e}) PASSED")
+
+
+def test_packing_pad_no_nan():
+    # Trailing pad positions (attention_mask=0; seg id inherits the last document)
+    # must not produce NaNs at real positions: a pad query attends back into its
+    # document (never fully masked), and real queries never attend to pad keys.
+    torch.manual_seed(6)
+    d, nq, nkv, hd, inter = 16, 4, 2, 8, 32
+    entry, meta, refw, lins = _build_block(d, nq, nkv, hd, inter, dtype=torch.float32, r=0)
+    net = _headless_net()
+
+    L0, L1, pad = 3, 2, 2
+    t = L0 + L1 + pad
+    hidden = torch.randn(1, t, d, dtype=torch.float32)
+    seg = torch.tensor([[0] * L0 + [1] * L1 + [1] * pad])   # pad inherits last doc seg
+    am = torch.tensor([[1] * (L0 + L1) + [0] * pad])
+    pos = torch.tensor([list(range(L0)) + list(range(L1)) + [0] * pad])
+    bias = net._attn_bias(am, t, hidden.device, torch.float32, seg_ids=seg)
+    out = net._block_forward(meta, entry, hidden, pos, bias)
+    assert torch.isfinite(out[:, :L0 + L1]).all(), "NaN/inf at real positions under packing"
+    print("[packing] trailing pads produce no NaN at real positions PASSED")
+
+
 def test_modules_to_save_param_groups():
     # Full-trained embed/head (modules_to_save) must be optimized but excluded
     # from weight decay (decaying a whole embedding table is harmful), while LoRA
@@ -431,6 +488,8 @@ def main():
     test_block_matches_reference()
     test_gemma_block_matches_reference()
     test_block_backward_reaches_adapters_only()
+    test_packing_block_isolation()
+    test_packing_pad_no_nan()
     test_modules_to_save_param_groups()
     print("\nAll native-Llama differentiable-forward checks passed.")
 

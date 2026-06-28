@@ -45,7 +45,7 @@ import torch.distributed as dist
 # Reuse the single-GPU example's data helpers (same dir on sys.path under torchrun).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qlora_train_native import (  # noqa: E402
-    build_sft_examples, build_lm_examples, collate, make_lr_scheduler,
+    build_sft_examples, build_lm_examples, pack_examples, collate, make_lr_scheduler,
     resolve_steps_and_warmup, ThroughputMeter, append_run_log,
     checkpoint_dir, prune_checkpoints,
     save_trainer_state, load_trainer_state, restore_optimizer_state,
@@ -135,6 +135,14 @@ def main():
                     help="Seed for --shuffle (also the random-subset seed when "
                          "--max-samples caps the rows). Default 0.")
     ap.add_argument("--seq-len", type=int, default=512)
+    ap.add_argument("--pack", action="store_true",
+                    help="Sample packing: concatenate training documents into each "
+                         "--seq-len sequence instead of padding (kills pad-token "
+                         "waste on short-answer data). Documents stay isolated "
+                         "(per-doc RoPE reset + flash-varlen / block-diagonal "
+                         "attention). Training set only; eval stays per-example. "
+                         "Packed once (identically on every rank) then sharded, so "
+                         "the per-rank block counts and step math stay in lockstep.")
     ap.add_argument("--targets", nargs="*", default=None)
     ap.add_argument("--train-embeddings", action="store_true",
                     help="Also FULLY train the input embeddings (modules_to_save). "
@@ -324,6 +332,20 @@ def main():
                 uppercase_response=args.uppercase_response,
                 messages_key=args.messages_key, prompt_format=args.prompt_format,
                 config_name=args.eval2_config)
+    # Sample packing (training set only). Pack the FULL set identically on every
+    # rank BEFORE sharding, so all ranks see the same block count (lockstep step
+    # math) and the stride-shard stays balanced. The val carve above already
+    # removed held-out docs, so no eval data leaks into a packed block.
+    if args.pack:
+        n_docs = len(examples)
+        real_tokens = sum(len(ex["input_ids"]) for ex in examples)
+        examples = pack_examples(examples, args.seq_len, pad_id)
+        cap = max(1, len(examples) * args.seq_len)
+        if is_main(rank):
+            print(f" -- packed {n_docs} docs -> {len(examples)} blocks of "
+                  f"{args.seq_len} tok ({100.0 * real_tokens / cap:.1f}% filled, "
+                  f"~{real_tokens / max(1, len(examples)):.0f} real tok/block)")
+
     shard = examples[rank::world_size]
     assert shard, "no training examples on this rank"
 
@@ -399,9 +421,10 @@ def main():
         total = 0.0
         with torch.no_grad():
             for ex in exs:
-                ii, ll, aa = collate([ex], pad_id)
+                ii, ll, aa, pp, ss = collate([ex], pad_id)
                 total += net.compute_loss(ii, ll, attention_mask=aa,
-                                          chunk=args.ce_chunk).item()
+                                          chunk=args.ce_chunk,
+                                          position_ids=pp, seg_ids=ss).item()
         net.train()
         return total / len(exs)
 
@@ -445,7 +468,8 @@ def main():
             "steps_planned": args.steps, "steps_done": step, "seq_len": args.seq_len,
             "targets": " ".join(net.target_modules), "compute_dtype": args.compute_dtype,
             "attn_impl": args.attn_impl, "parallel": "ddp",
-            "shuffle": int(bool(args.shuffle)), "max_samples": args.max_samples,
+            "shuffle": int(bool(args.shuffle)), "pack": int(bool(args.pack)),
+            "max_samples": args.max_samples,
             "train_embeddings": int(bool(args.train_embeddings)),
             "train_head": int(bool(args.train_head)), "prompt_format": args.prompt_format,
             "trainable_params": net.num_trainable(), "n_train": len(examples),
@@ -500,7 +524,8 @@ def main():
             "steps_planned": args.steps, "steps_done": step, "seq_len": args.seq_len,
             "targets": " ".join(net.target_modules), "compute_dtype": args.compute_dtype,
             "attn_impl": args.attn_impl, "parallel": "ddp",
-            "shuffle": int(bool(args.shuffle)), "max_samples": args.max_samples,
+            "shuffle": int(bool(args.shuffle)), "pack": int(bool(args.pack)),
+            "max_samples": args.max_samples,
             "train_embeddings": int(bool(args.train_embeddings)),
             "train_head": int(bool(args.train_head)), "prompt_format": args.prompt_format,
             "trainable_params": net.num_trainable(), "n_train": len(examples),
@@ -522,9 +547,10 @@ def main():
             step_sup = step_tot = 0
             for _ in range(args.grad_accum):
                 batch = next(bgen)
-                input_ids, labels, attn = collate(batch, pad_id)
+                input_ids, labels, attn, pos_ids, seg_ids = collate(batch, pad_id)
                 loss = net.compute_loss(input_ids, labels, attention_mask=attn,
-                                        chunk=args.ce_chunk)
+                                        chunk=args.ce_chunk,
+                                        position_ids=pos_ids, seg_ids=seg_ids)
                 (loss / args.grad_accum).backward()
                 accum_loss += loss.item() / args.grad_accum
                 step_sup += int((labels != -100).sum())

@@ -87,7 +87,7 @@ RUN_LOG_FIELDS = [
     "r", "alpha", "lr", "scheduler", "warmup_steps", "weight_decay",
     "batch", "grad_accum", "world_size", "eff_batch",
     "epochs", "steps_planned", "steps_done", "seq_len",
-    "targets", "compute_dtype", "attn_impl", "parallel", "shuffle",
+    "targets", "compute_dtype", "attn_impl", "parallel", "shuffle", "pack",
     "max_samples", "train_embeddings", "train_head", "prompt_format",
     "trainable_params", "n_train", "n_val", "n_eval2",
     "start_loss", "end_loss", "best_val", "best_val_step",
@@ -528,20 +528,94 @@ def build_lm_examples(tokenizer, dataset_name, split, seq_len,
     return examples
 
 
+def pack_examples(examples, seq_len, pad_id):
+    """Greedily pack tokenized SFT examples into ``seq_len`` blocks (sample packing).
+
+    Each input example (from :func:`build_sft_examples`) is one *document*. We
+    concatenate documents next-fit into blocks of at most ``seq_len`` tokens, so a
+    short-answer dataset stops wasting most of every forward on pad tokens -- the
+    same real tokens are processed in far fewer, fuller sequences.
+
+    Correctness is preserved by the native forward, NOT here: each block carries
+      * ``seg_ids``      -- per-token document index, so attention is restricted to
+                            the same document (block-diagonal / flash-varlen). Pad
+                            positions inherit the LAST document's seg id, so a pad
+                            query still attends back into a real doc and is never
+                            fully masked (no softmax NaN); pads are still blocked as
+                            keys by the attention mask.
+      * ``position_ids`` -- reset to 0..len-1 PER document, so RoPE sees each
+                            document at its true positions, not its block offset.
+    The completion-only ``-100`` prompt masks are already in each document's
+    labels; at a document join the shifted CE predicts the next document's first
+    (masked) prompt token, so boundaries contribute no loss and need no fixup.
+
+    The final block is padded to ``seq_len`` so every block is uniform. Returns a
+    list of dicts (input_ids / labels / seg_ids / position_ids), consumed by
+    :func:`collate`.
+    """
+    blocks = []
+    cur_ids, cur_labels, cur_seg, cur_pos = [], [], [], []
+    seg = 0
+
+    def flush():
+        nonlocal cur_ids, cur_labels, cur_seg, cur_pos, seg
+        if not cur_ids:
+            return
+        pad = seq_len - len(cur_ids)
+        last_seg = cur_seg[-1] if cur_seg else 0
+        blocks.append({
+            "input_ids": cur_ids + [pad_id] * pad,
+            "labels": cur_labels + [-100] * pad,
+            "seg_ids": cur_seg + [last_seg] * pad,
+            "position_ids": cur_pos + [0] * pad,
+        })
+        cur_ids, cur_labels, cur_seg, cur_pos, seg = [], [], [], [], 0
+
+    for ex in examples:
+        ids, labs = ex["input_ids"], ex["labels"]
+        if len(ids) > seq_len:                         # shouldn't happen (build_sft
+            ids, labs = ids[:seq_len], labs[:seq_len]  # truncates), but guard
+        if cur_ids and len(cur_ids) + len(ids) > seq_len:
+            flush()                                    # this doc won't fit; seal block
+        cur_ids += ids
+        cur_labels += labs
+        cur_seg += [seg] * len(ids)
+        cur_pos += list(range(len(ids)))
+        seg += 1
+    flush()
+    return blocks
+
+
 def collate(batch, pad_id):
-    """Right-pad a batch; pad input_ids with pad_id, labels with -100."""
+    """Right-pad a batch; pad input_ids with pad_id, labels with -100.
+
+    Returns ``(input_ids, labels, attention_mask, position_ids, seg_ids)``. For
+    plain (unpacked) examples ``position_ids`` and ``seg_ids`` are ``None`` (the
+    forward derives positions from the mask, with no block-diagonal constraint).
+    For packed blocks (carrying ``seg_ids`` from :func:`pack_examples`) they are
+    returned so the forward resets RoPE per document and isolates documents.
+    """
     maxlen = max(len(b["input_ids"]) for b in batch)
+    packed = "seg_ids" in batch[0]
     input_ids, labels, attn = [], [], []
+    seg_ids = [] if packed else None
+    pos_ids = [] if packed else None
     for b in batch:
         n = len(b["input_ids"])
         pad = maxlen - n
         input_ids.append(b["input_ids"] + [pad_id] * pad)
         labels.append(b["labels"] + [-100] * pad)
         attn.append([1] * n + [0] * pad)
+        if packed:
+            last_seg = b["seg_ids"][-1] if b["seg_ids"] else 0
+            seg_ids.append(b["seg_ids"] + [last_seg] * pad)
+            pos_ids.append(b["position_ids"] + [0] * pad)
     return (
         torch.tensor(input_ids, dtype=torch.long),
         torch.tensor(labels, dtype=torch.long),
         torch.tensor(attn, dtype=torch.long),
+        torch.tensor(pos_ids, dtype=torch.long) if packed else None,
+        torch.tensor(seg_ids, dtype=torch.long) if packed else None,
     )
 
 
@@ -653,6 +727,14 @@ def main():
                     help="Seed for --shuffle (also the random-subset seed when "
                          "--max-samples caps the rows). Default 0.")
     ap.add_argument("--seq-len", type=int, default=512)
+    ap.add_argument("--pack", action="store_true",
+                    help="Sample packing: concatenate multiple training documents "
+                         "into each --seq-len sequence instead of padding each to "
+                         "--seq-len, so short-answer data stops wasting most of the "
+                         "forward on pad tokens. Documents stay isolated (per-doc "
+                         "RoPE reset + block-diagonal attention; flash-varlen on "
+                         "CUDA fp16/bf16). Only the training set is packed; the "
+                         "held-out eval stays per-example for comparable losses.")
     ap.add_argument("--inspect", type=int, default=0, metavar="N",
                     help="Tokenization check: decode the first N built examples "
                          "(prompt span vs supervised response span + whether the "
@@ -879,6 +961,15 @@ def main():
                   + ("" if ends_eot else
                      "   <-- WARNING: response truncated by --seq-len; "
                      "raise --seq-len so the model learns to stop"))
+        if args.pack:
+            # Inspect decodes per-document (the tokenization check is per doc);
+            # add a one-line packing summary so the fill ratio is visible too.
+            real_tokens = sum(len(ex["input_ids"]) for ex in examples)
+            blocks = pack_examples(examples, args.seq_len, pad_id)
+            cap = max(1, len(blocks) * args.seq_len)
+            print(f"\n -- packing: {len(examples)} docs -> {len(blocks)} blocks of "
+                  f"{args.seq_len} tok ({100.0 * real_tokens / cap:.1f}% filled); "
+                  f"block 0 holds {len(set(blocks[0]['seg_ids']))} docs")
         print(f"\n -- inspect only ({args.inspect} shown); exiting before training.")
         return
 
@@ -931,6 +1022,20 @@ def main():
             kind = "SFT"
         print(f" -- eval2 ({eval2_label}): {len(val2_examples)} {kind} examples "
               f"from split '{args.eval2_split}'")
+
+    # Sample packing (training set ONLY -- eval stays per-example for comparable
+    # losses). Done after the val carve so a packed block never straddles the
+    # train/val boundary; resolve_steps below then counts packed blocks as the
+    # training unit, so --epochs still means "passes over the data".
+    if args.pack:
+        n_docs = len(examples)
+        real_tokens = sum(len(ex["input_ids"]) for ex in examples)
+        examples = pack_examples(examples, args.seq_len, pad_id)
+        cap = max(1, len(examples) * args.seq_len)
+        print(f" -- packed {n_docs} docs -> {len(examples)} blocks of "
+              f"{args.seq_len} tok ({100.0 * real_tokens / cap:.1f}% filled, "
+              f"~{real_tokens / max(1, len(examples)):.0f} real tok/block)")
+        assert examples, "no training blocks after packing"
 
     # Finalize step count (from --epochs) and warmup before building the schedule.
     args.steps, warmup_steps = resolve_steps_and_warmup(
@@ -1010,9 +1115,10 @@ def main():
         total, n = 0.0, 0
         with torch.no_grad():
             for ex in exs:
-                input_ids, labels, attn = collate([ex], pad_id)
+                input_ids, labels, attn, pos_ids, seg_ids = collate([ex], pad_id)
                 l = net.compute_loss(input_ids, labels, attention_mask=attn,
-                                     chunk=args.ce_chunk)
+                                     chunk=args.ce_chunk,
+                                     position_ids=pos_ids, seg_ids=seg_ids)
                 total += l.item()
                 n += 1
         net.train()
@@ -1060,7 +1166,8 @@ def main():
             "steps_planned": args.steps, "steps_done": step, "seq_len": args.seq_len,
             "targets": " ".join(net.target_modules), "compute_dtype": args.compute_dtype,
             "attn_impl": args.attn_impl, "parallel": args.parallel,
-            "shuffle": int(bool(args.shuffle)), "max_samples": args.max_samples,
+            "shuffle": int(bool(args.shuffle)), "pack": int(bool(args.pack)),
+            "max_samples": args.max_samples,
             "train_embeddings": int(bool(args.train_embeddings)),
             "train_head": int(bool(args.train_head)), "prompt_format": args.prompt_format,
             "trainable_params": net.num_trainable(), "n_train": len(examples),
@@ -1119,7 +1226,8 @@ def main():
             "steps_planned": args.steps, "steps_done": step, "seq_len": args.seq_len,
             "targets": " ".join(net.target_modules), "compute_dtype": args.compute_dtype,
             "attn_impl": args.attn_impl, "parallel": args.parallel,
-            "shuffle": int(bool(args.shuffle)), "max_samples": args.max_samples,
+            "shuffle": int(bool(args.shuffle)), "pack": int(bool(args.pack)),
+            "max_samples": args.max_samples,
             "train_embeddings": int(bool(args.train_embeddings)),
             "train_head": int(bool(args.train_head)), "prompt_format": args.prompt_format,
             "trainable_params": net.num_trainable(), "n_train": len(examples),
@@ -1140,9 +1248,10 @@ def main():
             step_sup = step_tot = 0
             for _ in range(args.grad_accum):
                 batch = next(bgen)
-                input_ids, labels, attn = collate(batch, pad_id)
+                input_ids, labels, attn, pos_ids, seg_ids = collate(batch, pad_id)
                 loss = net.compute_loss(input_ids, labels, attention_mask=attn,
-                                        chunk=args.ce_chunk)
+                                        chunk=args.ce_chunk,
+                                        position_ids=pos_ids, seg_ids=seg_ids)
                 (loss / args.grad_accum).backward()
                 accum_loss += loss.item() / args.grad_accum
                 step_sup += int((labels != -100).sum())   # supervised tokens
