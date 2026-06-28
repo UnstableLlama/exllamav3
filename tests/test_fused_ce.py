@@ -36,8 +36,16 @@ def _load(name: str):
 
 _fce = _load("fused_ce")
 FusedLinearCrossEntropy = _fce.FusedLinearCrossEntropy
+FusedLinearCrossEntropyVocabChunked = _fce.FusedLinearCrossEntropyVocabChunked
 fused_linear_cross_entropy = _fce.fused_linear_cross_entropy
+fused_linear_cross_entropy_vocab_chunked = _fce.fused_linear_cross_entropy_vocab_chunked
 IGNORE_INDEX = _fce.IGNORE_INDEX
+
+
+def _slice_fn(weight):
+    """Mock column-slice reconstructor over a dense weight (the EXL3 head provides
+    the real one via get_weight_tensor_slice; granularity 1 for the dense mock)."""
+    return lambda s, n: weight[:, s:s + n]
 
 
 def _naive(hidden, weight, labels, ignore_index=IGNORE_INDEX):
@@ -151,12 +159,74 @@ def test_convenience_shift():
     print("[fce] convenience shift PASSED")
 
 
+def test_vocab_chunked_parity():
+    """Vocab-chunked CE must match naive F.cross_entropy on loss AND grad_hidden,
+    for several vocab/token chunk sizes (incl. a chunk that doesn't divide V)."""
+    torch.manual_seed(5)
+    n, d, v = 48, 16, 70
+    weight = torch.randn(d, v, dtype=torch.float64)
+    labels = torch.randint(0, v, (n,))
+    labels[::5] = IGNORE_INDEX
+
+    for vchunk in (16, 32, v, 1000):
+        for tchunk in (8, n):
+            h1 = torch.randn(n, d, dtype=torch.float64, requires_grad=True)
+            h2 = h1.detach().clone().requires_grad_(True)
+            loss_ref = _naive(h1, weight, labels); loss_ref.backward()
+            loss = FusedLinearCrossEntropyVocabChunked.apply(
+                h2, labels, _slice_fn(weight), v, vchunk, tchunk, IGNORE_INDEX, 1)
+            loss.backward()
+            assert torch.allclose(loss_ref, loss, atol=1e-10), \
+                f"loss mismatch (vchunk={vchunk}, tchunk={tchunk})"
+            assert torch.allclose(h1.grad, h2.grad, atol=1e-9), \
+                f"grad mismatch (vchunk={vchunk}, tchunk={tchunk})"
+    print("[fce] vocab-chunked parity vs F.cross_entropy PASSED")
+
+
+def test_vocab_chunked_matches_single_shot():
+    """The chunked-vocab head must give bit-for-bit the same loss/grad as the
+    existing single-shot fused head (the two production code paths agree)."""
+    torch.manual_seed(6)
+    n, d, v = 50, 24, 64
+    weight = torch.randn(d, v, dtype=torch.float64)
+    labels = torch.randint(0, v, (n,)); labels[3] = IGNORE_INDEX
+
+    h1 = torch.randn(n, d, dtype=torch.float64, requires_grad=True)
+    h2 = h1.detach().clone().requires_grad_(True)
+    loss_a = FusedLinearCrossEntropy.apply(h1, labels, lambda: weight, 7, IGNORE_INDEX)
+    loss_a.backward()
+    loss_b = FusedLinearCrossEntropyVocabChunked.apply(
+        h2, labels, _slice_fn(weight), v, 16, 7, IGNORE_INDEX, 1)
+    loss_b.backward()
+    assert torch.allclose(loss_a, loss_b, atol=1e-12), "loss differs from single-shot"
+    assert torch.allclose(h1.grad, h2.grad, atol=1e-11), "grad differs from single-shot"
+    print("[fce] vocab-chunked == single-shot PASSED")
+
+
+def test_vocab_chunked_gradcheck():
+    torch.manual_seed(7)
+    n, d, v = 12, 8, 23
+    weight = torch.randn(d, v, dtype=torch.float64)
+    labels = torch.randint(0, v, (n,))
+    h = torch.randn(n, d, dtype=torch.float64, requires_grad=True)
+    ok = torch.autograd.gradcheck(
+        lambda h_: FusedLinearCrossEntropyVocabChunked.apply(
+            h_, labels, _slice_fn(weight), v, 8, 5, IGNORE_INDEX, 1),
+        (h,), eps=1e-6, atol=1e-6, rtol=1e-4,
+    )
+    assert ok
+    print("[fce] vocab-chunked gradcheck PASSED")
+
+
 def main():
     test_loss_and_grad_parity()
     test_ignore_index()
     test_chunk_invariance()
     test_gradcheck()
     test_convenience_shift()
+    test_vocab_chunked_parity()
+    test_vocab_chunked_matches_single_shot()
+    test_vocab_chunked_gradcheck()
     print("\nAll fused cross-entropy checks passed.")
 
 

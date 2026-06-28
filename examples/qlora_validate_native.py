@@ -31,6 +31,7 @@ from collections import Counter
 import torch
 
 from exllamav3 import Config, Model, Tokenizer
+from exllamav3.training import backbone
 from exllamav3.training.native_llama import NativeLlamaQLoRA
 
 
@@ -232,6 +233,9 @@ def main():
         print(f"  diff   next-token : {tok_diff}   {'OK' if match else 'MISMATCH'}")
         print(f"  per-position argmax agreement: {agree*100:.1f}%")
         print(f"  last-token logits: max|Δ|={max_abs:.4f}  cos={cos:.6f}")
+
+    if not args.skip_head_slice_check:
+        all_ok &= check_head_slice(net)
 
     if args.check_backward:
         all_ok &= check_backward(model, tokenizer, prompts[0], args.device, cdt,

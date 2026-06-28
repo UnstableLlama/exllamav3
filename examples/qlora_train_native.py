@@ -763,6 +763,13 @@ def main():
                          "(the reference; O(t^2) memory). Flash is O(t) memory -- "
                          "the lever for long-context training.")
     ap.add_argument("--ce-chunk", type=int, default=1024)
+    ap.add_argument("--head-vocab-chunk", type=int, default=0,
+                    help="Reconstruct + matmul the frozen LM head in vocab-column "
+                         "chunks of this many columns (0 = off, single-shot). Bounds "
+                         "the head's peak memory on the OUTPUT device -- the full "
+                         "[hidden, vocab] reconstruction + fp32 upcast is the spike "
+                         "for big-vocab models (e.g. Gemma 262k). Try 32768. Same "
+                         "loss/grad as off; no extra dequant cost (vocab-outer loop).")
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
     ap.add_argument("--sample-every", type=int, default=25,
                     help="Generate a sample completion every N steps (0 to disable)")
@@ -892,9 +899,12 @@ def main():
         model, r=args.r, alpha=args.alpha, target_modules=args.targets,
         compute_dtype=cdt, gradient_checkpointing=not args.no_grad_ckpt,
         train_embeddings=args.train_embeddings, train_head=args.train_head,
-        attn_impl=args.attn_impl,
+        attn_impl=args.attn_impl, head_vocab_chunk=args.head_vocab_chunk,
     )
     net.train()
+    if args.head_vocab_chunk and net._head_slice is None:
+        print(" -- note: --head-vocab-chunk set but this head can't slice; using "
+              "the single-shot fused head.")
     if args.resume:
         net.load_adapter(args.resume)
     ms = [n for n, p in [("embed", net.embed_weight), ("head", net.head_weight)] if p is not None]
