@@ -358,24 +358,33 @@ class NativeLlamaQLoRA(nn.Module):
         # scale by constant_scale, then multiply by (weight + constant_bias). spec
         # comes from backbone.norm_spec; weight None = unweighted (Gemma v-norm).
         # Gemma's (1 + weight) convention is just bias = 1.0 read from the module.
+        # Normalize in fp32 for stability, then return in the INPUT dtype (bf16 in
+        # a training run, fp32 in the validate/reference path) so the residual
+        # stream stays in compute_dtype rather than being silently upcast to fp32.
+        # Mirrors HF RMSNorm (fp32 internals, cast back to the activation dtype).
         xf = x.float()
         var = xf.pow(2).mean(dim=-1, keepdim=True) + spec["eps"]
         xn = xf * torch.rsqrt(var) * spec["scale"]
         w = spec["weight"]
         if w is None:
-            return xn
+            return xn.to(x.dtype)
         w = w.float()
         b = spec["bias"]
-        return xn * (w + b) if b != 0.0 else xn * w
+        out = xn * (w + b) if b != 0.0 else xn * w
+        return out.to(x.dtype)
 
     def _apply_rope(self, x: torch.Tensor, inv_freq: torch.Tensor, attn_factor: float,
                     position_ids: torch.Tensor) -> torch.Tensor:
-        # x: [b, t, n_heads, head_dim] (fp32). position_ids: [b, t].
+        # x: [b, t, n_heads, head_dim]. position_ids: [b, t]. Rotation math runs in
+        # fp32 (position-dependent precision) and the result is cast back to x's
+        # dtype, so a bf16 activation stays bf16 instead of being upcast to fp32.
+        in_dtype = x.dtype
+        xf = x.float()
         freqs = position_ids.float().unsqueeze(-1) * inv_freq.float().unsqueeze(0).unsqueeze(0)  # [b,t,hd/2]
         emb = torch.cat((freqs, freqs), dim=-1)                  # [b,t,hd]  (NeoX layout)
         cos = (emb.cos() * attn_factor).unsqueeze(2)             # [b,t,1,hd]
         sin = (emb.sin() * attn_factor).unsqueeze(2)
-        return x * cos + _rotate_half_neox(x) * sin
+        return (xf * cos + _rotate_half_neox(xf) * sin).to(in_dtype)
 
     def _attn_bias(self, attention_mask: Optional[torch.Tensor], t: int,
                    device, dtype, window: int = -1,
@@ -419,11 +428,16 @@ class NativeLlamaQLoRA(nn.Module):
         nq, nkv, hd = meta["num_q_heads"], meta["num_kv_heads"], meta["head_dim"]
 
         # --- attention ---
+        # Projections already run in compute_dtype (the QLoRA linear casts input and
+        # reconstructs the frozen weight in compute_dtype), so q/k/v come out bf16 in
+        # a training run / fp32 in the validate path -- DON'T upcast them to fp32 here
+        # (that is what doubled the activation footprint). Per-head norm and RoPE
+        # below keep their internals in fp32 but return in this dtype.
         normed = self._norm(hidden, entry.attn_norm_spec)
-        q = entry.q_proj(normed).view(bsz, t, nq, hd).float()
-        k = entry.k_proj(normed).view(bsz, t, nkv, hd).float()
+        q = entry.q_proj(normed).view(bsz, t, nq, hd)
+        k = entry.k_proj(normed).view(bsz, t, nkv, hd)
         # use_k_as_v: V is the raw K projection (taken before k-norm/RoPE).
-        v = k if entry.v_proj is None else entry.v_proj(normed).view(bsz, t, nkv, hd).float()
+        v = k if entry.v_proj is None else entry.v_proj(normed).view(bsz, t, nkv, hd)
 
         # Per-head q/k/v RMSNorm, applied to the raw projections before RoPE
         # (Qwen3: q/k; Gemma: q/k/v unweighted). No-ops when the spec is None.
@@ -466,7 +480,7 @@ class NativeLlamaQLoRA(nn.Module):
                 )                                               # [total, nq, hd]
                 o = q.new_zeros(bsz, t, nq, hd, dtype=of.dtype)
                 o[keep] = of
-                ctx = o.reshape(bsz, t, nq * hd).float()
+                ctx = o.reshape(bsz, t, nq * hd)
             else:
                 window = meta["sliding_window"]
                 ws = (window - 1, 0) if window and window > 0 else (-1, -1)
@@ -475,7 +489,7 @@ class NativeLlamaQLoRA(nn.Module):
                     softmax_scale=meta["sm_scale"], causal=True,
                     window_size=ws, softcap=float(meta["softcap"] or 0.0),
                 )                                               # [b, t, nq, hd]
-                ctx = o.reshape(bsz, t, nq * hd).float()
+                ctx = o.reshape(bsz, t, nq * hd)
         elif attn_mode == "sdpa":
             # head_dim > 256 (Gemma global layers): FA2 can't, but torch's
             # MEM-EFFICIENT SDPA backend handles big heads at O(t) -- the same path
@@ -513,7 +527,7 @@ class NativeLlamaQLoRA(nn.Module):
                     of[s:e] = od.squeeze(0).transpose(0, 1)
                 o = q.new_zeros(bsz, t, nq, hd, dtype=of.dtype)
                 o[keep] = of
-                ctx = o.reshape(bsz, t, nq * hd).float()
+                ctx = o.reshape(bsz, t, nq * hd)
             else:
                 qh = q.transpose(1, 2).to(cd)
                 kh = k.transpose(1, 2).to(cd)
@@ -524,12 +538,14 @@ class NativeLlamaQLoRA(nn.Module):
                 o = F.scaled_dot_product_attention(
                     qh, kh, vh, is_causal=True, scale=meta["sm_scale"],
                 )                                               # [b, nq, t, hd]
-                ctx = o.transpose(1, 2).reshape(bsz, t, nq * hd).float()
+                ctx = o.transpose(1, 2).reshape(bsz, t, nq * hd)
         else:
-            # Eager reference: materializes [b, nq, t, t]. [b, n_heads, t, hd]
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
+            # Eager reference (validate / CPU / fp32 / gradcheck): materializes the
+            # [b, nq, t, t] scores. Keep the score+softmax math in fp32 for fidelity
+            # regardless of the activation dtype, then return ctx in compute_dtype.
+            q = q.transpose(1, 2).float()
+            k = k.transpose(1, 2).float()
+            v = v.transpose(1, 2).float()
             if nq != nkv:                                       # GQA: expand KV groups
                 rep = nq // nkv
                 k = k.repeat_interleave(rep, dim=1)
@@ -542,8 +558,11 @@ class NativeLlamaQLoRA(nn.Module):
             scores = scores + attn_bias.to(scores.dtype)
             probs = torch.softmax(scores, dim=-1)
             ctx = torch.matmul(probs, v)                        # [b,nq,t,hd]
-            ctx = ctx.transpose(1, 2).reshape(bsz, t, nq * hd)
-        attn_out = entry.o_proj(ctx).float()
+            ctx = ctx.transpose(1, 2).reshape(bsz, t, nq * hd)  # fp32 reference result
+        # o_proj re-casts its input to compute_dtype and outputs in it, so attn_out is
+        # bf16 in a training run regardless of ctx's dtype -- no fp32 upcast of the
+        # residual stream here (that is what the old `.float()` was costing).
+        attn_out = entry.o_proj(ctx)
         # Sandwich post-norm (Gemma): x = x + post_norm(attn_out). Plain pre-norm
         # archs have no post-norm -> straight residual add.
         if entry.attn_post_spec is not None:
@@ -558,7 +577,7 @@ class NativeLlamaQLoRA(nn.Module):
         mlp_out = None
         for gate, up, down in zip(entry.gates, entry.ups, entry.downs):
             a = act(gate(normed2)) * up(normed2)
-            d = down(a).float()
+            d = down(a)                                          # compute_dtype (no fp32 upcast)
             mlp_out = d if mlp_out is None else mlp_out + d
         if entry.mlp_post_spec is not None:
             hidden = hidden + self._norm(mlp_out, entry.mlp_post_spec)
@@ -570,7 +589,9 @@ class NativeLlamaQLoRA(nn.Module):
         # Gemma produces garbage even though each block is individually close.
         ls = meta.get("layer_scalar")
         if ls is not None:
-            hidden = hidden * ls
+            # Cast the result back to hidden's dtype: a fp32 layer_scalar tensor would
+            # otherwise promote the whole bf16 residual to fp32 at every block end.
+            hidden = (hidden * ls).to(hidden.dtype)
         return hidden
 
     # --- attention backend selection -------------------------------------
@@ -662,9 +683,9 @@ class NativeLlamaQLoRA(nn.Module):
             # then the same multiplier/normalize the frozen path applies.
             ew = self.embed_weight
             looked_up = F.embedding(input_ids.to(ew.device), ew)
-            hidden = backbone.embed_apply(self.embed, looked_up).to(first_device).float()
+            hidden = backbone.embed_apply(self.embed, looked_up).to(first_device).to(self.compute_dtype)
         else:
-            hidden = backbone.embed_tokens(self.embed, input_ids).to(first_device).float()
+            hidden = backbone.embed_tokens(self.embed, input_ids).to(first_device).to(self.compute_dtype)
 
         if attention_mask is not None:
             attention_mask = attention_mask.to(first_device)
@@ -747,8 +768,11 @@ class NativeLlamaQLoRA(nn.Module):
                                              attn_bias, mode, pack)
 
         # Final norm + head live on the output device (the last split device).
+        # Return fp32 hidden so the head / cross-entropy path keeps its existing
+        # dtype contract (the per-block residual stream above is bf16, but this is a
+        # single [b, t, d] tensor, so the fp32 cast here is negligible).
         hidden = backbone.to_device(hidden, self.device)
-        hidden = self._norm(hidden, self.final_norm_spec)
+        hidden = self._norm(hidden, self.final_norm_spec).float()
         return hidden
 
     # --- heads -------------------------------------------------------------

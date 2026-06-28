@@ -1066,7 +1066,24 @@ path untouched (the reference).
 - `qlora_validate_native.py --compute-dtype bfloat16` — the sdpa path runs only in
   fp16/bf16, so this is its parity gate (fp32 validate stays eager).
 
-**Follow-on (same session): 8-bit AdamW (`--optim`) — the optimizer-state lever.**
+**Follow-on: bf16 activations (the big one — was running the forward in fp32).**
+The matmuls already ran in `compute_dtype` (the QLoRA linear casts input + reconstructs
+the frozen weight in bf16), but `_block_forward` then **upcast every activation back to
+fp32** via `.float()` (q/k/v, ctx, attn_out, mlp_out) and kept the **whole residual
+stream in fp32** — so activations, the grad-checkpoint saves, and the per-block backward
+working set were all ~2x bigger than HF/Axolotl's bf16. That's the structural reason a
+12B needed two cards where Axolotl fits a 31B. Fix: drop the `.float()` upcasts so
+activations follow `compute_dtype`; keep fp32 only where it matters — `_norm` and
+`_apply_rope` compute internals in fp32 but **return in the input dtype** (HF RMSNorm
+convention), the eager *reference* path still does scores/softmax in fp32, and the
+**final** norm returns fp32 so the head/CE dtype contract is unchanged. `layer_scalar`
+is cast back to the residual dtype (an fp32 scalar would silently re-promote the whole
+stream). Net: ~halves activation + grad-checkpoint + attention-backward memory. **Reduces
+bit-identically in fp32** (every new dtype op is a no-op when `compute_dtype` is fp32), so
+`qlora_validate_native.py` (fp32 eager) is unchanged and the CPU block tests (all fp32)
+still pass by construction.
+
+**Follow-on: 8-bit AdamW (`--optim`) — the optimizer-state lever.**
 The 8k run trained but sat ~750 MiB from the ceiling on the output card and then
 **OOM'd at the step-10 eval**. Cause: `torch.optim.AdamW` keeps `m`/`v` in fp32 =
 **8 bytes/param** = ~2.1 GB for the 262M-param r=64 adapter (split across cards),
