@@ -1007,97 +1007,113 @@ training.
 
 ---
 
-### Session 8 — big-head (head_dim > 256) layers OOM at long context → ride mem-efficient SDPA
+### Session 8 — 8k context on 2×3090: long-context OOM, run-confirmed but BARELY (more to do)
 
-> Symptom: gemma-4-12B 3bpw, `--parallel split` 2×24GB, `--seq-len 8192 --pack`,
-> batch 1 — OOM at the **first training step** (baseline eval step 0 passed). Not
-> a weight-budget problem (12B@3bpw is ~4.5GB, split). The wall was the **8 Gemma
-> global layers** (`attn: 40×flash, 8×sdpa`).
+> Goal: train gemma-4-12B-it 3bpw QLoRA at **`--seq-len 8192 --pack`**, r64/α64,
+> `--parallel split` across 2×24GB (RTX 3090), batch 1, 262M trainable params.
+> End state: **running, but on the ragged edge** of cuda:1 — see open items. Three
+> structural fixes landed this session; one more (query-tiled big-head attention)
+> is the next lever. This note supersedes the earlier incremental framing in the
+> commit history (notably the "ride the mem-efficient backend" idea, which was
+> wrong — see below).
 
-**Root cause.** Those 8 layers have **head_dim > 256** (~512), for which there is
-*no* memory-efficient kernel in the training forward: FA2 caps at 256
-(`flash_attn_2.py`: `dim > 256 → None`), and exllamav3's `bighead_scalar` kernel
-is inference-only (needs a KV cache + `q_len < 8`, `bighead_scalar.py`). So they
-fell to `F.scaled_dot_product_attention`, which at head_dim > 256 can only pick
-the **math backend** — materializing the full `[b, nq, t, t]` fp32 score matrix.
-At `t=8192` that is multiple GB *per layer*; grad-checkpointing keeps one block
-live but a single big-head block tips the card. The old doc claim that "SDPA keeps
-the big-head layers O(t)" was wrong — it was only ever masked by running at
-shorter seq-len. `--pack` made it strictly worse (handed SDPA an explicit
-`[1,1,t,t]` mask, guaranteeing the math backend). Eval step 0 survived because
-eval examples aren't packed to 8192.
+**The arch (confirmed from `config.json`).** `head_dim: 256`,
+**`global_head_dim: 512`**, `num_attention_heads: 16`, `num_key_value_heads: 8`,
+`hidden_size: 3840`, `vocab_size: 262144`. So 40 sliding layers are head_dim 256
+(→ `flash`) and **8 global (full-attention) layers are head_dim 512** (→ `sdpa`).
+`describe_attn()` → `40×flash, 8×sdpa`.
 
-The Gemma global layers genuinely have a larger `global_head_dim` (`gemma4.py:63,230`
-— full layers use it, sliding layers use the smaller `head_dim`), so head_dim > 256
-on those 8 layers is real, not a metadata bug.
+**The real wall: head_dim 512 has NO O(t) attention kernel on Ampere.** FA2 caps at
+256 (`flash_attn_2.py`: `dim > 256 → None`); torch's mem-efficient SDPA backend
+**also caps at 256**; exllamav3's `bighead_scalar` is inference-only (needs a KV
+cache + `q_len < 8`). So the 8 global layers **always** run the SDPA **math**
+backend, which materializes the `[nq, L, L]` score matrix **in fp32** (the math
+backend upcasts regardless of input dtype). At L≈8k that is ~4 GB *per global
+layer*. Grad-checkpointing keeps one layer live, so the peak is one such matrix —
+fine **if the card has room**, fatal when it doesn't. **This is exactly how
+HF/Axolotl run gemma-4 too** (they eat the same O(t²) math on the global layers);
+they fit a 31B at 8k only because everything *else* is lean. Our OOM was never the
+4 GB itself — it was that cuda:1 was already maxed.
 
-**The real fix is to ride torch's MEM-EFFICIENT SDPA backend (O(t)).** That backend
-handles head_dim > 256 at O(t) memory — it is exactly how HF/Axolotl fit head_dim
-> 256 at 8k on the same hardware (confirmed: Axolotl trains 8k LoRA on 2×3090).
-Our code was being kicked off it onto the **math** backend (full `[nq, t, t]`
-scores) by two things:
-1. the old `--pack` path passed an **explicit `[t,t]` mask** to SDPA — any
-   user mask disqualifies the mem-efficient backend; and
-2. `enable_gqa=True` **also** disqualifies the mem-efficient backend on torch's
-   C++ path.
+**Confirmed culprit allocation:** the OOM was `Tried to allocate 3.97 GiB` in the
+backward = `16 × 8161² × 4 bytes` exactly — a near-full **single-document** packed
+block (one ~8.2k-token doc) hitting a head_dim-512 global layer. The score matrix
+scales with the **longest document in a block**, not the block size.
 
-`_block_forward`'s `sdpa` branch now avoids both: under packing it runs **per
-document** with `is_causal` and **no mask** (isolation via `pack["cu_seqlens"]`),
-and it **expands GQA by hand** (`repeat_interleave` KV to `nq` heads) and drops
-`enable_gqa`, so the mem-efficient backend stays eligible. Default SDPA backend
-selection then prefers it over math; if it's somehow ineligible for this head_dim,
-the per-document split keeps the math fallback bounded to the longest document
-rather than the full packed block. `pack_ctx` feeds both `flash` and `sdpa`; the
-explicit-mask path is gone. Non-packed big-head: one full `is_causal` pass (GQA
-expanded). FlexAttention was tried first and does NOT fit a 24GB consumer SM at
-this head dim (`No valid triton configs … Required: 200704, limit: 101376`) —
-removed. `describe_attn()` still reads `40×flash, 8×sdpa`. Eager/fp32/CPU validate
-path untouched (the reference).
+**Correction to the earlier framing (important for next time):** the
+`sdpa`-branch changes that "keep the mem-efficient backend eligible" (per-document
+`is_causal`, no mask, **hand-expanded GQA**) were built on a false premise —
+**the mem-efficient backend never engages at head_dim 512**, so those layers are
+always math. What actually helped: (a) the **per-document split** still matters
+(it bounds the math score matrix to the longest *document* instead of the full
+8192 block); but (b) the **GQA `repeat_interleave` expansion is now pointless
+overhead** for head_dim 512 (math handles GQA via `enable_gqa`) — see open items.
 
-**To verify on the box (no torch in the container — write-confirmed only):**
-- Should clear the first training step at `--seq-len 8192 --pack` without OOM,
-  if the mem-efficient backend serves this head_dim (the premise — Axolotl fits
-  8k on the same cards). Watch the per-card VRAM line.
-- If it STILL OOMs, the mem-efficient backend isn't engaging for this head_dim and
-  it fell back to per-document math — check `global_head_dim`, and how Axolotl runs
-  *this* arch (its sample packing uses FA2-varlen, which caps at 256, so it may
-  handle the big-head layers unpacked). Then either run unpacked or add a
-  doc-chunked manual flash for head_dim > 256.
-- `qlora_validate_native.py --compute-dtype bfloat16` — the sdpa path runs only in
-  fp16/bf16, so this is its parity gate (fp32 validate stays eager).
+**Three fixes that got it running (in order of impact):**
+1. **bf16 activations (the big one).** The matmuls already ran in `compute_dtype`
+   (the QLoRA linear casts input + reconstructs the frozen weight in bf16), but
+   `_block_forward` then **upcast every activation back to fp32** via `.float()`
+   (q/k/v, ctx, attn_out, mlp_out) and kept the **whole residual stream in fp32** —
+   ~2× the memory of an HF/Axolotl bf16 forward. *That* was the structural reason a
+   12B needed two cards where Axolotl fits a 31B. Fix: drop the `.float()` upcasts
+   so activations follow `compute_dtype`; keep fp32 only where it matters — `_norm`
+   and `_apply_rope` compute internals in fp32 but **return in the input dtype** (HF
+   RMSNorm convention); the eager *reference* path still does scores/softmax in fp32;
+   the **final** norm returns fp32 so the head/CE dtype contract is unchanged;
+   `layer_scalar` is cast back to the residual dtype (an fp32 scalar would re-promote
+   the whole stream). ~Halves activation + grad-checkpoint + attention-backward
+   memory. **Bit-identical in fp32** (every new dtype op is a no-op when
+   `compute_dtype` is fp32), so the fp32 validate gate and the fp32 CPU block tests
+   are unaffected. NOTE: bf16 does **not** shrink the math score matrix (it stays
+   fp32) — it frees everything *else* so that spike has room.
+2. **`--optim {adamw,adamw8bit,paged_adamw8bit}`** (`build_optimizer`). `torch.AdamW`
+   keeps `m`/`v` in fp32 = 8 bytes/param = ~2.1 GB for the 262M-param r=64 adapter,
+   allocated lazily on the **first `optimizer.step()`** — which is why an early run
+   passed step-0 eval, trained a few steps, then OOM'd at the first *in-training*
+   eval (the moments had materialized). bitsandbytes 8-bit moments → ~2 bytes/param
+   (~4× less, ~1.6 GB freed at r=64; `paged_` also offloads to host on a spike).
+   Negligible quality cost (QLoRA paper uses paged 8-bit Adam). Default stays
+   `adamw`. Needs `bitsandbytes` in the venv. **Native trainer only so far.**
+3. **Per-document SDPA under packing** (`sdpa` branch): gather non-pad tokens, loop
+   `is_causal` SDPA per document span (`pack["cu_seqlens"]`), scatter back — bounds
+   the math score matrix to the longest document. `pack_ctx` feeds both `flash` and
+   `sdpa`; the old explicit-`[t,t]`-mask path is gone. FlexAttention was tried first
+   and does NOT fit a 24GB consumer SM at head_dim 512 (`No valid triton configs …
+   Required: 200704, limit: 101376`) — removed.
 
-**Follow-on: bf16 activations (the big one — was running the forward in fp32).**
-The matmuls already ran in `compute_dtype` (the QLoRA linear casts input + reconstructs
-the frozen weight in bf16), but `_block_forward` then **upcast every activation back to
-fp32** via `.float()` (q/k/v, ctx, attn_out, mlp_out) and kept the **whole residual
-stream in fp32** — so activations, the grad-checkpoint saves, and the per-block backward
-working set were all ~2x bigger than HF/Axolotl's bf16. That's the structural reason a
-12B needed two cards where Axolotl fits a 31B. Fix: drop the `.float()` upcasts so
-activations follow `compute_dtype`; keep fp32 only where it matters — `_norm` and
-`_apply_rope` compute internals in fp32 but **return in the input dtype** (HF RMSNorm
-convention), the eager *reference* path still does scores/softmax in fp32, and the
-**final** norm returns fp32 so the head/CE dtype contract is unchanged. `layer_scalar`
-is cast back to the residual dtype (an fp32 scalar would silently re-promote the whole
-stream). Net: ~halves activation + grad-checkpoint + attention-backward memory. **Reduces
-bit-identically in fp32** (every new dtype op is a no-op when `compute_dtype` is fp32), so
-`qlora_validate_native.py` (fp32 eager) is unchanged and the CPU block tests (all fp32)
-still pass by construction.
+Also fixed this session: a **corrupted #100/#101 squash-merge** had left
+`native_llama.py` with dangling `_flex_*` references (NameError at construction);
+master was repaired (`3f28d48`).
 
-**Follow-on: 8-bit AdamW (`--optim`) — the optimizer-state lever.**
-The 8k run trained but sat ~750 MiB from the ceiling on the output card and then
-**OOM'd at the step-10 eval**. Cause: `torch.optim.AdamW` keeps `m`/`v` in fp32 =
-**8 bytes/param** = ~2.1 GB for the 262M-param r=64 adapter (split across cards),
-**allocated lazily on the first `optimizer.step()`** — so step-0 eval (no moments
-yet) fit, the first training steps fit barely, and the first *in-training* eval
-ran after the moments materialized and tipped cuda:1 over. New `--optim
-{adamw,adamw8bit,paged_adamw8bit}` (`build_optimizer`): the bitsandbytes 8-bit
-variants store moments at ~2 bytes/param (~4x less, ~1.6 GB freed at r=64;
-`paged_` also offloads state to host on a spike). Negligible quality cost (the
-QLoRA paper trains with paged 8-bit Adam) and almost certainly how the rank-128
-2×3090 runs fit. Default stays `adamw` (no behavior change); needs `bitsandbytes`
-importable in the venv. Native trainer only so far — mirror into the DDP/BNB arms
-if a matched run needs it. (`--resume` restoring an 8-bit optimizer state is
-untested; use `--reset-optimizer` if it misbehaves.)
+**Current run config (run-confirmed, barely):** `--parallel split --use-per-device
+9 24 --seq-len 8192 --pack --r 64 --alpha 64 --head-vocab-chunk 32768 --optim
+paged_adamw8bit --scheduler cosine`. Split = `{cuda:0: 36 blocks, cuda:1: 12
+blocks + final norm + head}`; **cuda:1 is the constraint** (it carries the 262k
+head *and* 2 of the 8 global layers, so a long-doc block spikes ~4 GB right where
+free memory is tightest). Loss descends cleanly (4.1 → 2.4 by step 5).
+
+**Open items / next session (in priority order):**
+1. **Query-tiled big-head attention — THE next lever.** Bound the global-layer
+   score matrix to `[16, q_tile, L]` (e.g. q_tile=2048 → ~1 GB vs ~4 GB) with a
+   flash-style online-softmax accumulation so **both forward and backward** stay
+   bounded (a naive query loop re-bloats the backward unless it's a custom
+   `autograd.Function` or nested-checkpointed per tile). This makes head_dim 512 @
+   8k fit with real margin regardless of document length, and is what unlocks
+   higher rank (128, like the confirmed 2×3090 runs) / longer context.
+2. **Drop the pointless GQA expansion** in the `sdpa` branch. Since head_dim 512 is
+   always the math backend, `repeat_interleave(KV → nq)` just wastes memory — revert
+   to `enable_gqa=True` (math handles GQA, keeps K/V at `nkv` heads). Small win, but
+   free, and fold it into the query-tiling rewrite.
+3. **Rebalance the split off cuda:1.** It holds the head + 2 global layers. Either
+   force the global layers onto cuda:0, or lower `--head-vocab-chunk` to 8192
+   (~375 MiB more margin), or shift blocks via `--use-per-device`.
+4. **Mirror `--optim` into the DDP + BNB arms** for matched EXL3-vs-NF4 runs.
+5. **bf16 parity gate** still worth running once: `qlora_validate_native.py
+   --compute-dtype bfloat16` (the `flash`/`sdpa` paths run only in fp16/bf16).
+6. **Throughput**: layer-split is serial (cuda:0 100% / cuda:1 0% see-saw); true
+   overlap needs pipeline-parallel micro-batching, not built. ~420 tok/s is near the
+   floor for this split. Not memory-related, but the next efficiency frontier after
+   query-tiling.
 
 ---
 
