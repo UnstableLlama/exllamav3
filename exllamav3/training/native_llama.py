@@ -352,13 +352,22 @@ class NativeLlamaQLoRA(nn.Module):
         return x * cos + _rotate_half_neox(x) * sin
 
     def _attn_bias(self, attention_mask: Optional[torch.Tensor], t: int,
-                   device, dtype, window: int = -1) -> torch.Tensor:
+                   device, dtype, window: int = -1,
+                   seg_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         # Additive attention bias: causal (upper triangle masked) AND, if given, a
         # [b, t] key-padding mask. Assumes right-padding (pads at the end), so no
         # real-token query row is ever fully masked -> softmax can't produce NaN.
         # When window > 0, also mask keys older than the sliding window (query i
         # attends only to j with i - window < j <= i), matching Gemma's local
         # layers; window <= 0 is full causal.
+        #
+        # seg_ids ([b, t]) is the sample-packing block-diagonal mask: query i may
+        # only attend to key j in the SAME document (seg_ids[i] == seg_ids[j]), so
+        # packed documents never bleed across boundaries. This is the eager
+        # *reference* path (CUDA fp16/bf16 packed runs use flash-varlen instead);
+        # at the small t of CPU/fp32/gradcheck/validate the [b,1,t,t] size is fine.
+        # Pad positions carry the last real document's seg id (see pack_examples),
+        # so a pad query still attends back into a real doc -> never fully masked.
         neg = float("-inf")
         causal = torch.triu(torch.ones(t, t, dtype=torch.bool, device=device), diagonal=1)
         bias = torch.zeros(1, 1, t, t, dtype=dtype, device=device)
@@ -367,13 +376,19 @@ class NativeLlamaQLoRA(nn.Module):
             too_old = torch.tril(torch.ones(t, t, dtype=torch.bool, device=device),
                                  diagonal=-window)
             bias = bias.masked_fill(too_old[None, None], neg)
+        if seg_ids is not None:
+            # [b,1,t,t]: True where query i and key j are in different documents.
+            # Add -inf there (additive, so it composes with the causal/window
+            # masks above); broadcasts the [1,1,t,t] bias up to [b,1,t,t].
+            cross = (seg_ids[:, :, None] != seg_ids[:, None, :])[:, None]
+            bias = bias + torch.zeros_like(cross, dtype=dtype).masked_fill(cross, neg)
         if attention_mask is not None:
             key_pad = (attention_mask == 0)[:, None, None, :]    # [b,1,1,t]
             bias = bias.masked_fill(key_pad, neg)
         return bias
 
     def _block_forward(self, meta, entry, hidden, position_ids, attn_bias,
-                       attn_mode="eager"):
+                       attn_mode="eager", pack=None):
         bsz, t, _ = hidden.shape
         nq, nkv, hd = meta["num_q_heads"], meta["num_kv_heads"], meta["head_dim"]
 
@@ -405,24 +420,58 @@ class NativeLlamaQLoRA(nn.Module):
             # trailing pad keys under `causal`, matching the eager mask for every
             # loss-bearing position. FA2 supports head_dim <= 256; larger heads take
             # the SDPA branch. Runs in compute_dtype (fp16/bf16).
-            window = meta["sliding_window"]
-            ws = (window - 1, 0) if window and window > 0 else (-1, -1)
-            o = _flash_attn_func()(
-                q.to(self.compute_dtype), k.to(self.compute_dtype), v.to(self.compute_dtype),
-                softmax_scale=meta["sm_scale"], causal=True,
-                window_size=ws, softcap=float(meta["softcap"] or 0.0),
-            )                                                   # [b, t, nq, hd]
-            ctx = o.reshape(bsz, t, nq * hd).float()
+            if pack is not None:
+                # Sample packing: flatten the batch's non-pad tokens into one
+                # [total, nh, hd] stream and run variable-length flash, isolating
+                # documents by cu_seqlens with NO [t,t] mask (the O(t) packing
+                # primitive). RoPE was applied above with per-document position
+                # resets; here we just gather, attend and scatter back.
+                # keep / cu_seqlens are built on the first block's device; under a
+                # layer-autosplit load this block may be on another card, so localize.
+                keep = pack["keep"].to(hidden.device)           # [b, t] bool, non-pad
+                cu = pack["cu_seqlens"].to(hidden.device)
+                of = backbone.attn_varlen(
+                    q.to(self.compute_dtype)[keep],             # [total, nq, hd]
+                    k.to(self.compute_dtype)[keep],             # [total, nkv, hd]
+                    v.to(self.compute_dtype)[keep],
+                    cu, pack["max_seqlen"],
+                    meta["sm_scale"], window=meta["sliding_window"],
+                    softcap=float(meta["softcap"] or 0.0),
+                )                                               # [total, nq, hd]
+                o = q.new_zeros(bsz, t, nq, hd, dtype=of.dtype)
+                o[keep] = of
+                ctx = o.reshape(bsz, t, nq * hd).float()
+            else:
+                window = meta["sliding_window"]
+                ws = (window - 1, 0) if window and window > 0 else (-1, -1)
+                o = _flash_attn_func()(
+                    q.to(self.compute_dtype), k.to(self.compute_dtype), v.to(self.compute_dtype),
+                    softmax_scale=meta["sm_scale"], causal=True,
+                    window_size=ws, softcap=float(meta["softcap"] or 0.0),
+                )                                               # [b, t, nq, hd]
+                ctx = o.reshape(bsz, t, nq * hd).float()
         elif attn_mode == "sdpa":
             # head_dim > 256 (e.g. Gemma global layers): FA2 can't, but torch SDPA's
             # memory-efficient backend handles large heads and is differentiable and
             # O(t) -- so these layers don't re-impose the t^2 peak. Used only for the
             # full-causal, no-softcap case (chosen in forward()); GQA via enable_gqa.
             qh, kh, vh = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            o = F.scaled_dot_product_attention(
-                qh.to(self.compute_dtype), kh.to(self.compute_dtype), vh.to(self.compute_dtype),
-                is_causal=True, scale=meta["sm_scale"], enable_gqa=(nq != nkv),
-            )                                                   # [b, nq, t, hd]
+            if attn_bias is not None:
+                # Packed big-head layer: SDPA can't combine is_causal with a custom
+                # mask, so pass the block-diagonal causal mask explicitly (boolean,
+                # True = attend), derived from the seg-aware additive bias. Keeps
+                # SDPA's O(t) compute; the [b,1,t,t] mask is the one O(t^2) buffer
+                # (cached across layers) -- the documented big-head packing fallback,
+                # since FA2 varlen caps head_dim at 256.
+                o = F.scaled_dot_product_attention(
+                    qh.to(self.compute_dtype), kh.to(self.compute_dtype), vh.to(self.compute_dtype),
+                    attn_mask=(attn_bias == 0), scale=meta["sm_scale"], enable_gqa=(nq != nkv),
+                )                                               # [b, nq, t, hd]
+            else:
+                o = F.scaled_dot_product_attention(
+                    qh.to(self.compute_dtype), kh.to(self.compute_dtype), vh.to(self.compute_dtype),
+                    is_causal=True, scale=meta["sm_scale"], enable_gqa=(nq != nkv),
+                )                                               # [b, nq, t, hd]
             ctx = o.transpose(1, 2).reshape(bsz, t, nq * hd).float()
         else:
             # Eager reference: materializes [b, nq, t, t]. [b, n_heads, t, hd]
@@ -489,6 +538,32 @@ class NativeLlamaQLoRA(nn.Module):
             return "sdpa"
         return "eager"
 
+    def _build_pack_context(self, seg_ids, attention_mask, bsz, t, device):
+        """Precompute the variable-length packing descriptor for the flash path.
+
+        Returns ``{keep, cu_seqlens, max_seqlen}`` or ``None`` if there are no real
+        tokens. ``keep`` ([b, t] bool) selects non-pad tokens; flattening the batch
+        in row-major order yields one token stream whose per-document boundaries are
+        ``cu_seqlens`` (int32, ``[num_docs + 1]`` cumulative lengths) -- exactly the
+        input ``flash_attn_varlen_func`` wants. A document is a maximal run of equal
+        ``seg_ids`` within a row (pads, which carry the last doc's seg id, are
+        dropped by ``keep``); a row change also starts a new document, since seg ids
+        are block-local (each packed sequence numbers its docs from 0)."""
+        keep = (attention_mask.to(device) > 0) if attention_mask is not None \
+            else torch.ones(bsz, t, dtype=torch.bool, device=device)
+        seg = seg_ids.to(device)
+        seg_flat = seg[keep]                                    # [total], row-major
+        if seg_flat.numel() == 0:
+            return None
+        rows = torch.arange(bsz, device=device)[:, None].expand(bsz, t)[keep]
+        new_doc = torch.ones_like(seg_flat, dtype=torch.bool)
+        new_doc[1:] = (seg_flat[1:] != seg_flat[:-1]) | (rows[1:] != rows[:-1])
+        doc_id = torch.cumsum(new_doc.long(), 0) - 1            # 0..num_docs-1
+        counts = torch.bincount(doc_id)                        # tokens per document
+        cu = torch.zeros(counts.numel() + 1, dtype=torch.int32, device=device)
+        cu[1:] = torch.cumsum(counts, 0).to(torch.int32)
+        return {"keep": keep, "cu_seqlens": cu, "max_seqlen": int(counts.max().item())}
+
     def describe_attn(self) -> str:
         """One-line summary of the attention plan for the loaded model + dtype, so
         a run can confirm flash/SDPA actually engage (vs a silent eager fallback)."""
@@ -512,8 +587,15 @@ class NativeLlamaQLoRA(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        seg_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Return final-norm hidden states ``[b, t, d]`` in fp32."""
+        """Return final-norm hidden states ``[b, t, d]`` in fp32.
+
+        ``seg_ids`` ([b, t]) enables sample packing: it marks each token's
+        document within its packed sequence, so attention is restricted to the
+        same document (flash-varlen via cu_seqlens on CUDA fp16/bf16; the
+        block-diagonal eager/SDPA mask otherwise). ``position_ids`` must then be
+        per-document resets (built by ``pack_examples`` / ``collate``)."""
         bsz, t = input_ids.shape
         # Under a layer-autosplit load each block lives on its own device; the
         # hidden state is migrated across boundaries below (mirroring exllamav3's
@@ -531,6 +613,8 @@ class NativeLlamaQLoRA(nn.Module):
 
         if attention_mask is not None:
             attention_mask = attention_mask.to(first_device)
+        if seg_ids is not None:
+            seg_ids = seg_ids.to(first_device)
         if position_ids is None:
             if attention_mask is not None:
                 position_ids = attention_mask.long().cumsum(-1) - 1
@@ -557,9 +641,11 @@ class NativeLlamaQLoRA(nn.Module):
         mem_eff = (self._flash_ok and hidden.is_cuda
                    and self.compute_dtype in (torch.float16, torch.bfloat16))
 
-        # Attention bias per (window, device) for eager blocks only. Gemma alternates
-        # sliding/full layers, so each distinct window needs its own mask; plain
-        # archs have a single window (-1). Cached: built at most once per key.
+        # Attention bias per (window, device). Built for eager blocks (always) and,
+        # under packing, also for SDPA big-head blocks (which take an explicit
+        # block-diagonal mask). Gemma alternates sliding/full layers, so each
+        # distinct window needs its own mask; plain archs have a single window (-1).
+        # When packing, the bias is seg-aware (block-diagonal). Cached per key.
         bias_cache: dict = {}
 
         def get_bias(window, dev):
@@ -567,9 +653,19 @@ class NativeLlamaQLoRA(nn.Module):
             b = bias_cache.get(key)
             if b is None:
                 am = attention_mask.to(dev) if attention_mask is not None else None
-                b = self._attn_bias(am, t, dev, torch.float32, window)
+                sg = seg_ids.to(dev) if seg_ids is not None else None
+                b = self._attn_bias(am, t, dev, torch.float32, window, seg_ids=sg)
                 bias_cache[key] = b
             return b
+
+        # Sample-packing context for the flash-varlen path: flatten the batch's
+        # non-pad tokens into one stream and mark per-document boundaries with
+        # cu_seqlens, so flash isolates documents with NO [t,t] mask. Built once
+        # (constant across layers); only needed when flash actually runs (CUDA
+        # fp16/bf16). On CPU/fp32 the eager block-diagonal bias handles packing.
+        pack_ctx = self._build_pack_context(seg_ids, attention_mask, bsz, t,
+                                            first_device) if (seg_ids is not None
+                                                              and mem_eff) else None
 
         cur_device = first_device
         for meta, entry, dev in zip(self._block_meta, self.blocks, self._block_devices):
@@ -580,15 +676,24 @@ class NativeLlamaQLoRA(nn.Module):
                 position_ids = backbone.to_device(position_ids, dev)
                 cur_device = dev
             mode = self._attn_mode_for(meta, mem_eff)
-            attn_bias = get_bias(meta["sliding_window"], dev) if mode == "eager" else None
+            # eager: seg-aware additive bias. sdpa under packing: same bias, used as
+            # an explicit block-diagonal mask (FA2 varlen can't do head_dim>256).
+            # flash: no bias -- isolation comes from pack_ctx's cu_seqlens.
+            if mode == "eager":
+                attn_bias = get_bias(meta["sliding_window"], dev)
+            elif mode == "sdpa" and pack_ctx is not None:
+                attn_bias = get_bias(-1, dev)   # sdpa blocks are full-causal here
+            else:
+                attn_bias = None
+            pack = pack_ctx if (mode == "flash" and pack_ctx is not None) else None
             if ckpt:
                 hidden = torch.utils.checkpoint.checkpoint(
                     self._block_forward, meta, entry, hidden, position_ids, attn_bias,
-                    mode, use_reentrant=False,
+                    mode, pack, use_reentrant=False,
                 )
             else:
                 hidden = self._block_forward(meta, entry, hidden, position_ids,
-                                             attn_bias, mode)
+                                             attn_bias, mode, pack)
 
         # Final norm + head live on the output device (the last split device).
         hidden = backbone.to_device(hidden, self.device)
@@ -602,9 +707,11 @@ class NativeLlamaQLoRA(nn.Module):
         return backbone.head_weight_closure(self.lm_head)
 
     def logits(self, input_ids: torch.Tensor,
-               attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+               attention_mask: Optional[torch.Tensor] = None,
+               position_ids: Optional[torch.Tensor] = None,
+               seg_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Materialize full logits ``[b, t, vocab]`` (validation / small batches)."""
-        hidden = self.forward(input_ids, attention_mask)
+        hidden = self.forward(input_ids, attention_mask, position_ids, seg_ids)
         w = self.lm_head_weight_fn()()
         logits = backbone.to_device(hidden, w.device).to(w.dtype) @ w
         if self.final_softcap:
@@ -618,6 +725,8 @@ class NativeLlamaQLoRA(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         chunk: int = DEFAULT_CHUNK,
         ignore_index: int = IGNORE_INDEX,
+        position_ids: Optional[torch.Tensor] = None,
+        seg_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Shifted causal-LM cross-entropy.
 
@@ -627,8 +736,14 @@ class NativeLlamaQLoRA(nn.Module):
         positions (labels != ignore_index), so memory scales with the number of
         supervised tokens, not the full sequence. Final-logit softcapping (Gemma2)
         also takes the supervised-position path, since the fused head can't apply
-        the tanh cap."""
-        hidden = self.forward(input_ids, attention_mask)
+        the tanh cap.
+
+        ``position_ids`` / ``seg_ids`` enable sample packing (per-document position
+        resets + block-diagonal attention). The shifted CE needs no packing special
+        case: at a document boundary the shift predicts the next document's first
+        token, which is always a masked (-100) prompt token, so it contributes no
+        loss."""
+        hidden = self.forward(input_ids, attention_mask, position_ids, seg_ids)
         # Materialize logits only at supervised positions when the head trains OR
         # a final softcap must be applied (the fused head supports neither).
         if self.train_head or self.final_softcap:

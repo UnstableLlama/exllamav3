@@ -83,6 +83,55 @@ def check_backward(model, tokenizer, prompt, device, cdt, attn_impl="auto"):
     return ok
 
 
+def check_packing(net, tokenizer, prompts, device):
+    """
+    Prove sample packing isolates documents: the logits for each document inside a
+    packed block must match running that document ALONE. This exercises both
+    halves of correct packing -- the block-diagonal attention (no token attends
+    across a document boundary) and the per-document RoPE position reset. A
+    mismatch means packed training would silently mix documents.
+
+    Runs on whatever dtype/attn the net was built with, so it covers the fp32
+    eager reference and (under --compute-dtype bfloat16) the flash-varlen path.
+    """
+    print("\n" + "-" * 78)
+    print("packing check: packed-block logits == per-document logits")
+    docs = [tokenizer.encode(p, add_bos=True)[0].tolist() for p in prompts]
+
+    # Per-document reference: each document forwarded on its own.
+    ref = []
+    with torch.no_grad():
+        for d in docs:
+            ref.append(net.logits(torch.tensor([d], device=device))[0].float().cpu())
+
+    # Pack the documents into one sequence with seg ids + per-document position
+    # resets (exactly what pack_examples/collate produce for training).
+    input_ids, seg_ids, position_ids = [], [], []
+    for s, d in enumerate(docs):
+        input_ids += d
+        seg_ids += [s] * len(d)
+        position_ids += list(range(len(d)))
+    ii = torch.tensor([input_ids], device=device)
+    sg = torch.tensor([seg_ids], device=device)
+    pp = torch.tensor([position_ids], device=device)
+    with torch.no_grad():
+        packed = net.logits(ii, position_ids=pp, seg_ids=sg)[0].float().cpu()
+
+    ok, off = True, 0
+    for s, (d, r) in enumerate(zip(docs, ref)):
+        sl = packed[off: off + len(d)]
+        off += len(d)
+        agree = (sl.argmax(-1) == r.argmax(-1)).float().mean().item()
+        max_abs = (sl - r).abs().max().item()
+        cos = torch.cosine_similarity(sl[-1], r[-1], dim=0).item()
+        good = agree > 0.999
+        ok &= good
+        print(f"  doc {s} ({len(d):>3} tok): per-position argmax {agree*100:5.1f}% | "
+              f"max|Δ|={max_abs:.4f} cos={cos:.6f}  {'OK' if good else 'MISMATCH'}")
+    print("  packing check:", "PASS" if ok else "FAIL")
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -104,6 +153,11 @@ def main():
     ap.add_argument("--prompts", nargs="*", default=None)
     ap.add_argument("--check-backward", action="store_true",
                     help="also smoke-test cross-device gradient flow (tiny adapter + backward)")
+    ap.add_argument("--check-packing", action="store_true",
+                    help="also verify sample packing: a packed block's per-document "
+                         "logits must match running each document alone (block-"
+                         "diagonal attention + per-document RoPE reset). Run with "
+                         "--compute-dtype bfloat16 to exercise the flash-varlen path.")
     args = ap.parse_args()
 
     cdt = {"float32": torch.float32, "float16": torch.float16,
@@ -182,6 +236,9 @@ def main():
     if args.check_backward:
         all_ok &= check_backward(model, tokenizer, prompts[0], args.device, cdt,
                                  attn_impl=args.attn_impl)
+
+    if args.check_packing:
+        all_ok &= check_packing(net, tokenizer, prompts, args.device)
 
     print("\n" + "=" * 78)
     print("RESULT:", "PASS -- differentiable forward matches native"

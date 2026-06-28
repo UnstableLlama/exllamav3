@@ -216,6 +216,51 @@ def rms_norm_eps(norm) -> float:
     return norm.rms_norm_eps
 
 
+# --- variable-length (packed) attention ------------------------------------
+
+def attn_varlen(q, k, v, cu_seqlens, max_seqlen, sm_scale,
+                window: int = -1, softcap: float = 0.0):
+    """
+    Variable-length (packed) attention for the training forward, via exllamav3's
+    own autograd-capable flash wrapper -- the O(t) primitive that lets sample
+    packing isolate documents without ever building a ``[t, t]`` mask.
+
+    ``q`` / ``k`` / ``v`` are ``[total_tokens, num_heads, head_dim]``: every
+    document of a packed batch concatenated into one token stream, with
+    ``cu_seqlens`` (int32, shape ``[num_docs + 1]``, cumulative document lengths)
+    marking the per-document boundaries so a document never attends across one.
+    ``max_seqlen`` is the longest document length.
+
+    Routed through ``attention_fn.attn_dispatch`` with no cache, so it skips every
+    paged/cache backend and lands on ``fn_flash_attn_varlen_func`` -- the upstream
+    ``flash_attn_varlen_func``, which (unlike exllamav3's inference kernels) is NOT
+    wrapped in ``inference_mode`` and has a real backward. Requires
+    ``head_dim <= 256`` (FA2 limit; the caller routes larger heads elsewhere).
+
+    ``window > 0`` is a sliding window expressed as exllamav3's per-layer
+    ``sliding_window`` (a token attends to itself + ``window - 1`` previous tokens
+    = ``window`` total). We hand ``attn_dispatch`` ``window - 1`` because its
+    ``get_window_size`` wraps the value as the FA2 left-window ``(w, 0)`` -- so the
+    result matches the eager reference's ``-window`` diagonal exactly. ``softcap``
+    applies tanh logit softcapping. Returns ``[total_tokens, num_heads, head_dim]``.
+    """
+    from ..modules.attention_fn.dispatch import attn_dispatch
+    # attn_dispatch reads [bsz, q_len, num_heads, head_dim]; the varlen backend
+    # asserts bsz == 1 and squeezes it, reading boundaries from cu_seqlens. Present
+    # the flattened stream as a single batch row; the result is [total, nh, hd].
+    window_size = (int(window) - 1) if (window and window > 0) else None
+    return attn_dispatch(
+        q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
+        cache=None,
+        causal=True,
+        sm_scale=float(sm_scale),
+        cu_seqlens=cu_seqlens,
+        max_seqlen=int(max_seqlen),
+        window_size=window_size,
+        softcap=float(softcap or 0.0),
+    )
+
+
 # --- frozen quantized linears ----------------------------------------------
 
 def is_loaded(linear) -> bool:
