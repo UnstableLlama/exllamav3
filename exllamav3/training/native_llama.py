@@ -73,32 +73,16 @@ def _flash_attn_func():
     return _FLASH_FN
 
 
-# FlexAttention path for the large-head (head_dim > 256) layers. There neither
-# FlashAttention-2 (caps at head_dim 256) nor a memory-efficient SDPA backend is
-# available, so plain SDPA falls to the *math* backend and materializes the full
-# [b, nq, t, t] score matrix -- the O(t^2) long-context wall (the big-head Gemma
-# global layers at seq-len 8k+ OOM here). FlexAttention is a compiled Triton
-# kernel that supports arbitrary head dims and a block-sparse mask (causal, plus
-# the sample-packing block-diagonal mask) at O(t) memory, with a real backward.
-# Compiled once: the fused kernel is what realizes the saving (the eager flex
-# fallback would itself materialize scores). Returns (flex_attention,
-# create_block_mask) or None when torch is too old / flex is unavailable.
-_FLEX = None
-_FLEX_TRIED = False
-
-
-def _flex_attn():
-    global _FLEX, _FLEX_TRIED
-    if not _FLEX_TRIED:
-        _FLEX_TRIED = True
-        try:
-            from torch.nn.attention.flex_attention import (
-                flex_attention, create_block_mask,
-            )
-            _FLEX = (torch.compile(flex_attention), create_block_mask)
-        except Exception:
-            _FLEX = None
-    return _FLEX
+# Big-head (head_dim > 256) layers -- the Gemma global layers -- have no
+# memory-efficient kernel in the training forward: FA2 caps at head_dim 256,
+# exllamav3's bighead kernel is inference-only, and at head_dim > 256 torch SDPA
+# can only pick the math backend (full [b, nq, t, t] score matrix -> the O(t^2)
+# long-context OOM). FlexAttention was tried but its Triton kernel exceeds the
+# shared-memory limit of a 24GB consumer card at this head dim (~512), and the
+# backward needs more still. So under sample packing these layers run SDPA
+# PER DOCUMENT (see _block_forward): each document attends only to itself, so the
+# materialized scores are bounded by the longest document, not the full packed
+# block -- the head-dim-agnostic O(sum t_doc^2) fallback.
 
 
 DEFAULT_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
@@ -242,12 +226,6 @@ class NativeLlamaQLoRA(nn.Module):
             self._flash_ok = False
         else:
             self._flash_ok = _fn is not None
-        # FlexAttention covers the big-head (head_dim > 256) layers at O(t) memory
-        # -- the layers FA2 can't take and SDPA runs as O(t^2) math. Enabled for
-        # any non-eager impl when torch's flex_attention is importable; the
-        # big-head layers fall back to the SDPA math path otherwise (correct, but
-        # OOMs at long context). Eager/fp32/CPU validate path never reaches it.
-        self._flex_ok = (attn_impl != "eager") and (_flex_attn() is not None)
         targets = set(target_modules) if target_modules is not None else set(DEFAULT_TARGET_MODULES)
         self.target_modules = sorted(targets)
         self.r = r
@@ -436,7 +414,7 @@ class NativeLlamaQLoRA(nn.Module):
         return bias
 
     def _block_forward(self, meta, entry, hidden, position_ids, attn_bias,
-                       attn_mode="eager", pack=None, flex_mask=None):
+                       attn_mode="eager", pack=None):
         bsz, t, _ = hidden.shape
         nq, nkv, hd = meta["num_q_heads"], meta["num_kv_heads"], meta["head_dim"]
 
@@ -498,43 +476,43 @@ class NativeLlamaQLoRA(nn.Module):
                     window_size=ws, softcap=float(meta["softcap"] or 0.0),
                 )                                               # [b, t, nq, hd]
                 ctx = o.reshape(bsz, t, nq * hd).float()
-        elif attn_mode == "flex":
-            # head_dim > 256, full-causal (optionally sample-packed): FlexAttention's
-            # compiled kernel handles any head dim at O(t) memory with a block-sparse
-            # mask (causal, or block-diagonal under packing -- prebuilt in forward()),
-            # and is autograd-capable. These are the big-head Gemma global layers
-            # FA2 can't take and SDPA would otherwise run as O(t^2) math. GQA
-            # (nkv < nq) goes through enable_gqa; runs in compute_dtype.
-            flex_fn, _ = _flex_attn()
-            qh, kh, vh = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            o = flex_fn(
-                qh.to(self.compute_dtype), kh.to(self.compute_dtype), vh.to(self.compute_dtype),
-                block_mask=flex_mask, scale=meta["sm_scale"], enable_gqa=(nq != nkv),
-            )                                               # [b, nq, t, hd]
-            ctx = o.transpose(1, 2).reshape(bsz, t, nq * hd).float()
         elif attn_mode == "sdpa":
-            # head_dim > 256 (e.g. Gemma global layers): FA2 can't, but torch SDPA's
-            # memory-efficient backend handles large heads and is differentiable and
-            # O(t) -- so these layers don't re-impose the t^2 peak. Used only for the
-            # full-causal, no-softcap case (chosen in forward()); GQA via enable_gqa.
-            qh, kh, vh = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            if attn_bias is not None:
-                # Packed big-head layer: SDPA can't combine is_causal with a custom
-                # mask, so pass the block-diagonal causal mask explicitly (boolean,
-                # True = attend), derived from the seg-aware additive bias. Keeps
-                # SDPA's O(t) compute; the [b,1,t,t] mask is the one O(t^2) buffer
-                # (cached across layers) -- the documented big-head packing fallback,
-                # since FA2 varlen caps head_dim at 256.
-                o = F.scaled_dot_product_attention(
-                    qh.to(self.compute_dtype), kh.to(self.compute_dtype), vh.to(self.compute_dtype),
-                    attn_mask=(attn_bias == 0), scale=meta["sm_scale"], enable_gqa=(nq != nkv),
-                )                                               # [b, nq, t, hd]
+            # head_dim > 256 (e.g. Gemma global layers): FA2 can't, and at head_dim
+            # > 256 torch SDPA can only use the math backend (full [nq, t, t]
+            # scores). To keep that from re-imposing the t^2 peak at long context,
+            # run SDPA PER DOCUMENT under packing: each document attends only to
+            # itself (is_causal), so the materialized scores are bounded by the
+            # longest document, not the whole packed block. GQA via enable_gqa;
+            # compute_dtype. Non-packed (pack is None) falls back to one full
+            # is_causal pass (right-padding makes that correct).
+            cd = self.compute_dtype
+            if pack is not None:
+                keep = pack["keep"].to(hidden.device)           # [b, t] bool
+                cu = pack["cu_seqlens"].to(hidden.device)       # [num_docs + 1]
+                qf = q[keep].to(cd)                             # [total, nq, hd]
+                kf = k[keep].to(cd)                             # [total, nkv, hd]
+                vf = v[keep].to(cd)
+                of = qf.new_zeros(qf.shape[0], nq, hd)
+                cul = cu.tolist()
+                for s, e in zip(cul[:-1], cul[1:]):
+                    # [1, heads, L, hd] for SDPA; isolate this document.
+                    od = F.scaled_dot_product_attention(
+                        qf[s:e].transpose(0, 1).unsqueeze(0),
+                        kf[s:e].transpose(0, 1).unsqueeze(0),
+                        vf[s:e].transpose(0, 1).unsqueeze(0),
+                        is_causal=True, scale=meta["sm_scale"], enable_gqa=(nq != nkv),
+                    )                                           # [1, nq, L, hd]
+                    of[s:e] = od.squeeze(0).transpose(0, 1)
+                o = q.new_zeros(bsz, t, nq, hd, dtype=of.dtype)
+                o[keep] = of
+                ctx = o.reshape(bsz, t, nq * hd).float()
             else:
+                qh, kh, vh = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
                 o = F.scaled_dot_product_attention(
-                    qh.to(self.compute_dtype), kh.to(self.compute_dtype), vh.to(self.compute_dtype),
+                    qh.to(cd), kh.to(cd), vh.to(cd),
                     is_causal=True, scale=meta["sm_scale"], enable_gqa=(nq != nkv),
                 )                                               # [b, nq, t, hd]
-            ctx = o.transpose(1, 2).reshape(bsz, t, nq * hd).float()
+                ctx = o.transpose(1, 2).reshape(bsz, t, nq * hd).float()
         else:
             # Eager reference: materializes [b, nq, t, t]. [b, n_heads, t, hd]
             q = q.transpose(1, 2)
@@ -586,21 +564,21 @@ class NativeLlamaQLoRA(nn.Module):
     # --- attention backend selection -------------------------------------
 
     def _attn_mode_for(self, meta, mem_eff: bool) -> str:
-        """Per-block attention backend: "flash" (FA2, head_dim<=256), "flex"
-        (FlexAttention, head_dim>256 full-causal no-softcap, O(t)), "sdpa" (same
-        case when flex is unavailable -- O(t^2) math fallback), else "eager".
-        mem_eff gates the memory-efficient kernels (CUDA + fp16/bf16)."""
+        """Per-block attention backend: "flash" (FA2, head_dim<=256), "sdpa"
+        (head_dim>256 full-causal no-softcap -- per-document under packing, else a
+        single full causal pass), else "eager". mem_eff gates the memory-efficient
+        kernels (CUDA + fp16/bf16)."""
         if not mem_eff:
             return "eager"
         hd = meta["head_dim"]
         if hd <= 256 and hd % 8 == 0:
             return "flash"
-        # head_dim > 256: FA2 unsupported. FlexAttention handles big heads + GQA at
-        # O(t) memory (with the causal / packing block mask) but has no window or
-        # softcap knobs, so only the plain full-causal case goes there; it falls
-        # back to the SDPA math path (correct, but O(t^2)) when flex is missing.
+        # head_dim > 256: FA2 unsupported and SDPA can only use the math backend, so
+        # only the plain full-causal case goes there (per-document under packing to
+        # bound the O(t^2) scores to the longest document); windowed/softcap big-head
+        # stays eager.
         if meta["sliding_window"] <= 0 and not meta["softcap"]:
-            return "flex" if self._flex_ok else "sdpa"
+            return "sdpa"
         return "eager"
 
     def _build_pack_context(self, seg_ids, attention_mask, bsz, t, device):
@@ -641,7 +619,7 @@ class NativeLlamaQLoRA(nn.Module):
         mem_eff = (self._flash_ok and is_cuda
                    and self.compute_dtype in (torch.float16, torch.bfloat16))
         counts = Counter(self._attn_mode_for(m, mem_eff) for m in self._block_meta)
-        plan = ", ".join(f"{counts[k]}×{k}" for k in ("flash", "flex", "sdpa", "eager") if counts[k])
+        plan = ", ".join(f"{counts[k]}×{k}" for k in ("flash", "sdpa", "eager") if counts[k])
         avail = "available" if _flash_attn_func() is not None else "NOT importable"
         why = "" if mem_eff else "  (eager: needs CUDA + fp16/bf16" + \
             ("" if self._flash_ok else " + flash_attn") + ")"
@@ -700,10 +678,10 @@ class NativeLlamaQLoRA(nn.Module):
         # Memory-efficient attention is used only on CUDA in fp16/bf16 (the kernels
         # need both); fp32 / CPU / gradcheck fall back to eager. The mode is chosen
         # PER BLOCK because Gemma mixes head sizes: FA2 (head_dim <= 256) covers the
-        # sliding/full layers, FlexAttention covers head_dim > 256 full-causal layers
-        # at O(t) (SDPA is the O(t^2) math fallback only when flex is unavailable),
-        # and eager is the fallback. Only eager/sdpa blocks build the [t, t] bias --
-        # skipping it for flash/flex is what realizes the O(t²) saving.
+        # sliding/full layers, SDPA covers head_dim > 256 full-causal layers
+        # (per-document under packing to bound the scores to the longest document),
+        # and eager is the fallback. Only eager blocks build the [t, t] bias --
+        # flash and sdpa both isolate documents via the packing descriptor instead.
         mem_eff = (self._flash_ok and hidden.is_cuda
                    and self.compute_dtype in (torch.float16, torch.bfloat16))
 
@@ -733,34 +711,6 @@ class NativeLlamaQLoRA(nn.Module):
                                             first_device) if (seg_ids is not None
                                                               and mem_eff) else None
 
-        # FlexAttention block-sparse mask for the big-head (head_dim > 256) layers:
-        # causal, plus the sample-packing block-diagonal constraint (a query attends
-        # only within its own document, seg_ids[q] == seg_ids[k]). Built lazily per
-        # device (constant across the big-head layers) and only when a flex block
-        # actually runs. The BlockMask stores block-level sparsity, not a dense
-        # [t, t] buffer, so it stays O(t/BLOCK)^2 -- the O(t) packing primitive for
-        # head_dim > 256, mirroring what cu_seqlens does for the flash path.
-        flex_mask_cache: dict = {}
-
-        def get_flex_mask(dev):
-            m = flex_mask_cache.get(str(dev))
-            if m is None:
-                _, create_block_mask = _flex_attn()
-                if seg_ids is not None:
-                    seg = seg_ids.to(dev)
-
-                    def mask_mod(b, h, q_idx, kv_idx):
-                        return (q_idx >= kv_idx) & (seg[b, q_idx] == seg[b, kv_idx])
-
-                    m = create_block_mask(mask_mod, bsz, None, t, t, device=dev)
-                else:
-                    def mask_mod(b, h, q_idx, kv_idx):
-                        return q_idx >= kv_idx
-
-                    m = create_block_mask(mask_mod, None, None, t, t, device=dev)
-                flex_mask_cache[str(dev)] = m
-            return m
-
         cur_device = first_device
         for meta, entry, dev in zip(self._block_meta, self.blocks, self._block_devices):
             # Cross the device boundary if this block sits on another card. All
@@ -770,27 +720,19 @@ class NativeLlamaQLoRA(nn.Module):
                 position_ids = backbone.to_device(position_ids, dev)
                 cur_device = dev
             mode = self._attn_mode_for(meta, mem_eff)
-            # eager: seg-aware additive bias. sdpa under packing: same bias, used as
-            # an explicit block-diagonal mask (the O(t^2) flex-unavailable fallback).
-            # flex: block-sparse causal/packing mask (built per device, O(t)).
-            # flash: no bias -- isolation comes from pack_ctx's cu_seqlens.
-            attn_bias = None
-            flex_mask = None
-            if mode == "eager":
-                attn_bias = get_bias(meta["sliding_window"], dev)
-            elif mode == "sdpa" and pack_ctx is not None:
-                attn_bias = get_bias(-1, dev)   # sdpa blocks are full-causal here
-            elif mode == "flex":
-                flex_mask = get_flex_mask(dev)
-            pack = pack_ctx if (mode == "flash" and pack_ctx is not None) else None
+            # eager: seg-aware additive bias. flash + sdpa both isolate documents
+            # via pack_ctx (cu_seqlens for flash-varlen; per-document SDPA loop for
+            # big-head), so neither builds the [t, t] bias.
+            attn_bias = get_bias(meta["sliding_window"], dev) if mode == "eager" else None
+            pack = pack_ctx if (mode in ("flash", "sdpa") and pack_ctx is not None) else None
             if ckpt:
                 hidden = torch.utils.checkpoint.checkpoint(
                     self._block_forward, meta, entry, hidden, position_ids, attn_bias,
-                    mode, pack, flex_mask, use_reentrant=False,
+                    mode, pack, use_reentrant=False,
                 )
             else:
                 hidden = self._block_forward(meta, entry, hidden, position_ids,
-                                             attn_bias, mode, pack, flex_mask)
+                                             attn_bias, mode, pack)
 
         # Final norm + head live on the output device (the last split device).
         hidden = backbone.to_device(hidden, self.device)
