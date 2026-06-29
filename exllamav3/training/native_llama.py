@@ -217,6 +217,15 @@ class NativeLlamaQLoRA(nn.Module):
         net.save_adapter("out/pirate")               # PEFT format
     """
 
+    # Class-level defaults for the optional feature flags so the helper methods are
+    # safe on a headless instance built via __new__ (the CPU tests construct nets that
+    # way to exercise _norm/_block_forward without a real model). Instance __init__
+    # overrides these. NOTE: only non-parameter flags get class defaults -- a class
+    # attribute that shadows a registered nn.Parameter (embed_lora_a, ...) would hide
+    # it from nn.Module's __getattr__, so those are read via getattr() in the accessor.
+    use_liger = False
+    offload_activations = False
+
     def __init__(
         self,
         model: nn.Module,
@@ -1038,11 +1047,12 @@ class NativeLlamaQLoRA(nn.Module):
         return ps
 
     def module_lora_parameters(self) -> list[nn.Parameter]:
-        """LoRA adapters on the embedding / LM head (lora_embed / lora_head), if any."""
+        """LoRA adapters on the embedding / LM head (lora_embed / lora_head), if any.
+        Read via getattr so a headless instance (no __init__) returns []."""
         ps: list[nn.Parameter] = []
-        if self.embed_lora_a is not None:
+        if getattr(self, "embed_lora_a", None) is not None:
             ps += [self.embed_lora_a, self.embed_lora_b]
-        if self.head_lora_a is not None:
+        if getattr(self, "head_lora_a", None) is not None:
             ps += [self.head_lora_a, self.head_lora_b]
         return ps
 
