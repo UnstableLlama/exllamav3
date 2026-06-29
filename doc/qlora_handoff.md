@@ -1117,6 +1117,79 @@ free memory is tightest). Loss descends cleanly (4.1 → 2.4 by step 5).
 
 ---
 
+### Session 9 — bf16 flash/packing parity gate CLOSED; review pass + doc/comment fixes
+
+> Branch `claude/exllama-qlora-review-xginxq`. A review of the whole QLoRA-on-EXL3
+> body of work, plus the bf16 packing verification that had been the standing
+> open item since Session 6, plus two box-free code/doc accuracy fixes.
+
+**bf16 forward parity is now confirmed for the flash + packing path (was the #1
+open verification gap).** Run-confirmed on the box:
+- **`qlora_validate_native.py --check-packing --compute-dtype bfloat16`**:
+  `attn: 16×flash` with packing **PASS** — 100% per-position argmax agreement,
+  last-token `cos ≈ 0.99996`. This is the first time the bf16 *flash* path (not
+  just fp32 eager) is differenced against exllamav3's own forward, and the first
+  with sample packing engaged.
+- **`tests/test_native_llama.py`**: packing **document-isolation** + **pad-NaN**
+  checks PASS.
+- **bf16 `--pack` training run** (4000 docs → 1413 packed blocks, **82.5% filled**)
+  descends cleanly on `16×flash`, grad norms 7–30, `|B|` climbing — confirming the
+  **flash-varlen backward** and the **`o[keep] = of` scatter under
+  grad-checkpointing** (a real risk area: a custom scatter inside a checkpointed
+  block, re-run on recompute).
+
+**Remaining parity sub-gate (precise scope):** the verified run is `16×flash`, i.e.
+**all head_dim ≤ 256 — no `sdpa` blocks exercised**. The **big-head `sdpa` path in
+bf16** (Gemma4's 8 global layers, head_dim 512, the per-document SDPA loop) is still
+only validated *indirectly* via the 12B/8k training descent. To close it the same
+way, run `qlora_validate_native.py --compute-dtype bfloat16` on a **Gemma4** base so
+`describe_attn` reports `…×sdpa` and the gate covers those blocks. Lower risk than
+flash was (plain `is_causal` SDPA, no custom scatter) — but it is the last
+uncovered attention branch, and it would **also** serve as the verification for the
+pending GQA-expansion removal (next item).
+
+**Code/doc accuracy fixes this session (box-free, no numeric change):**
+- **`native_llama._block_forward` (`sdpa` branch) — comment corrected.** The old
+  comment still claimed the per-document SDPA "keeps the mem-efficient backend
+  eligible" via hand-expanded GQA + no mask. Session 8 established that head_dim 512
+  *always* hits the SDPA **math** backend (mem-efficient/flash cap at 256), so that
+  rationale was wrong. Comment now states the reality; the `repeat_interleave` GQA
+  expansion is annotated as **pure overhead pending removal** (the math backend
+  reads `enable_gqa` directly). **The expansion itself was intentionally left in
+  place** — removing it changes the attention path and there were no test runs to
+  confirm it; do it in the query-tiled big-head rewrite (Session 8 open #1/#2) and
+  cover it with the bf16 Gemma4 `sdpa` gate above.
+- **Gemma2 `--head-vocab-chunk` no-op warning.** `compute_loss` routes any model
+  with final-logit softcapping (Gemma2) to the materialized supervised-position head
+  path *before* the vocab-chunk branch, because the chunked-vocab CE can't apply the
+  tanh cap — so `--head-vocab-chunk` is silently a no-op there. That is exactly the
+  case you'd want it (Gemma2 = 256k vocab + softcap). `NativeLlamaQLoRA.__init__` now
+  prints a one-line heads-up so the bypass isn't silent; **no loss-path change**.
+  (A real fix would be a softcap-aware chunked CE — not built; flag if Gemma2 with
+  long supervised spans becomes a target.)
+
+**Review findings still open (carried forward, unchanged):**
+- **bf16 `sdpa` big-head parity gate** on Gemma4 (above) — the one real remaining
+  correctness check.
+- **Drop the GQA `repeat_interleave`** in the big-head `sdpa` path (free margin on
+  the constrained card; do it with the query-tiling rewrite, verify via the gate).
+- **Mirror `--optim {adamw,adamw8bit,paged_adamw8bit}`** into the DDP + BNB arms
+  (currently native-single-GPU only) so a matched EXL3-vs-NF4 flagship run has equal
+  optimizer-state memory. (Session 8 open #4.)
+- **Micro-nit:** `EXL3LoRAFunction.backward` reconstructs the frozen weight and
+  computes `grad_x` *before* checking `needs_input_grad[0]`; the reconstruction is
+  wasted when `grad_x` isn't needed. In practice the first wrapped linear's input
+  always requires grad, so cost ≈ 0 today — noted only for completeness.
+
+**Next (box runs, when you're running again):**
+1. The bf16 Gemma4 `sdpa` parity gate (closes the last correctness hole).
+2. A real packed run with a **held-out eval** to quantify the tok/s win from `--pack`
+   and confirm the loss floor is unchanged vs unpacked.
+3. The low-bitrate flagship (EXL3 2.5/3bpw where NF4 can't follow, on a real
+   metric) — still the highest-value *unrealized* result (§0d).
+
+---
+
 ## 0d. Multi-GPU strategy (rationale)
 
 "Multi-GPU" splits by *goal*, and QLoRA changes which tool fits, because only the

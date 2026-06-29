@@ -313,6 +313,16 @@ class NativeLlamaQLoRA(nn.Module):
         self._head_slice = None
         if self.head_vocab_chunk > 0:
             self._head_slice = backbone.head_weight_slice_closure(self.lm_head)
+        # Gemma2-style final-logit softcapping forces compute_loss down the
+        # materialized supervised-position head path (the chunked-vocab CE can't
+        # apply the tanh cap), so --head-vocab-chunk is silently a no-op there. Warn
+        # once: on a big-vocab softcapped model (Gemma2 = 256k vocab + softcap) the
+        # [hidden, vocab] spike the chunk flag is meant to avoid is NOT avoided.
+        if self.head_vocab_chunk > 0 and self.final_softcap:
+            print(" -- note: --head-vocab-chunk is ignored on this model because it "
+                  "uses final-logit softcapping; the chunked-vocab CE can't apply the "
+                  "tanh cap, so compute_loss uses the materialized supervised-position "
+                  "head loss. Watch head memory on a big-vocab softcapped base.")
 
         # Sanity: every requested target name actually matched something.
         matched = {w.key.split(".")[-1] for w in wrappers if w.r > 0}
@@ -491,18 +501,22 @@ class NativeLlamaQLoRA(nn.Module):
                 )                                               # [b, t, nq, hd]
                 ctx = o.reshape(bsz, t, nq * hd)
         elif attn_mode == "sdpa":
-            # head_dim > 256 (Gemma global layers): FA2 can't, but torch's
-            # MEM-EFFICIENT SDPA backend handles big heads at O(t) -- the same path
-            # HF/Axolotl ride to fit long context. Two things were forcing the O(t^2)
-            # math backend instead: (1) the old packed path passed an explicit [t,t]
-            # mask (any user mask disqualifies the mem-efficient backend), and
-            # (2) enable_gqa=True also disqualifies it on torch's C++ path. So here
-            # we (a) isolate documents by running PER DOCUMENT with is_causal and NO
-            # mask, and (b) expand GQA by hand (repeat KV to nq heads) and drop
-            # enable_gqa, so the mem-efficient backend stays eligible. Default SDPA
-            # backend selection then prefers it over math; if it's somehow ineligible
-            # for this head_dim, the per-document fallback keeps the math cost bounded
-            # to the longest document. Non-packed: one full is_causal pass.
+            # head_dim > 256 (Gemma global layers): FA2 can't (caps at 256), and
+            # torch's mem-efficient / flash SDPA backends ALSO cap at head_dim 256 --
+            # so at this head dim SDPA can only pick the MATH backend, which
+            # materializes the [nq, L, L] score matrix in fp32 (it upcasts regardless
+            # of input dtype). This is the same O(t^2) math HF/Axolotl run on these
+            # layers too. (An earlier comment here claimed the mem-efficient backend
+            # could be kept "eligible" by hand-expanding GQA and dropping the mask --
+            # that premise was wrong; see the Session 8 correction in the handoff doc.)
+            # We bound the spike by running PER DOCUMENT under packing with is_causal,
+            # so the score matrix scales with the longest *document*, not the full
+            # packed block. The hand repeat_interleave of K/V to nq heads below is now
+            # pure overhead (the math backend handles GQA via enable_gqa) and should be
+            # dropped in the query-tiled rewrite -- left as-is here to avoid an
+            # untested change to the attention path. The real O(t) fix for this head
+            # dim is query-tiled attention (module header / handoff doc) -- not built.
+            # Non-packed: one full is_causal pass.
             cd = self.compute_dtype
             rep = nq // nkv
             if pack is not None:
