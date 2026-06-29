@@ -1317,6 +1317,66 @@ The fp32 gate (100%, cos 0.999998) remains the correctness proof. `qlora_validat
 now **tolerates a low-precision top-1 flip when argmax-agreement ≥ 0.8 and cos ≥ 0.999**
 (fp32 stays strict), so this no longer reads as a spurious FAIL.
 
+#### Session 9 — DONE this session (recap) and OPEN for next session
+
+**DONE (branch `claude/exllama-qlora-review-xginxq`, all merged/pushed):**
+- Full review of the QLoRA-on-EXL3 work; recorded the bf16 flash/packing parity
+  (`--check-packing`) result that had been open since Session 6.
+- VRAM-efficiency research vs Axolotl/Liger/torchao/DeepSpeed/unsloth (sourced; in the
+  session log). Net: this repo already has FLCE + packing + grad-ckpt + 8-bit optim +
+  bf16 activations; the gaps it filled are below.
+- **Three VRAM features built + RUN-CONFIRMED** (native single-process trainer; see the
+  detailed blocks above for the design and the bugs fixed):
+  - **A** `--offload-embed-head-optim` — embed/head optimizer → CPU (torchao, bf16
+    stochastic rounding). 547M params @ 3.39 GB on the 1B; resume round-trips.
+  - **B** `--lora-embed` / `--lora-head` — low-rank embed/head training (30.8M vs 547M).
+  - **C** `--offload-activations` (torch save_on_cpu) + `--use-liger` (Liger RMSNorm/
+    SwiGLU). Liger parity = wash vs torch; offload numerically identical.
+- Validate gate now tolerates a low-precision borderline top-1 flip (fp32 strict).
+
+**OPEN — measurements & real-use (NOT correctness; correctness is confirmed):**
+1. **Quantify the VRAM wins at scale** — the smoke runs were too small to show C's
+   benefit. Do with-vs-without `peak VRAM` diffs at a realistic config:
+   - `--offload-activations`: bump `--seq-len 4096/8192` (or `--batch`) — that's where
+     it pays (activations dominate; at 1B/2048/b2 it was only ~0.07 GB).
+   - `--use-liger`: a sizable run with vs without; compare peak VRAM + tok/s (this gives
+     the Liger memory/speed number we don't yet have).
+2. **A real training run with `--train-head`/`--lora-head` + an eval** — confirm the
+   embed/head training actually *helps* the task (held-out loss), not just that it runs.
+   Live samples / native infer do NOT reflect embed/head training — judge via held-out
+   eval or after a merge/re-quantize.
+3. **`--parallel split` + `--offload-embed-head-optim`** — the one unverified combo
+   (torchao offload optimizer with params spanning cuda:0/cuda:1, single process). Run
+   the gate first: `qlora_validate_native.py --parallel split --use-per-device 8 24
+   --check-backward`, then a short split training run.
+4. **Re-run the Gemma `--use-liger` gate** to confirm the softened gate now reports
+   `PASS` (`MISMATCH (tolerated: low-precision noise…)`), not FAIL.
+
+**OPEN — could-build-next (nice-to-have, not started):**
+5. **Mirror A/B/C into the DDP arm** (`qlora_train_native_ddp.py`). Today they're native
+   single-process only. Note torchao's CPUOffloadOptimizer is single-process, so A under
+   DDP would need a different offload (per-rank bnb paged, or a hand-rolled CPU optimizer)
+   — or just document A as single-process/`--parallel split` only.
+6. **Async (CUDA-stream) activation offload** — the current `--offload-activations` is
+   torch's *synchronous* `save_on_cpu` (~3% slower here). unsloth's double-buffered async
+   version is ~1%. Would replace/augment the save_on_cpu wrap in `native_llama.forward`.
+7. **Chunked trainable-head CE** — `--train-head` / `--lora-head` currently materialize
+   `[supervised_tokens, vocab]` logits (the vocab-chunked fused CE is frozen-head only).
+   Extend `FusedLinearCrossEntropyVocabChunked` to emit a head/LoRA-B gradient so the
+   trainable-head path stays memory-bounded on big-vocab models (Gemma 262k).
+8. **GQA `repeat_interleave` removal** in the big-head `sdpa` branch + query-tiled
+   big-head attention (carried from Session 8 open #1/#2; the bf16 Gemma `sdpa` gate now
+   exists to verify it).
+9. **Liger for GeGLU** (currently silu-only; GeGLU/Gemma MLP stays torch) and Liger
+   RMSNorm on the 4D per-head q/k/v norm (currently torch) — both via the existing
+   `--use-liger` guard, if the quantified Liger win (#1) justifies the extra wiring.
+
+**Env note for next session:** torch 2.8.0+cu128, torchao 0.17.0, liger-kernel and
+flash_attn installed in the qlora-venv. xformers is ABI-mismatched (ignored; the SDPA
+fallback handles big heads). Test models: `$LLAMA1B` (Llama-3.2-1B 4bpw, tied) and
+`$GEMMA4` (gemma-4-12B-it, 40×flash + 8×sdpa). Test scratch dir: `$OUT` /
+`/mnt/two/Weights/qlora_test`.
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)
