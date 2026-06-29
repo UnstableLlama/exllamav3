@@ -73,6 +73,16 @@ def is_main(rank):
 
 
 def main():
+    # Line-buffer stdout/stderr so per-step progress flushes on each newline.
+    # Python block-buffers stdout when it isn't a TTY -- exactly when the run is
+    # redirected to a file or piped through tee -- which otherwise holds every
+    # step line in an ~8KB buffer and dumps them all at once at process exit.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass  # not a TextIOWrapper (already line-buffered, or wrapped)
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", default="out/exl3_qlora_adapter")
