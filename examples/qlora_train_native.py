@@ -160,21 +160,27 @@ def prune_checkpoints(out, keep):
 TRAINER_STATE_FILE = "trainer_state.pt"
 
 
-def save_trainer_state(directory, *, step, opt, sched, best_val, best_val_step, ema):
+def save_trainer_state(directory, *, step, opt, sched, best_val, best_val_step, ema,
+                       offload_opt=None):
     """Persist resumable training state next to the adapter so --resume continues
     the optimizer + LR schedule instead of cold-restarting them (which would
     wrongly replay warmup/cosine from step 0). Small for LoRA (AdamW moments are a
     few MB at low rank). Written into every save target, so any checkpoint dir --
     the best at --out, a --save-every copy, or a --checkpoint-every history dir --
-    is a complete resume point."""
-    torch.save({
+    is a complete resume point. ``offload_opt`` is the optional CPU-offload optimizer
+    for the embed/head group (its state is large -- the embed/head Adam moments --
+    but lives on CPU); stored under a separate key so a run without it still loads."""
+    state = {
         "step": int(step),
         "optimizer": opt.state_dict(),
         "scheduler": sched.state_dict() if sched is not None else None,
         "best_val": best_val,
         "best_val_step": best_val_step,
         "ema": ema,
-    }, os.path.join(directory, TRAINER_STATE_FILE))
+    }
+    if offload_opt is not None:
+        state["offload_optimizer"] = offload_opt.state_dict()
+    torch.save(state, os.path.join(directory, TRAINER_STATE_FILE))
 
 
 def load_trainer_state(directory):
@@ -317,6 +323,54 @@ def build_optimizer(param_groups, lr, optim="adamw"):
         )
     cls = bnb.optim.PagedAdamW8bit if optim == "paged_adamw8bit" else bnb.optim.AdamW8bit
     return cls(param_groups, lr=lr)
+
+
+def build_cpu_offload_optimizer(params, lr):
+    """A torchao ZeRO-Offload optimizer for the fully-trained embedding / LM head.
+
+    Keeps the optimizer state (and the bf16 master weights) on CPU and runs the
+    AdamW step there, so the ~12 bytes/param of fp32 Adam state for the (huge,
+    untied ~0.8B-each) embed/head matrices never sits on the GPU -- only the bf16
+    parameter and its transient grad do. The base optimizer is torchao's AdamW with
+    ``bf16_stochastic_round=True`` (bound via ``partial`` so it applies regardless of
+    whether CPUOffloadOptimizer forwards kwargs): bf16 master updates stay an
+    unbiased estimate of fp32, so small embedding updates aren't rounded away. The
+    embed/head params must already be bf16 (NativeLlamaQLoRA(modules_to_save_dtype=
+    bfloat16)) for the rounding to apply.
+
+    State-only offload (NOT offload_gradients) so gradient accumulation still works.
+    CPUOffloadOptimizer is a wrapper, not a real optimizer: it has no LR-scheduler
+    support and forbids gradient clipping on its params, so the caller mirrors the
+    schedule's LR via set_offload_lr() each step and excludes these params from the
+    clip. Single-process only (CUDA); not for the DDP arm.
+    """
+    try:
+        import functools
+        from torchao.optim import CPUOffloadOptimizer
+        from torchao.optim import AdamW as AOAdamW
+    except Exception as e:
+        raise SystemExit(
+            f"--offload-embed-head-optim needs torchao, which is not importable "
+            f"({e}). Install it in this venv (pip install torchao) or drop the flag "
+            f"(the embed/head optimizer then stays on GPU; use --optim adamw8bit to "
+            f"shrink it instead)."
+        )
+    base = functools.partial(AOAdamW, bf16_stochastic_round=True)
+    opt = CPUOffloadOptimizer(params, base, lr=lr)
+    set_offload_lr(opt, lr)   # don't rely on lr= forwarding to the base optimizer
+    return opt
+
+
+def set_offload_lr(opt, lr):
+    """Set the LR on every param group of a CPUOffloadOptimizer (which is not
+    compatible with torch's LR schedulers). Handles the tensor-LR case torchao uses
+    for its fused/compiled path."""
+    for g in opt.param_groups:
+        cur = g.get("lr")
+        if isinstance(cur, torch.Tensor):
+            cur.fill_(lr)
+        else:
+            g["lr"] = lr
 
 
 def make_lr_scheduler(optimizer, name, total_steps, warmup_steps):
@@ -790,6 +844,15 @@ def main():
                          "the loss off the fused frozen-head path to a supervised-"
                          "position cross-entropy so the head gets a gradient. On a "
                          "tied model this is equivalent to --train-embeddings.")
+    ap.add_argument("--offload-embed-head-optim", action="store_true",
+                    help="Put the fully-trained embedding/LM-head optimizer on CPU "
+                         "(torchao CPUOffloadOptimizer) with bf16 stochastic-rounding "
+                         "master weights, so the embed/head Adam state never sits on "
+                         "the GPU -- frees ~12 bytes/param of the (huge, untied) "
+                         "embed/head matrices. Requires torchao and "
+                         "--train-embeddings/--train-head. Single-process only (not "
+                         "the DDP arm); these params are excluded from grad clipping "
+                         "and follow the same LR schedule as the LoRA group.")
     ap.add_argument("--compute-dtype", default="bfloat16",
                     choices=["float32", "float16", "bfloat16"])
     ap.add_argument("--no-grad-ckpt", action="store_true")
@@ -932,11 +995,18 @@ def main():
         pad_id = tokenizer.eos_token_id or 0
 
     # 2. Build the differentiable QLoRA model (frozen base + trainable adapters).
+    if args.offload_embed_head_optim and not (args.train_embeddings or args.train_head):
+        raise SystemExit("--offload-embed-head-optim has nothing to offload without "
+                         "--train-embeddings and/or --train-head.")
+    # bf16 embed/head master weights when the CPU-offload optimizer (bf16 stochastic
+    # rounding) drives them; fp32 otherwise.
+    ms_dtype = torch.bfloat16 if args.offload_embed_head_optim else torch.float32
     net = NativeLlamaQLoRA(
         model, r=args.r, alpha=args.alpha, target_modules=args.targets,
         compute_dtype=cdt, gradient_checkpointing=not args.no_grad_ckpt,
         train_embeddings=args.train_embeddings, train_head=args.train_head,
         attn_impl=args.attn_impl, head_vocab_chunk=args.head_vocab_chunk,
+        modules_to_save_dtype=ms_dtype,
     )
     net.train()
     if args.head_vocab_chunk and net._head_slice is None:
@@ -1096,7 +1166,18 @@ def main():
 
     # 5. Optimizer over the trainable params, plus the LR schedule. Weight decay
     #    on the LoRA params only (param_groups puts embed/head in a 0-WD group).
-    opt = build_optimizer(net.param_groups(args.weight_decay), args.lr, args.optim)
+    #    With --offload-embed-head-optim the embed/head group is split off onto a
+    #    separate CPU-offload optimizer (offload_opt) and the main optimizer/scheduler
+    #    drives only the LoRA group; offload_opt mirrors the schedule's LR per step.
+    offload_opt = None
+    if args.offload_embed_head_optim:
+        lora_groups = [{"params": net.lora_parameters(), "weight_decay": args.weight_decay}]
+        opt = build_optimizer(lora_groups, args.lr, args.optim)
+        offload_opt = build_cpu_offload_optimizer(net.modules_to_save_parameters(), args.lr)
+        print(f" -- embed/head optimizer offloaded to CPU (torchao, bf16 stochastic "
+              f"rounding); excluded from grad clip, follows the LoRA LR schedule")
+    else:
+        opt = build_optimizer(net.param_groups(args.weight_decay), args.lr, args.optim)
     sched = make_lr_scheduler(opt, args.scheduler, args.steps, warmup_steps)
 
     # 5a. Optionally restore optimizer/schedule/step from the resumed checkpoint so
@@ -1107,6 +1188,11 @@ def main():
         resume_state = load_trainer_state(args.resume)
         if resume_state is not None:
             restore_optimizer_state(opt, resume_state["optimizer"])
+            # The CPU-offload optimizer manages its own (CPU) state placement, so
+            # load it directly rather than through restore_optimizer_state (which would
+            # move state onto the params' GPU devices). Absent in pre-offload runs.
+            if offload_opt is not None and resume_state.get("offload_optimizer") is not None:
+                offload_opt.load_state_dict(resume_state["offload_optimizer"])
             if resume_state.get("scheduler") is not None:
                 sched.load_state_dict(resume_state["scheduler"])
             resume_step = int(resume_state["step"])
@@ -1139,7 +1225,8 @@ def main():
         # Always leave net in train mode after; saving touches the adapter only.
         net.save_adapter(args.out, base_model_name_or_path=args.model)
         save_trainer_state(args.out, step=step, opt=opt, sched=sched,
-                           best_val=best_val, best_val_step=best_val_step, ema=ema)
+                           best_val=best_val, best_val_step=best_val_step, ema=ema,
+                           offload_opt=offload_opt)
         print(f"{tag} Adapter written to {args.out}")
 
     def eval_loss(exs):
@@ -1166,6 +1253,8 @@ def main():
 
     bgen = batches()
     opt.zero_grad(set_to_none=True)
+    if offload_opt is not None:
+        offload_opt.zero_grad(set_to_none=True)
     # Seed from the resumed state so best-tracking and the EMA continue rather than
     # reset (resume_state is None under --reset-optimizer / a weights-only dir).
     ema = resume_state["ema"] if resume_state else None
@@ -1296,12 +1385,25 @@ def main():
 
             # grad norm BEFORE clipping is a direct check that gradients reach the
             # adapters (a flat ~0 here would mean the backward graph is broken).
+            # Under --offload-embed-head-optim the embed/head params are excluded
+            # (torchao's CPUOffloadOptimizer forbids grad clipping on its params);
+            # the LoRA grads are what the norm/clip should reflect anyway.
+            clip_params = (net.lora_parameters() if offload_opt is not None
+                           else net.trainable_parameters())
             gnorm = torch.nn.utils.clip_grad_norm_(
-                net.trainable_parameters(), args.max_grad_norm or float("inf")
+                clip_params, args.max_grad_norm or float("inf")
             ).item()
+            if offload_opt is not None:
+                # Mirror the schedule's current LR (the one opt.step() is about to use)
+                # onto the offload optimizer, which has no scheduler support, then step
+                # both. Set before stepping so embed/head move at the same LR as LoRA.
+                set_offload_lr(offload_opt, sched.get_last_lr()[0])
+                offload_opt.step()
             opt.step()
             sched.step()
             opt.zero_grad(set_to_none=True)
+            if offload_opt is not None:
+                offload_opt.zero_grad(set_to_none=True)
 
             # Rolling tok/s over the train-step compute only (eval/sample/save
             # below are excluded so the rate reflects steady-state throughput).
@@ -1354,7 +1456,7 @@ def main():
                 net.save_adapter(cdir, base_model_name_or_path=args.model)
                 save_trainer_state(cdir, step=step, opt=opt, sched=sched,
                                    best_val=best_val, best_val_step=best_val_step,
-                                   ema=ema)
+                                   ema=ema, offload_opt=offload_opt)
                 print(f"  [checkpoint] step {step} -> {cdir} (resumable)")
                 prune_checkpoints(args.out, args.keep_checkpoints)
     except KeyboardInterrupt:

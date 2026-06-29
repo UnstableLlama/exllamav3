@@ -207,6 +207,7 @@ class NativeLlamaQLoRA(nn.Module):
         train_head: bool = False,
         attn_impl: str = "auto",
         head_vocab_chunk: int = 0,
+        modules_to_save_dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
         self.model = model
@@ -345,6 +346,11 @@ class NativeLlamaQLoRA(nn.Module):
         # hint for a downstream merge/re-quantize step.)
         self.train_embeddings = bool(train_embeddings)
         self.train_head = bool(train_head)
+        # dtype of the trainable embed/head master copies. fp32 by default; bf16 when
+        # the optimizer does bf16 stochastic-rounding updates (CPU-offload path), which
+        # keeps the master at bf16 without losing small updates (so the GPU holds a 2-
+        # byte param instead of 4, and the CPU-offloaded optimizer halves its master).
+        self.modules_to_save_dtype = modules_to_save_dtype
         self.tie_word_embeddings = bool(
             getattr(getattr(model, "config", None), "tie_word_embeddings", False))
         self.embed_weight = None    # [vocab, hidden], trainable, or None
@@ -354,12 +360,15 @@ class NativeLlamaQLoRA(nn.Module):
         # copies on the GPU compute devices so training isn't bottlenecked on a CPU
         # optimizer / matmul. First-block device for the input embedding, head
         # device for the output projection (identical under single-device / DDP).
+        # Reconstruct in fp32, then cast to the chosen master dtype.
         if self.train_embeddings:
             w = backbone.embed_weight(self.embed).detach().to(torch.float32)   # [V, d]
-            self.embed_weight = nn.Parameter(w.clone().to(self._block_devices[0]))
+            self.embed_weight = nn.Parameter(
+                w.clone().to(self._block_devices[0]).to(modules_to_save_dtype))
         if self.train_head:
             hw = backbone.head_weight_closure(self.lm_head)().detach().to(torch.float32)  # [d, V]
-            self.head_weight = nn.Parameter(hw.clone().to(self._head_device))
+            self.head_weight = nn.Parameter(
+                hw.clone().to(self._head_device).to(modules_to_save_dtype))
 
     # --- forward -----------------------------------------------------------
 
@@ -850,7 +859,11 @@ class NativeLlamaQLoRA(nn.Module):
             logits = hs @ w
             if self.final_softcap:
                 logits = self.final_softcap * torch.tanh(logits / self.final_softcap)
-            return F.cross_entropy(logits, lbl[valid].to(w.device))
+            # Upcast logits to fp32 for the softmax/CE regardless of the head dtype --
+            # a no-op for an fp32 head, but essential when the head is bf16 (the
+            # stochastic-rounding offload path), where a bf16 softmax over a large
+            # vocab is numerically unstable.
+            return F.cross_entropy(logits.float(), lbl[valid].to(w.device))
         # The fused head matmuls hidden against the frozen head weight, which
         # lives on the head's device; co-locate them (no-op single-device).
         hidden = backbone.to_device(hidden, self._head_device)

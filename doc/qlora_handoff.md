@@ -1188,6 +1188,52 @@ pending GQA-expansion removal (next item).
 3. The low-bitrate flagship (EXL3 2.5/3bpw where NF4 can't follow, on a real
    metric) — still the highest-value *unrealized* result (§0d).
 
+#### Session 9 (cont.) — VRAM-efficiency research + feature A: CPU-offloaded embed/head optimizer
+
+Researched VRAM-efficiency techniques across Axolotl / Liger / torchao / DeepSpeed /
+unsloth and mapped them onto this repo (see chat log for the full sourced writeup).
+Net gaps vs Axolotl: fused RMSNorm/SwiGLU/RoPE kernels (Liger), CPU activation
+offloading (unsloth/torchtune), and a CPU-offload optimizer. The hot path's fp32
+hygiene is already correct (norm reductions / softmax / CE fp32; activations bf16
+since Session 8), so the precision wins are confined to the trained embed/head.
+
+**Feature A — `--offload-embed-head-optim` (native single-process trainer; WRITE-
+CONFIRMED ONLY, not yet run).** Puts the fully-trained embedding / LM-head optimizer
+on CPU via **torchao `CPUOffloadOptimizer`** with **bf16 stochastic-rounding** master
+weights, so the ~12 bytes/param of Adam state for the (huge, untied ~0.8B-each)
+embed/head matrices never sits on the GPU — only the bf16 param + transient grad do.
+- **Two-optimizer split** (`qlora_train_native.py`): LoRA stays on the existing
+  AdamW/8-bit + `LambdaLR` + grad-clip path; the embed/head group goes on
+  `CPUOffloadOptimizer(ms_params, partial(torchao.optim.AdamW, bf16_stochastic_round=
+  True))` (state-only offload — NOT `offload_gradients`, so grad-accum still works).
+- **Constraints handled** (from torchao's docs): it's a wrapper with no LR-scheduler
+  support and **forbids grad clipping on its params** → embed/head are excluded from
+  `clip_grad_norm_` (only LoRA is clipped), and the schedule's LR is **mirrored** onto
+  the offload optimizer each step so embed/head track the LoRA LR. `save/load_trainer_
+  state` round-trips its state under a separate `offload_optimizer` key (absent in
+  pre-offload checkpoints → loads fine). Weights are loaded (line 946 `load_adapter`)
+  before the optimizer is built, satisfying torchao's "load weights first" rule.
+- **bf16 master** requires the params to be bf16: `NativeLlamaQLoRA(modules_to_save_
+  dtype=bfloat16)` (fp32 otherwise). The `--train-head` CE now upcasts logits to fp32
+  (no-op for an fp32 head; essential for a bf16 one — a bf16 softmax over a big vocab
+  is unstable).
+- **Scope:** single-process only (torchao is single-GPU; should also cover
+  `--parallel split` since that's one process — verify). NOT wired into the DDP arm.
+  Needs `pip install torchao` in the venv.
+- **Residual uncertainty (must smoke-test):** whether `CPUOffloadOptimizer` forwards
+  `lr=`/composes with the `partial`-bound `bf16_stochastic_round` exactly as assumed,
+  and whether it composes with `--parallel split` (params on cuda:0/cuda:1). Smoke:
+  ```
+  python examples/qlora_train_native.py --model <exl3> --dataset <small> \
+      --train-head --train-embeddings --offload-embed-head-optim \
+      --steps 5 --batch 1 --checkpoint-every 3   # then --resume to confirm round-trip
+  #  Expect: loss descends, |B| climbs, embed/head Adam state on CPU (nvidia-smi: the
+  #  embed/head optimizer no longer shows on-GPU), resume continues at the right step/LR.
+  ```
+
+**Still to do (this branch): B — LoRA-on-head/embed (or PEFT trainable-tokens) as the
+cheaper structural alternative; C — activation offload + Liger RMSNorm/SwiGLU swap.**
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)
