@@ -37,6 +37,7 @@ gating, mRoPE, partial rotary and non-NeoX RoPE.
 
 from __future__ import annotations
 from typing import Callable, Iterable, Optional
+import contextlib
 import json
 import os
 import torch
@@ -71,6 +72,28 @@ def _flash_attn_func():
         except Exception:
             _FLASH_FN = None
     return _FLASH_FN
+
+
+# Liger Triton kernels (optional). Fused RMSNorm (in-place backward -> less activation
+# memory) and SiLU*mul (fewer intermediates). Imported lazily/cached (Triton CUDA
+# kernels; must not import at module load on a CPU box). Returns
+# (LigerRMSNormFunction, LigerSiLUMulFunction) or None when unavailable. These are
+# real autograd Functions, so they slot into the differentiable forward directly.
+_LIGER = None
+_LIGER_TRIED = False
+
+
+def _liger_ops():
+    global _LIGER, _LIGER_TRIED
+    if not _LIGER_TRIED:
+        _LIGER_TRIED = True
+        try:
+            from liger_kernel.ops.rms_norm import LigerRMSNormFunction
+            from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+            _LIGER = (LigerRMSNormFunction, LigerSiLUMulFunction)
+        except Exception:
+            _LIGER = None
+    return _LIGER
 
 
 # Big-head (head_dim > 256) layers -- the Gemma global layers -- have no
@@ -210,8 +233,22 @@ class NativeLlamaQLoRA(nn.Module):
         modules_to_save_dtype: torch.dtype = torch.float32,
         lora_embed: bool = False,
         lora_head: bool = False,
+        offload_activations: bool = False,
+        use_liger: bool = False,
     ):
         super().__init__()
+        # Offload the (grad-checkpointed) saved activations to CPU via torch's
+        # built-in save_on_cpu, and/or route RMSNorm + SwiGLU through Liger Triton
+        # kernels. Both are CUDA + fp16/bf16 memory levers; eager fp32 / CPU / the
+        # validate path ignore them (so the correctness gate is unaffected). Liger
+        # changes numerics slightly -- run qlora_validate_native.py with --use-liger
+        # before trusting a Liger run.
+        self.offload_activations = bool(offload_activations)
+        self.use_liger = bool(use_liger)
+        if self.use_liger and _liger_ops() is None:
+            raise SystemExit(
+                "use_liger=True but liger_kernel is not importable. Install it "
+                "(pip install liger-kernel) or drop --use-liger.")
         self.model = model
         self.compute_dtype = compute_dtype
         self.gradient_checkpointing = gradient_checkpointing
@@ -417,6 +454,21 @@ class NativeLlamaQLoRA(nn.Module):
         # a training run, fp32 in the validate/reference path) so the residual
         # stream stays in compute_dtype rather than being silently upcast to fp32.
         # Mirrors HF RMSNorm (fp32 internals, cast back to the activation dtype).
+        #
+        # Liger fast path (opt-in, CUDA + fp16/bf16): the fused RMSNorm kernel with
+        # in-place backward cuts activation memory. Only for the 2D/3D norms (attn/mlp/
+        # post/final) -- the 4D per-head q/k/v norm falls through to torch. Requires
+        # constant_scale == 1.0 (Liger has no scale param). casting_mode="gemma" =
+        # full-fp32 normalize, matching this module's fp32-internal numerics for every
+        # arch; offset = constant_bias reproduces Gemma's (1 + weight).
+        if (self.use_liger and x.is_cuda and x.dim() in (2, 3)
+                and spec["scale"] == 1.0
+                and self.compute_dtype in (torch.float16, torch.bfloat16)):
+            ops = _liger_ops()
+            if ops is not None:
+                w = spec["weight"]
+                w = w.to(x.dtype) if w is not None else None
+                return ops[0].apply(x, w, spec["eps"], spec["bias"], "gemma")
         xf = x.float()
         var = xf.pow(2).mean(dim=-1, keepdim=True) + spec["eps"]
         xn = xf * torch.rsqrt(var) * spec["scale"]
@@ -631,11 +683,19 @@ class NativeLlamaQLoRA(nn.Module):
 
         # --- gated MLP (SwiGLU / GeGLU) ---
         normed2 = self._norm(hidden, entry.mlp_norm_spec)
-        act = F.silu if meta["activation"] == "silu" \
-            else (lambda z: F.gelu(z, approximate="tanh"))
+        is_silu = meta["activation"] == "silu"
+        act = F.silu if is_silu else (lambda z: F.gelu(z, approximate="tanh"))
+        # Liger fused SiLU*mul (CUDA + fp16/bf16, silu only -- GeGLU stays torch):
+        # fuses the activation+multiply into one kernel, saving an intermediate.
+        liger_silu = (self.use_liger and is_silu and normed2.is_cuda
+                      and self.compute_dtype in (torch.float16, torch.bfloat16))
+        liger_ops = _liger_ops() if liger_silu else None
         mlp_out = None
         for gate, up, down in zip(entry.gates, entry.ups, entry.downs):
-            a = act(gate(normed2)) * up(normed2)
+            if liger_ops is not None:
+                a = liger_ops[1].apply(gate(normed2), up(normed2))   # silu(gate)*up
+            else:
+                a = act(gate(normed2)) * up(normed2)
             d = down(a)                                          # compute_dtype (no fp32 upcast)
             mlp_out = d if mlp_out is None else mlp_out + d
         if entry.mlp_post_spec is not None:
@@ -815,28 +875,38 @@ class NativeLlamaQLoRA(nn.Module):
                                             first_device) if (seg_ids is not None
                                                               and mem_eff) else None
 
+        # Activation offload: park the (grad-checkpointed) block-boundary activations
+        # saved for backward in CPU RAM via torch's built-in save_on_cpu, trading
+        # CPU<->GPU copies for GPU memory. Only meaningful with checkpointing on CUDA;
+        # wraps just the block loop (the final norm/head stay GPU-resident). pin_memory
+        # speeds the transfer. Synchronous (no CUDA-stream double-buffering yet), so it
+        # costs more wall-clock than unsloth's async variant but is correct + built-in.
+        offload = (self.offload_activations and ckpt and "cuda" in str(first_device))
+        save_ctx = (torch.autograd.graph.save_on_cpu(pin_memory=True)
+                    if offload else contextlib.nullcontext())
         cur_device = first_device
-        for meta, entry, dev in zip(self._block_meta, self.blocks, self._block_devices):
-            # Cross the device boundary if this block sits on another card. All
-            # no-ops under a single-device load (dev == cur_device throughout).
-            if dev != cur_device:
-                hidden = backbone.to_device(hidden, dev)
-                position_ids = backbone.to_device(position_ids, dev)
-                cur_device = dev
-            mode = self._attn_mode_for(meta, mem_eff)
-            # eager: seg-aware additive bias. flash + sdpa both isolate documents
-            # via pack_ctx (cu_seqlens for flash-varlen; per-document SDPA loop for
-            # big-head), so neither builds the [t, t] bias.
-            attn_bias = get_bias(meta["sliding_window"], dev) if mode == "eager" else None
-            pack = pack_ctx if (mode in ("flash", "sdpa") and pack_ctx is not None) else None
-            if ckpt:
-                hidden = torch.utils.checkpoint.checkpoint(
-                    self._block_forward, meta, entry, hidden, position_ids, attn_bias,
-                    mode, pack, use_reentrant=False,
-                )
-            else:
-                hidden = self._block_forward(meta, entry, hidden, position_ids,
-                                             attn_bias, mode, pack)
+        with save_ctx:
+            for meta, entry, dev in zip(self._block_meta, self.blocks, self._block_devices):
+                # Cross the device boundary if this block sits on another card. All
+                # no-ops under a single-device load (dev == cur_device throughout).
+                if dev != cur_device:
+                    hidden = backbone.to_device(hidden, dev)
+                    position_ids = backbone.to_device(position_ids, dev)
+                    cur_device = dev
+                mode = self._attn_mode_for(meta, mem_eff)
+                # eager: seg-aware additive bias. flash + sdpa both isolate documents
+                # via pack_ctx (cu_seqlens for flash-varlen; per-document SDPA loop for
+                # big-head), so neither builds the [t, t] bias.
+                attn_bias = get_bias(meta["sliding_window"], dev) if mode == "eager" else None
+                pack = pack_ctx if (mode in ("flash", "sdpa") and pack_ctx is not None) else None
+                if ckpt:
+                    hidden = torch.utils.checkpoint.checkpoint(
+                        self._block_forward, meta, entry, hidden, position_ids, attn_bias,
+                        mode, pack, use_reentrant=False,
+                    )
+                else:
+                    hidden = self._block_forward(meta, entry, hidden, position_ids,
+                                                 attn_bias, mode, pack)
 
         # Final norm + head live on the output device (the last split device).
         # Return fp32 hidden so the head / cross-entropy path keeps its existing

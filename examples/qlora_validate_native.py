@@ -42,7 +42,8 @@ DEFAULT_PROMPTS = [
 ]
 
 
-def check_backward(model, tokenizer, prompt, device, cdt, attn_impl="auto"):
+def check_backward(model, tokenizer, prompt, device, cdt, attn_impl="auto",
+                   use_liger=False):
     """
     Smoke-test cross-device gradient flow: attach a tiny adapter, run one
     loss.backward() with gradient checkpointing, and assert that gradients
@@ -55,7 +56,7 @@ def check_backward(model, tokenizer, prompt, device, cdt, attn_impl="auto"):
     net = NativeLlamaQLoRA(model, r=4, alpha=8.0,
                            target_modules=["q_proj", "down_proj"],
                            compute_dtype=cdt, gradient_checkpointing=True,
-                           attn_impl=attn_impl)
+                           attn_impl=attn_impl, use_liger=use_liger)
     net.train()
     ids = tokenizer.encode(prompt, add_bos=True).to(device)
     loss = net.compute_loss(ids, ids.clone())
@@ -190,6 +191,10 @@ def main():
                     help="auto/eager/flash. NOTE flash needs CUDA fp16/bf16, so the "
                          "default float32 validate runs eager regardless; pass "
                          "--compute-dtype bfloat16 to exercise/validate the flash path.")
+    ap.add_argument("--use-liger", action="store_true",
+                    help="Validate the Liger RMSNorm/SwiGLU path (needs liger-kernel + "
+                         "--compute-dtype bfloat16/float16; ignored under fp32). Run "
+                         "this to confirm Liger parity before a --use-liger training run.")
     ap.add_argument("--prompts", nargs="*", default=None)
     ap.add_argument("--check-backward", action="store_true",
                     help="also smoke-test cross-device gradient flow (tiny adapter + backward)")
@@ -224,7 +229,8 @@ def main():
 
     # No adapters: a pure frozen forward, directly comparable to native inference.
     net = NativeLlamaQLoRA(model, target_modules=[], compute_dtype=cdt,
-                           gradient_checkpointing=False, attn_impl=args.attn_impl)
+                           gradient_checkpointing=False, attn_impl=args.attn_impl,
+                           use_liger=args.use_liger)
     net.eval()
     print(f" -- {net.describe_attn()}")
 
@@ -281,7 +287,7 @@ def main():
 
     if args.check_backward:
         all_ok &= check_backward(model, tokenizer, prompts[0], args.device, cdt,
-                                 attn_impl=args.attn_impl)
+                                 attn_impl=args.attn_impl, use_liger=args.use_liger)
 
     if args.check_packing:
         all_ok &= check_packing(net, tokenizer, prompts, args.device)

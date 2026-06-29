@@ -866,6 +866,18 @@ def main():
                          "--train-embeddings/--train-head. Single-process only (not "
                          "the DDP arm); these params are excluded from grad clipping "
                          "and follow the same LR schedule as the LoRA group.")
+    ap.add_argument("--offload-activations", action="store_true",
+                    help="Offload the grad-checkpointed block activations to CPU RAM "
+                         "(torch save_on_cpu, pinned) to free GPU memory for longer "
+                         "context / bigger batch. Needs gradient checkpointing (on by "
+                         "default) + CUDA. Synchronous copies, so a modest wall-clock "
+                         "cost; wraps only the decoder block loop.")
+    ap.add_argument("--use-liger", action="store_true",
+                    help="Route RMSNorm (2D/3D norms) and SwiGLU (silu only) through "
+                         "Liger Triton kernels for lower activation memory + speed. "
+                         "Needs liger-kernel + CUDA fp16/bf16; eager/fp32/CPU paths "
+                         "are unchanged. Changes numerics slightly -- run "
+                         "qlora_validate_native.py --use-liger to confirm parity first.")
     ap.add_argument("--compute-dtype", default="bfloat16",
                     choices=["float32", "float16", "bfloat16"])
     ap.add_argument("--no-grad-ckpt", action="store_true")
@@ -1021,6 +1033,7 @@ def main():
         attn_impl=args.attn_impl, head_vocab_chunk=args.head_vocab_chunk,
         modules_to_save_dtype=ms_dtype,
         lora_embed=args.lora_embed, lora_head=args.lora_head,
+        offload_activations=args.offload_activations, use_liger=args.use_liger,
     )
     net.train()
     if args.head_vocab_chunk and net._head_slice is None:

@@ -1257,8 +1257,35 @@ backward). Mutually exclusive with `--train-embeddings`/`--train-head` per modul
 - Smoke: `--lora-embed --lora-head --steps 5 --batch 1 --checkpoint-every 3`, then
   `--resume` to confirm the `lora_modules.safetensors` round-trip; loss should descend.
 
-**Still to do (this branch): C — activation offload (unsloth-style, `hidden_states`
-granularity) + Liger RMSNorm/SwiGLU Functions in the block forward.**
+**Feature C — `--offload-activations` + `--use-liger` (WRITE-CONFIRMED ONLY, not yet run).**
+The two general (model-agnostic) VRAM levers.
+- **Activation offload** (`--offload-activations`): wraps the decoder block loop in
+  torch's built-in `torch.autograd.graph.save_on_cpu(pin_memory=True)`, so the
+  grad-checkpointed block-boundary activations saved for backward are parked in CPU
+  RAM. Needs gradient checkpointing + CUDA. **Numerically identical by construction**
+  (save_on_cpu only relocates saved tensors), so it needs no parity gate — only a
+  VRAM/throughput check. Synchronous copies (no CUDA-stream double-buffering yet, the
+  unsloth async refinement), so a modest wall-clock cost for real GPU-memory headroom.
+- **Liger kernels** (`--use-liger`): routes RMSNorm (the 2D/3D attn/mlp/post/final
+  norms — the 4D per-head q/k/v norm stays torch) and SwiGLU (silu only — GeGLU stays
+  torch) through Liger's Triton autograd Functions. RMSNorm uses `casting_mode="gemma"`
+  (full-fp32) + `offset=constant_bias` to **match this module's fp32-internal `_norm`
+  numerics** for every arch (so it reduces to the validated path); guarded to CUDA +
+  fp16/bf16 + `constant_scale==1.0`, with the torch path as fallback for everything
+  else. **Changes numerics slightly → MUST run the parity gate first:**
+  `qlora_validate_native.py --compute-dtype bfloat16 --use-liger` (the flag is wired
+  into the validate script + its backward check). Needs `pip install liger-kernel`.
+- Both are opt-in, native-trainer + validate only; eager/fp32/CPU paths untouched.
+- Smoke: add `--offload-activations` and/or `--use-liger` to a short run and watch peak
+  VRAM drop; for Liger, gate parity first as above.
+
+**A/B/C are all WRITE-CONFIRMED ONLY (no torch/GPU in the authoring container).**
+Recommended first GPU pass on the box, in order: (1) `qlora_validate_native.py
+--compute-dtype bfloat16 --use-liger` (Liger parity); (2) a 5-step run of each flag
+(`--offload-embed-head-optim` with `--train-head --train-embeddings`; `--lora-embed
+--lora-head`; `--offload-activations`) watching loss-descends + peak VRAM; (3) a
+stop/`--resume` to confirm the new checkpoint round-trips (trainer_state offload_opt +
+lora_modules.safetensors).
 
 ---
 
