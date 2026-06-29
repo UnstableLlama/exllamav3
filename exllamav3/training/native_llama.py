@@ -476,7 +476,12 @@ class NativeLlamaQLoRA(nn.Module):
             ops = _liger_ops()
             if ops is not None:
                 w = spec["weight"]
-                w = w.to(x.dtype) if w is not None else None
+                # The frozen norm weight is an exllamav3 *inference tensor* (loaded
+                # under inference_mode); Liger saves W for backward, which rejects
+                # inference tensors. clone() in this (training) context returns a normal
+                # tensor. .to() alone can be a no-op when the dtype already matches, so
+                # it would leave the inference tensor in place -- clone explicitly.
+                w = w.clone().to(x.dtype) if w is not None else None
                 return ops[0].apply(x, w, spec["eps"], spec["bias"], "gemma")
         xf = x.float()
         var = xf.pow(2).mean(dim=-1, keepdim=True) + spec["eps"]
