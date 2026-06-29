@@ -1231,8 +1231,34 @@ embed/head matrices never sits on the GPU — only the bf16 param + transient gr
   #  embed/head optimizer no longer shows on-GPU), resume continues at the right step/LR.
   ```
 
-**Still to do (this branch): B — LoRA-on-head/embed (or PEFT trainable-tokens) as the
-cheaper structural alternative; C — activation offload + Liger RMSNorm/SwiGLU swap.**
+**Feature B — `--lora-embed` / `--lora-head` (WRITE-CONFIRMED ONLY, not yet run).**
+The low-rank alternative to fully training the embedding / LM head: a rank-r *shift*
+(`r*(vocab+hidden)` params vs `vocab*hidden`), trained through **ordinary autograd**
+(no custom Function — correctness rests on the forward formulas, not a hand-written
+backward). Mutually exclusive with `--train-embeddings`/`--train-head` per module.
+- **Embedding** (`native_llama.forward`): `hidden += scale * (F.embedding(ids, A) @ B)`
+  with `A=[vocab,r]` (token-indexed, so only rows for tokens in the batch get a
+  gradient — sparse/cheap), `B=[r,hidden]` zero-init (no-op at start). Added after the
+  base embed scaling; the from-zero B absorbs any constant factor.
+- **Head** (`native_llama.compute_loss`): routes to the materialized supervised-
+  position path (like `--train-head`) and adds `scale * (hs @ A) @ B` to the frozen
+  head's logits, in fp32, with `A=[hidden,r]`, `B=[r,vocab]` zero-init. Memory scales
+  with supervised tokens (the chunked-vocab fused head is frozen-only, so it's bypassed
+  when `lora_head` is on — fine, the delta needs full logits at the supervised rows).
+- Params ride in `lora_parameters()` (GPU-resident, optimized by the main optimizer,
+  included in the grad clip; small, never offloaded). Saved to a **separate**
+  `lora_modules.safetensors` (merge-path, like `modules_to_save.safetensors`) so the
+  runtime per-linear LoRA loader is undisturbed; `load_adapter` restores it and now
+  tolerates a missing `adapter_model.safetensors` (embed/head-only checkpoints).
+  `adapter_config.json` records `lora_embed`/`lora_head`.
+- **Live `🎭` samples / native infer do NOT reflect embed/head LoRA** (only the
+  runtime per-linear LoRA slots are wired) — same as `--train-head`/`--train-embeddings`;
+  judge via the held-out eval (`compute_loss` includes both deltas) or after a merge.
+- Smoke: `--lora-embed --lora-head --steps 5 --batch 1 --checkpoint-every 3`, then
+  `--resume` to confirm the `lora_modules.safetensors` round-trip; loss should descend.
+
+**Still to do (this branch): C — activation offload (unsloth-style, `hidden_states`
+granularity) + Liger RMSNorm/SwiGLU Functions in the block forward.**
 
 ---
 

@@ -844,6 +844,19 @@ def main():
                          "the loss off the fused frozen-head path to a supervised-"
                          "position cross-entropy so the head gets a gradient. On a "
                          "tied model this is equivalent to --train-embeddings.")
+    ap.add_argument("--lora-embed", action="store_true",
+                    help="Train a rank-r LoRA on the input embedding instead of "
+                         "fully (mutually exclusive with --train-embeddings). Far "
+                         "cheaper: r*(vocab+hidden) params, GPU-resident, no offload "
+                         "needed. A low-rank shift of the whole embedding (use "
+                         "PEFT-style trainable-tokens instead if you only added new "
+                         "tokens). Saved to lora_modules.safetensors (merge-path).")
+    ap.add_argument("--lora-head", action="store_true",
+                    help="Train a rank-r LoRA on the LM head instead of fully "
+                         "(mutually exclusive with --train-head). Adds a low-rank "
+                         "delta to the head logits at the supervised positions; "
+                         "memory scales with supervised tokens, params are tiny. "
+                         "Saved to lora_modules.safetensors (merge-path).")
     ap.add_argument("--offload-embed-head-optim", action="store_true",
                     help="Put the fully-trained embedding/LM-head optimizer on CPU "
                          "(torchao CPUOffloadOptimizer) with bf16 stochastic-rounding "
@@ -1007,6 +1020,7 @@ def main():
         train_embeddings=args.train_embeddings, train_head=args.train_head,
         attn_impl=args.attn_impl, head_vocab_chunk=args.head_vocab_chunk,
         modules_to_save_dtype=ms_dtype,
+        lora_embed=args.lora_embed, lora_head=args.lora_head,
     )
     net.train()
     if args.head_vocab_chunk and net._head_slice is None:
