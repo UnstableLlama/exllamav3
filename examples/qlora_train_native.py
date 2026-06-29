@@ -346,8 +346,8 @@ def build_cpu_offload_optimizer(params, lr):
     """
     try:
         import functools
+        import torchao.optim as aoopt
         from torchao.optim import CPUOffloadOptimizer
-        from torchao.optim import AdamW as AOAdamW
     except Exception as e:
         raise SystemExit(
             f"--offload-embed-head-optim needs torchao, which is not importable "
@@ -355,6 +355,16 @@ def build_cpu_offload_optimizer(params, lr):
             f"(the embed/head optimizer then stays on GPU; use --optim adamw8bit to "
             f"shrink it instead)."
         )
+    # The fp32 AdamW clone that supports bf16 stochastic rounding is `_AdamW` in
+    # current torchao (README: `_AdamW(..., bf16_stochastic_round=True)`); older/newer
+    # layouts may call it `AdamW`. The 8-bit variants (AdamW8bit/4bit) use CUDA-only
+    # quant kernels and can't run on the CPU-offloaded step, so they're not used here.
+    AOAdamW = getattr(aoopt, "_AdamW", None) or getattr(aoopt, "AdamW", None)
+    if AOAdamW is None:
+        raise SystemExit(
+            "torchao.optim exposes no _AdamW/AdamW for bf16 stochastic rounding; "
+            "available: " + ", ".join(n for n in dir(aoopt) if "dam" in n.lower())
+            + ". Tell me which to use.")
     base = functools.partial(AOAdamW, bf16_stochastic_round=True)
     opt = CPUOffloadOptimizer(params, base, lr=lr)
     set_offload_lr(opt, lr)   # don't rely on lr= forwarding to the base optimizer

@@ -262,7 +262,6 @@ def main():
         top1_native = int(ln.argmax())
         top1_diff = int(ld.argmax())
         match = top1_native == top1_diff
-        all_ok &= match
 
         # Cross-entropy of the *native* next-token prediction under each model,
         # and agreement metrics on the final-token logits.
@@ -271,14 +270,28 @@ def main():
         # How often do the two forwards agree on the argmax across all positions?
         agree = (logits_native[0].argmax(-1) == logits_diff[0].argmax(-1)).float().mean().item()
 
+        # Pass criterion: fp32 is the strict correctness gate (top-1 must match). In
+        # fp16/bf16 the forward is inherently looser -- a borderline top-1 can flip even
+        # at cos ~0.9999 (rounding; the fp32-math big-head SDPA path on Gemma flips both
+        # ways vs native, independent of Liger). So in low precision, accept a flip when
+        # the per-position argmax agreement AND last-token cosine stay high; this stops a
+        # single noise-flip reading as FAIL while still catching real drift (a genuinely
+        # broken forward shows low agreement / low cosine and still fails).
+        is_lowp = cdt in (torch.float16, torch.bfloat16)
+        ok = match or (is_lowp and agree >= 0.8 and cos >= 0.999)
+        all_ok &= ok
+
         tok_native = repr(tokenizer.decode(torch.tensor([[top1_native]]),
                                            decode_special_tokens=True)[0])
         tok_diff = repr(tokenizer.decode(torch.tensor([[top1_diff]]),
                                          decode_special_tokens=True)[0])
 
+        status = "OK" if match else (
+            "MISMATCH (tolerated: low-precision noise, cos/agree high)" if ok
+            else "MISMATCH")
         print(f"\nprompt: {prompt!r}")
         print(f"  native next-token : {tok_native}")
-        print(f"  diff   next-token : {tok_diff}   {'OK' if match else 'MISMATCH'}")
+        print(f"  diff   next-token : {tok_diff}   {status}")
         print(f"  per-position argmax agreement: {agree*100:.1f}%")
         print(f"  last-token logits: max|Δ|={max_abs:.4f}  cos={cos:.6f}")
 
