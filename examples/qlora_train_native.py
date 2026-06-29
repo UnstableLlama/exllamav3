@@ -45,6 +45,7 @@ import os
 import random
 import re
 import shutil
+import sys
 import time
 from collections import deque
 import torch
@@ -724,6 +725,17 @@ def sample(model, cache, tokenizer, generator, build_prompt, prompt, max_new_tok
 
 
 def main():
+    # Line-buffer stdout/stderr so the per-step progress lines (and interleaved
+    # eval/sample/checkpoint lines) flush on each newline. Python block-buffers
+    # stdout when it isn't a TTY -- i.e. exactly when the run is redirected to a
+    # file or piped through tee -- which otherwise holds every step line in an
+    # ~8KB buffer and dumps them all at once when the process exits.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass  # not a TextIOWrapper (already line-buffered, or wrapped)
+
     # This is the single-process trainer (--parallel single|split). Launched under
     # torchrun (RANK/WORLD_SIZE in env) it would silently run N independent copies,
     # so redirect to the DDP entry point with a clear one-liner instead of the
