@@ -476,13 +476,16 @@ class NativeLlamaQLoRA(nn.Module):
             ops = _liger_ops()
             if ops is not None:
                 w = spec["weight"]
-                # The frozen norm weight is an exllamav3 *inference tensor* (loaded
-                # under inference_mode); Liger saves W for backward, which rejects
-                # inference tensors. clone() in this (training) context returns a normal
-                # tensor. .to() alone can be a no-op when the dtype already matches, so
-                # it would leave the inference tensor in place -- clone explicitly.
-                w = w.clone().to(x.dtype) if w is not None else None
-                return ops[0].apply(x, w, spec["eps"], spec["bias"], "gemma")
+                # Move the norm weight to x's device too (not just dtype): under
+                # --parallel split a block's weights and activations share a card,
+                # but the Triton kernel below launches on the *current* CUDA device.
+                w = w.to(device=x.device, dtype=x.dtype) if w is not None else None
+                # Triton launches on torch.cuda.current_device(), not x.device, so
+                # for a tail block on cuda:1 (split mode) it would otherwise emit a
+                # cuda:1 pointer from a cuda:0 launch ("cannot be accessed from
+                # Triton (cpu tensor?)"). Pin the launch to x's device.
+                with torch.cuda.device(x.device):
+                    return ops[0].apply(x, w, spec["eps"], spec["bias"], "gemma")
         xf = x.float()
         var = xf.pow(2).mean(dim=-1, keepdim=True) + spec["eps"]
         xn = xf * torch.rsqrt(var) * spec["scale"]
@@ -707,7 +710,11 @@ class NativeLlamaQLoRA(nn.Module):
         mlp_out = None
         for gate, up, down in zip(entry.gates, entry.ups, entry.downs):
             if liger_ops is not None:
-                a = liger_ops[1].apply(gate(normed2), up(normed2))   # silu(gate)*up
+                # Pin the Triton launch to the block's device (split mode: a tail
+                # block on cuda:1 while current_device is cuda:0 would otherwise
+                # fault on an inaccessible pointer). See _norm for the full note.
+                with torch.cuda.device(normed2.device):
+                    a = liger_ops[1].apply(gate(normed2), up(normed2))   # silu(gate)*up
             else:
                 a = act(gate(normed2)) * up(normed2)
             d = down(a)                                          # compute_dtype (no fp32 upcast)
