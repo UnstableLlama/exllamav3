@@ -476,10 +476,20 @@ class NativeLlamaQLoRA(nn.Module):
             ops = _liger_ops()
             if ops is not None:
                 w = spec["weight"]
-                # Move the norm weight to x's device too (not just dtype): under
-                # --parallel split a block's weights and activations share a card,
-                # but the Triton kernel below launches on the *current* CUDA device.
-                w = w.to(device=x.device, dtype=x.dtype) if w is not None else None
+                if w is not None:
+                    # Move the norm weight to x's device too (not just dtype): under
+                    # --parallel split a block's weights and activations share a card,
+                    # but the Triton kernel below launches on the *current* CUDA device.
+                    w = w.to(device=x.device, dtype=x.dtype)
+                    # The frozen base weight is an inference tensor (the EXL3 model
+                    # loads under @torch.inference_mode), and Liger's autograd Function
+                    # saves W for backward -- which forbids inference tensors. When the
+                    # .to() above already copied (dtype/device change) the result is a
+                    # normal tensor; when it was a no-op (weight already in compute
+                    # dtype on this card) clone to get one. The torch path below sidesteps
+                    # this for free via w.float(). Negligible: w is a [hidden] vector.
+                    if w.is_inference():
+                        w = w.clone()
                 # Triton launches on torch.cuda.current_device(), not x.device, so
                 # for a tail block on cuda:1 (split mode) it would otherwise emit a
                 # cuda:1 pointer from a cuda:0 launch ("cannot be accessed from
