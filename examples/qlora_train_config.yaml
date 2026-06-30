@@ -1,0 +1,104 @@
+# EXL3 QLoRA training config. Launch with:
+#   python examples/qlora_train.py --config examples/qlora_train_config.yaml
+#
+# One file selects the execution mode:
+#   parallel: single  # one process, one GPU
+#   parallel: split   # one process, native layer-autosplit across visible GPUs
+#   parallel: ddp     # launcher execs torchrun + examples/qlora_train_native_ddp.py
+#
+# Keys mirror the CLI flags in examples/qlora_train_native.py. Use snake_case here;
+# the launcher converts to --kebab-case. DDP-only launch settings live under ddp:.
+
+# Required
+model: /path/to/exl3_model
+out: out/exl3_qlora_adapter
+
+# Execution mode
+parallel: single
+device: cuda:0
+reserve_per_device: null   # split only, e.g. [1, 8] or [-1, 20]
+use_per_device: null       # split only, e.g. [1, 8] to force a boundary
+
+# DDP torchrun launch settings (used only when parallel: ddp)
+ddp:
+  nproc_per_node: 2
+  standalone: true
+  nnodes: null
+  node_rank: null
+  master_addr: null
+  master_port: null
+  rdzv_backend: null
+  rdzv_endpoint: null
+  rdzv_id: null
+
+# LoRA / optimization
+r: 32
+alpha: 64.0
+lr: 0.0002
+weight_decay: 0.01
+optim: adamw              # single/split only: adamw, adamw8bit, paged_adamw8bit
+scheduler: none           # none, linear, cosine
+warmup_ratio: 0.0
+warmup_steps: 0
+epochs: 0.0
+steps: 1000
+batch: 4                  # per-GPU micro-batch under ddp
+grad_accum: 1
+max_grad_norm: 1.0
+
+# Data
+dataset: superdrew100/UwU_Alpaca_data
+dataset_split: train
+instruction_key: instruction
+context_key: input
+response_key: output
+messages_key: null
+prompt_format: auto       # auto, mistral, metharme
+clean_text: false
+no_clean_text: false      # deprecated compatibility knob
+min_response_words: 3
+uppercase_response: false
+max_samples: 4000
+shuffle: false
+shuffle_seed: 0
+seq_len: 512
+pack: false
+inspect: 0                # single/split only
+
+# Trainable modules / memory levers
+targets: null             # e.g. [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+train_embeddings: false
+train_head: false
+lora_embed: false         # single/split only
+lora_head: false          # single/split only
+offload_embed_head_optim: false  # single/split only, requires torchao + train_embeddings/train_head
+offload_activations: false       # single/split only
+use_liger: false                 # single/split only
+compute_dtype: bfloat16
+no_grad_ckpt: false
+attn_impl: auto           # auto, eager, flash
+ce_chunk: 1024
+head_vocab_chunk: 0
+
+# Sampling / checkpoints / resume
+sample_every: 25          # single/split only
+sample_prompt: Tell me about your day.
+save_every: 0
+checkpoint_every: 0
+keep_checkpoints: 0
+resume: null
+reset_optimizer: false
+
+# Evaluation / run log
+eval_split: null
+eval_dataset: null
+eval2_dataset: null
+eval2_split: test
+eval2_config: null
+eval2_text_key: null
+eval2_max_samples: 0
+eval2_max_blocks: 0
+val_frac: 0.0
+eval_every: 0
+save_best: false
+run_log: qlora_runs.csv
