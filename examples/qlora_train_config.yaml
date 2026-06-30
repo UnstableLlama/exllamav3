@@ -66,7 +66,7 @@ pack: false
 inspect: 0                # single/split only
 
 # Trainable modules / memory levers
-targets: null             # e.g. [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+targets: null             # null = default projections; [] = no per-linear LoRA (embed/head only)
 train_embeddings: false
 train_head: false
 lora_embed: false         # single/split only
