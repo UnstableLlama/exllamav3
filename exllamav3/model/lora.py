@@ -64,11 +64,17 @@ class LoRA:
         config_path = os.path.join(directory, "adapter_config.json")
         weights_st = os.path.join(directory, "adapter_model.safetensors")
         weights_bin = os.path.join(directory, "adapter_model.bin")
+        modules_to_save = os.path.join(directory, "modules_to_save.safetensors")
+        lora_modules = os.path.join(directory, "lora_modules.safetensors")
 
         if os.path.exists(weights_st):
             return LoRA(model, config_path, weights_st, lora_scaling)
         if os.path.exists(weights_bin):
             return LoRA(model, config_path, weights_bin, lora_scaling)
+        if os.path.exists(config_path) and (
+            os.path.exists(modules_to_save) or os.path.exists(lora_modules)
+        ):
+            return LoRA(model, config_path, None, lora_scaling)
         raise FileNotFoundError(f"No LoRA adapter found in {directory}")
 
     @torch.inference_mode()
@@ -76,7 +82,7 @@ class LoRA:
             self,
             model: Model,
             config_path: str,
-            weights_path: str,
+            weights_path: str | None,
             lora_scaling: float = 1.0,
     ):
         self.target_modules = {}
@@ -106,8 +112,13 @@ class LoRA:
         if model.modules_dict is None:
             model.modules_dict = {m.key: m for m in model}
 
-        # Load weights
-        if weights_path.endswith(".safetensors"):
+        # Load per-linear LoRA weights, if present. Native QLoRA can also save
+        # module-only adapters (--targets [] with --lora-head/--lora-embed or
+        # --train-head/--train-embeddings); those are loaded below from their
+        # sidecar safetensors files.
+        if weights_path is None:
+            raw_tensors = {}
+        elif weights_path.endswith(".safetensors"):
             raw_tensors = safe_load_file(weights_path, device="cpu")
         else:
             raw_tensors = torch.load(weights_path, map_location="cpu", weights_only=True)

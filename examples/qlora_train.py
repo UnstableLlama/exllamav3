@@ -29,6 +29,10 @@ DDP_BACKEND = ROOT / "examples" / "qlora_train_native_ddp.py"
 
 # Config keys that are launcher-only and must not be forwarded to backend scripts.
 LAUNCHER_KEYS = {"ddp", "backend", "config", "parallel"}
+DDP_LAUNCH_KEYS = {
+    "nproc_per_node", "nproc", "standalone", "nnodes", "node_rank",
+    "master_addr", "master_port", "rdzv_backend", "rdzv_endpoint", "rdzv_id",
+}
 
 # Backend support differences. Common keys are forwarded to both, single-only keys
 # are only valid for parallel=single|split, and ddp-only keys are only valid for
@@ -191,8 +195,6 @@ def append_arg(argv: list[str], key: str, value: Any, *, ddp: bool) -> None:
             argv.append(flag)
         return
     if isinstance(value, (list, tuple)):
-        if not value:
-            return
         argv.append(flag)
         argv.extend(str(v) for v in value)
         return
@@ -277,6 +279,9 @@ def build_backend_argv(cfg: dict[str, Any], config_path: Path) -> list[str]:
         ddp_cfg = cfg.get("ddp") or {}
         if not isinstance(ddp_cfg, dict):
             raise SystemExit("`ddp` must be a mapping when provided")
+        unknown_ddp = sorted(str(k) for k in ddp_cfg if str(k) not in DDP_LAUNCH_KEYS)
+        if unknown_ddp:
+            raise SystemExit("Unknown ddp launch key(s): " + ", ".join(unknown_ddp))
         nproc = ddp_cfg.get("nproc_per_node", ddp_cfg.get("nproc", 2))
         torchrun = ["torchrun"]
         if ddp_cfg.get("standalone", True):
