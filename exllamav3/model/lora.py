@@ -25,6 +25,7 @@ import math
 import torch
 from safetensors.torch import load_file as safe_load_file
 from ..modules.linear import Linear
+from ..modules.embedding import Embedding
 
 from typing import TYPE_CHECKING
 
@@ -79,6 +80,10 @@ class LoRA:
             lora_scaling: float = 1.0,
     ):
         self.target_modules = {}
+        # modules_to_save / embed-LoRA targets we mutate in place, tracked so unload()
+        # can revert them (head full-weight override; restored embedding weight).
+        self._full_weight_targets = []          # [Linear] -- reset .lora_full_weight
+        self._embed_restore = []                # [(Embedding, original_weight)]
         self.name = os.path.basename(os.path.dirname(config_path))
 
         # Read adapter config
@@ -194,6 +199,93 @@ class LoRA:
                 f"on tensor-parallel sliced modules"
             )
 
+        # Embedding / LM-head adapters trained by the native QLoRA trainer live in
+        # SEPARATE files next to adapter_model.safetensors (the per-linear loader above
+        # only handles lora_A/lora_B on Linear modules). Apply them here so a head/embed
+        # adapter actually takes effect at inference instead of being silently dropped.
+        self._load_module_adapters(model, os.path.dirname(config_path))
+
+    def _find_module(self, model, key, cls):
+        """Locate a loaded module by exact key, falling back to the unique module of
+        the given type (handles key-prefix variation across architectures)."""
+        m = model.modules_dict.get(key)
+        if m is not None and isinstance(m, cls):
+            return m
+        of_type = [mod for mod in model.modules_dict.values() if isinstance(mod, cls)]
+        return of_type[0] if len(of_type) == 1 else None
+
+    @torch.inference_mode()
+    def _load_module_adapters(self, model, directory):
+        """Apply the native trainer's embedding / LM-head adapters:
+
+          * ``modules_to_save.safetensors`` -- fully fine-tuned embed/head
+            (``--train-embeddings`` / ``--train-head``): the head becomes a full-weight
+            override on the LM-head Linear; the embedding weight is replaced in place.
+          * ``lora_modules.safetensors`` -- low-rank embed/head LoRA
+            (``--lora-embed`` / ``--lora-head``): the head LoRA rides the LM-head
+            Linear's runtime LoRA slot; the embed LoRA is folded into the embedding
+            weight (scaled to undo the module's multiplier/normalize, since the trainer
+            adds the shift *after* that scaling).
+
+        Both files store tensors in the trainer's internal orientation already sized to
+        the head Linear's padded in/out features, so no transpose/pad is needed here.
+        """
+        head = self._find_module(model, "lm_head", Linear)
+        embed = self._find_module(model, "model.embed_tokens", Embedding)
+
+        # --- modules_to_save: fully fine-tuned embed / head ---
+        ms_path = os.path.join(directory, "modules_to_save.safetensors")
+        if os.path.exists(ms_path):
+            ms = safe_load_file(ms_path, device="cpu")
+            applied = []
+            if "lm_head.weight" in ms and head is not None and not head.is_sliced:
+                # Saved [out, in]; the override wants [in, out].
+                w = ms["lm_head.weight"].t().contiguous().to(torch.float16).to(head.device)
+                head.lora_full_weight = w
+                self._full_weight_targets.append(head)
+                applied.append("lm_head")
+            if "model.embed_tokens.weight" in ms and embed is not None:
+                self._embed_restore.append((embed, embed.embedding.weight.data))
+                new_w = ms["model.embed_tokens.weight"].to(
+                    embed.embedding.weight.dtype).to(embed.embedding.weight.device)
+                embed.embedding.weight.data = new_w.contiguous()
+                applied.append("embed_tokens")
+            if applied:
+                print(f" -- LoRA '{self.name}': applied modules_to_save {applied}")
+
+        # --- embed / head LoRA (low-rank) ---
+        ml_path = os.path.join(directory, "lora_modules.safetensors")
+        if os.path.exists(ml_path):
+            ml = safe_load_file(ml_path, device="cpu")
+            applied = []
+            if "lm_head.lora_a" in ml and head is not None and not head.is_sliced:
+                a = ml["lm_head.lora_a"].to(torch.float16).to(head.device)   # [in, r]
+                b = ml["lm_head.lora_b"].to(torch.float16).to(head.device)   # [r, out]
+                # apply_lora computes x @ a @ b with no scaling, so bake alpha/r (and the
+                # user's --lora-scaling) into b, matching the per-linear path.
+                b = b * self.lora_scaling
+                head.lora_a_tensors[self] = a
+                head.lora_b_tensors[self] = b
+                self.target_modules.setdefault("lm_head", head)
+                applied.append("lm_head")
+            if "embed_tokens.lora_a" in ml and embed is not None:
+                a = ml["embed_tokens.lora_a"].to(torch.float32)              # [V, r]
+                b = ml["embed_tokens.lora_b"].to(torch.float32)              # [r, d]
+                # The trainer adds scale * (a@b) to the embedding output AFTER the
+                # module's multiplier / sqrt(d) normalize. Folding into the weight means
+                # that scaling will reapply, so divide it out first.
+                factor = float(getattr(embed, "multiplier", 1.0) or 1.0)
+                if getattr(embed, "normalize", False):
+                    factor *= float(embed.hidden_size) ** 0.5
+                delta = (self.lora_scaling / factor) * (a @ b)              # [V, d]
+                w = embed.embedding.weight
+                self._embed_restore.append((embed, w.data))
+                w.data = (w.data + delta.to(w.dtype).to(w.device)).contiguous()
+                applied.append("embed_tokens")
+            if applied:
+                print(f" -- LoRA '{self.name}': applied module LoRA {applied} "
+                      f"(scaling={self.lora_scaling:.4f})")
+
     @staticmethod
     def _parse_key(key: str) -> tuple[str | None, str | None]:
         """
@@ -218,4 +310,12 @@ class LoRA:
             target.lora_a_tensors.pop(self, None)
             target.lora_b_tensors.pop(self, None)
 
+        # Revert in-place module adapters (modules_to_save head/embed, folded embed LoRA).
+        for linear in self._full_weight_targets:
+            linear.lora_full_weight = None
+        for embed, original in reversed(self._embed_restore):
+            embed.embedding.weight.data = original
+
         self.target_modules = {}
+        self._full_weight_targets = []
+        self._embed_restore = []

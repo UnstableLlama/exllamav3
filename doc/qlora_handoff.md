@@ -564,9 +564,11 @@ LoRA freezes `embed_tokens`/`lm_head`; these flags fully train them
 - Optimizer: embed/head go in a **0-weight-decay** group (`param_groups()`);
   decaying a whole embedding table is harmful. LoRA keeps its weight decay.
 - Saved to `modules_to_save.safetensors` (HF orientation `[vocab,hidden]`) beside
-  the adapter, kept OUT of `adapter_model.safetensors` so the LoRA loader is
-  undisturbed; `adapter_config.json` lists `modules_to_save`. `load_adapter`
-  restores them on resume. CPU test: `test_modules_to_save_param_groups`.
+  the adapter, kept OUT of `adapter_model.safetensors` so the per-linear LoRA
+  loader is undisturbed; `adapter_config.json` lists `modules_to_save`.
+  `load_adapter` restores them on resume, and `LoRA.from_directory` now applies
+  them at inference (see "Applying a trained embed / head / head-LoRA at
+  inference" below). CPU test: `test_modules_to_save_param_groups`.
 
 **Cost / caveats:** these are big matrices. On the tied 1B (vocab 128k×2048 ≈
 262M params) that's ~4 GB (fp32 master+grad+Adam m,v) — fine. On a 16B (vocab
@@ -574,9 +576,45 @@ LoRA freezes `embed_tokens`/`lm_head`; these flags fully train them
 replicated per card AND the grad is all-reduced every step** (the embed/head grad,
 not just the few-MB LoRA grad), so `--train-embeddings`/`--train-head` on a 16B
 will OOM 24 GB and is slow over PCIe. Realistic on small models, or large models
-only with `--parallel split` / more VRAM. Live samples + the native infer path do
-NOT yet reflect a trained embed/head (only the runtime LoRA slots are wired) — the
-trained matrices are for the merge/re-quantize deploy path.
+only with `--parallel split` / more VRAM.
+
+### Applying a trained embed / head / head-LoRA at inference (`LoRA.from_directory`)
+
+The four "extra" surfaces (`--lora-head`, `--lora-embed`, `--train-head`,
+`--train-embeddings`) are saved **beside** `adapter_model.safetensors`, not in it
+— so the main file is byte-identical with or without them (a "did it save?"
+red herring; check for the side files instead):
+- `lora_modules.safetensors` — low-rank head/embed LoRA (`lm_head.lora_a/b`,
+  `embed_tokens.lora_a/b`, internal orientation, **unscaled**).
+- `modules_to_save.safetensors` — fully fine-tuned head/embed (HF orientation
+  `[vocab,hidden]`).
+
+`LoRA.from_directory` (used by `examples/qlora_infer_native.py`) now **consumes
+both files automatically** so a head/embed adapter actually fires at inference
+(previously they were saved but silently dropped — only the per-linear LoRA in
+`adapter_model.safetensors` was applied). How each is wired:
+- **Head LoRA** → the LM-head is a native `Linear` with runtime LoRA slots, so
+  `lm_head.lora_a/b` load straight into them; `apply_lora` does `x @ a @ b` and
+  the loader bakes `alpha/r` (× `--lora-scaling`) into `b` to match the trainer.
+- **Full head** (`--train-head`) → installed as `Linear.lora_full_weight`, an
+  fp16 `[in,out]` override that **supersedes** the quantized base matmul for the
+  head (the trained fp16 head is better than the quantized one, so it replaces it
+  rather than adding a delta). Works on tied models too (exllamav3 keeps a
+  separate head `Linear`).
+- **Embed LoRA / full embed** → the input `Embedding` has no LoRA slot, so these
+  are **folded into the embedding weight in place**. Full embed is a direct
+  replacement; embed-LoRA adds `scale·(a@b)` but divided by the module's
+  `multiplier`/`sqrt(d)` normalize first, because the trainer adds the shift
+  *after* that scaling (a no-op divide on Llama/Mistral where both are 1).
+
+`unload()` reverts all of the above (clears the override, restores the original
+embedding weight). Implementation: `exllamav3/model/lora.py`
+(`_load_module_adapters`) + the guarded `lora_full_weight` branch in
+`exllamav3/modules/linear.py`. **Interop note:** these side files use the
+trainer's own keys, not PEFT's (`lora_embedding_A/B`,
+`modules_to_save.default.weight`), so HF/PEFT/Axolotl won't read the head/embed
+parts — a PEFT-format export is the remaining follow-up for external-tool
+loading; the per-linear `adapter_model.safetensors` is already standard PEFT.
 
 **Mistral caveat:** the native forward (`backbone.assert_block_supported`,
 backbone.py:71) **rejects sliding-window attention**, so Mistral-7B-v0.1

@@ -71,6 +71,10 @@ class Linear(Module):
         self.qgroup = qgroup or key
         self.lora_a_tensors = {}
         self.lora_b_tensors = {}
+        # Optional fully fine-tuned replacement weight ([in, out], fp16) installed by
+        # an adapter's modules_to_save (e.g. native QLoRA --train-head). When set, it
+        # supersedes the quantized base matmul for this Linear. Default None -> no-op.
+        self.lora_full_weight = None
 
         assert self.in_features_unpadded == self.in_features or allow_input_padding, \
             f"Input padding is not allowed for {self.key}, in_dim: {self.in_features_unpadded}, pad_to: {pad_to}"
@@ -423,7 +427,21 @@ class Linear(Module):
         else:
             lora_input = None
 
-        x = self.inner.forward(x, params, out_dtype)
+        if self.lora_full_weight is not None:
+            # modules_to_save replacement (e.g. a fully fine-tuned --train-head): an
+            # fp16 [in, out] weight that supersedes the quantized base for this Linear.
+            # Skip the base matmul entirely and project against it instead. Align the
+            # contracted dim defensively in case in_features was padded differently
+            # from the activation width (the padded tail is zeros, so a crop is exact).
+            w = self.lora_full_weight
+            in_dim = min(x.shape[-1], w.shape[0])
+            flat = x[..., :in_dim].reshape(-1, in_dim).to(w.dtype)
+            x = (flat @ w[:in_dim]).view(*x.shape[:-1], w.shape[1])
+            od = out_dtype if out_dtype is not None else self.out_dtype
+            if od is not None:
+                x = x.to(od)
+        else:
+            x = self.inner.forward(x, params, out_dtype)
 
         if lora_input is not None:
             self.apply_lora(lora_input, x)
