@@ -1493,6 +1493,34 @@ size, which is the "idle cuda:1 will bite later" concern.
 
 ---
 
+### Session 11 — optimization audit; instrumentation + first efficiency batch
+
+> Branch `claude/qlora-familiarization-gjd9so`. A research pass over the whole
+> pipeline for wasted compute/VRAM plus a survey of modern-framework techniques
+> (Axolotl / Unsloth / Liger / CCE / Chronicals) — the full audit with sources
+> lives in **`doc/qlora_optimization_audit.md`**. Headline findings: trellis
+> dequant runs 3× per linear per step (the structural tok/s ceiling);
+> checkpointing is unconditional even with VRAM headroom; the fused CE holds a
+> full fp32 copy of the head weight (~4 GB on Gemma) and re-casts it per token
+> chunk; packing is next-fit (~82.5% fill vs ~98% for FFD); the grad-accum loss
+> is mean-of-means (the mild form of the Oct-2024 GA bug); RoPE cos/sin are
+> rebuilt ~192× per step on a 48-layer model.
+
+**PLAN for this session (batch 1 — box-free verifiable):**
+0. Instrumentation: per-step wall-clock breakdown (data/forward/backward/optim
+   via CUDA events), `--profile-dequant`, and run-log v2 — every run INCLUDING
+   CRASHES auto-appends a CSV row (status=failed + error summary; full
+   traceback to a sidecar `<run_log>.errors.log`), turning the CSV into an
+   automatic lab notebook.
+1. FFD sample packing (replace next-fit; print fill %).
+2. Fused-CE dtype fix (drop the fp32 head-weight copy; upcast per-chunk logits
+   only).
+3. Grad-accum token-weighted loss normalization (native + DDP + BNB arms).
+
+Results are recorded at the end of this section after implementation.
+
+---
+
 ## 0d. Multi-GPU strategy (rationale)
 
 "Multi-GPU" splits by *goal*, and QLoRA changes which tool fits, because only the
