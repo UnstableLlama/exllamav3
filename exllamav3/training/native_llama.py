@@ -988,8 +988,9 @@ class NativeLlamaQLoRA(nn.Module):
             logits = (hs @ weight).float()
             if self.lora_head:
                 # Low-rank head shift: logits += scale * (hs @ A) @ B, in fp32.
+                lora_hs = hs.to(dtype=self.head_lora_a.dtype)
                 logits = logits + self._module_lora_scale * (
-                    (hs.float() @ self.head_lora_a) @ self.head_lora_b)
+                    (lora_hs @ self.head_lora_a) @ self.head_lora_b).float()
             if self.final_softcap:
                 logits = self.final_softcap * torch.tanh(logits / self.final_softcap)
             target = labels_flat.index_select(0, idx).to(weight.device)

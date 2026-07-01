@@ -495,10 +495,11 @@ def test_supervised_head_ce_chunking_matches_naive():
     scale = 1.7
     softcap = 12.0
 
-    h_ref = torch.randn(n, d, dtype=torch.float64, requires_grad=True)
-    w_ref = torch.randn(d, v, dtype=torch.float64, requires_grad=True)
-    a_ref = torch.randn(d, r, dtype=torch.float64, requires_grad=True)
-    b_ref = torch.randn(r, v, dtype=torch.float64, requires_grad=True)
+    dtype = torch.float32  # production head-LoRA params are fp32; logits are CE-upcast to fp32
+    h_ref = torch.randn(n, d, dtype=dtype, requires_grad=True)
+    w_ref = torch.randn(d, v, dtype=dtype, requires_grad=True)
+    a_ref = torch.randn(d, r, dtype=dtype, requires_grad=True)
+    b_ref = torch.randn(r, v, dtype=dtype, requires_grad=True)
 
     logits = h_ref[valid] @ w_ref + scale * ((h_ref[valid] @ a_ref) @ b_ref)
     logits = softcap * torch.tanh(logits / softcap)
@@ -520,11 +521,11 @@ def test_supervised_head_ce_chunking_matches_naive():
     loss = net._supervised_head_cross_entropy(h, labels, valid, w, token_chunk=5)
     loss.backward()
 
-    assert torch.allclose(loss, loss_ref, atol=1e-12), "chunked supervised CE loss mismatch"
-    assert torch.allclose(h.grad, h_ref.grad, atol=1e-11), "hidden grad mismatch"
-    assert torch.allclose(w.grad, w_ref.grad, atol=1e-11), "head weight grad mismatch"
-    assert torch.allclose(a.grad, a_ref.grad, atol=1e-11), "head LoRA A grad mismatch"
-    assert torch.allclose(b.grad, b_ref.grad, atol=1e-11), "head LoRA B grad mismatch"
+    assert torch.allclose(loss, loss_ref, atol=1e-6), "chunked supervised CE loss mismatch"
+    assert torch.allclose(h.grad, h_ref.grad, atol=1e-6), "hidden grad mismatch"
+    assert torch.allclose(w.grad, w_ref.grad, atol=1e-6), "head weight grad mismatch"
+    assert torch.allclose(a.grad, a_ref.grad, atol=1e-6), "head LoRA A grad mismatch"
+    assert torch.allclose(b.grad, b_ref.grad, atol=1e-6), "head LoRA B grad mismatch"
     print("[head-ce] supervised chunked CE matches naive logits PASSED")
 
 
