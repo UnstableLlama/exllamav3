@@ -48,7 +48,7 @@ COMMON_KEYS = {
     "train_head", "compute_dtype", "no_grad_ckpt", "attn_impl", "ce_chunk",
     "head_vocab_chunk", "max_grad_norm", "save_every", "checkpoint_every",
     "keep_checkpoints", "resume", "reset_optimizer", "eval_split",
-    "eval_dataset", "eval2_dataset", "eval2_split", "eval2_config",
+    "eval_dataset", "eval_max_samples", "eval2_dataset", "eval2_split", "eval2_config",
     "eval2_text_key", "eval2_max_samples", "eval2_max_blocks", "val_frac",
     "eval_every", "save_best", "run_log",
 }
@@ -71,7 +71,7 @@ SINGLE_ONLY_DEFAULTS = {
     "offload_embed_head_optim": False,
     "offload_activations": False,
     "use_liger": False,
-    "sample_every": 25,
+    "sample_every": 0,
     "sample_prompt": "Tell me about your day.",
 }
 

@@ -193,6 +193,10 @@ def main():
                          "--val-frac. Built identically on every rank.")
     ap.add_argument("--eval-dataset", default=None,
                     help="Dataset id/path for --eval-split (defaults to --dataset).")
+    ap.add_argument("--eval-max-samples", type=int, default=0,
+                    help="Cap source rows for the PRIMARY --eval-split dataset "
+                         "(0 = all). Ignored for --val-frac evals, where "
+                         "val_frac controls the eval size.")
     ap.add_argument("--eval2-dataset", default=None,
                     help="A SECOND held-out eval set, reported alongside the "
                          "primary one each --eval-every and at the end (e.g. your "
@@ -307,7 +311,7 @@ def main():
     val_examples = []
     if args.eval_split:
         val_examples = build_sft_examples(
-            model, tokenizer, args.eval_dataset or args.dataset, 0, args.seq_len,
+            model, tokenizer, args.eval_dataset or args.dataset, args.eval_max_samples, args.seq_len,
             instruction_key=args.instruction_key, context_key=args.context_key,
             response_key=args.response_key, split=args.eval_split,
             clean_text=clean_text,
@@ -398,8 +402,17 @@ def main():
         rng = random.Random(1234 + rank)
         while True:
             rng.shuffle(order)
-            for i in range(0, len(order) - args.batch + 1, args.batch):
-                yield [shard[j] for j in order[i:i + args.batch]]
+            i = 0
+            while i < len(order):
+                idxs = order[i:i + args.batch]
+                i += args.batch
+                # Keep every rank producing full micro-batches. Without wrapping, a
+                # shard smaller than --batch would spin forever, and tails would be
+                # silently skipped each epoch.
+                while len(idxs) < args.batch:
+                    rng.shuffle(order)
+                    idxs.extend(order[:args.batch - len(idxs)])
+                yield [shard[j] for j in idxs]
 
     def allreduce_grads():
         # Average trainable grads across ranks == DDP. Once per optimizer step,
@@ -457,45 +470,6 @@ def main():
     status = "completed"
     meter = ThroughputMeter()
 
-    def log_run(status, dt, final_val, final_eval2, sup_tok_s, tot_tok_s):
-        # Rank 0 writes one CSV row (same schema as the single-GPU arm). tok/s are
-        # passed in: the caller has the all-reduced totals at normal finish, or a
-        # per-rank x world_size estimate on interrupt (no collective there).
-        if not is_main(rank):
-            return
-        rnd = lambda x, n=6: round(x, n) if isinstance(x, (int, float)) else ""
-        append_run_log(args.run_log, {
-            "timestamp": run_started, "arm": "exl3-native-ddp", "status": status,
-            "model": args.model, "arch": getattr(config, "architecture", ""),
-            "out": args.out, "dataset": args.dataset,
-            "eval_split": args.eval_split or "", "eval_dataset": args.eval_dataset or "",
-            "eval2_dataset": args.eval2_dataset or "",
-            "r": args.r, "alpha": args.alpha, "lr": args.lr,
-            "scheduler": args.scheduler, "warmup_steps": warmup_steps,
-            "weight_decay": args.weight_decay, "batch": args.batch,
-            "grad_accum": args.grad_accum, "world_size": world_size,
-            "eff_batch": eff_batch, "epochs": args.epochs,
-            "steps_planned": args.steps, "steps_done": step, "seq_len": args.seq_len,
-            "targets": " ".join(net.target_modules), "compute_dtype": args.compute_dtype,
-            "attn_impl": args.attn_impl, "parallel": "ddp",
-            "shuffle": int(bool(args.shuffle)), "pack": int(bool(args.pack)),
-            "max_samples": args.max_samples,
-            "train_embeddings": int(bool(args.train_embeddings)),
-            "train_head": int(bool(args.train_head)), "prompt_format": args.prompt_format,
-            "trainable_params": net.num_trainable(), "n_train": len(examples),
-            "n_val": len(val_examples), "n_eval2": len(val2_examples),
-            "start_loss": rnd(start_loss), "end_loss": rnd(end_loss),
-            "best_val": rnd(best_val) if best_val != float("inf") else "",
-            "best_val_step": best_val_step or "",
-            "start_val": rnd(start_val), "start_eval2": rnd(start_eval2),
-            "final_val": rnd(final_val), "final_eval2": rnd(final_eval2),
-            "total_s": rnd(dt, 1), "s_per_step": rnd(dt / step, 4) if step else "",
-            "sup_tok_s": round(sup_tok_s) if sup_tok_s else "",
-            "tot_tok_s": round(tot_tok_s) if tot_tok_s else "",
-            "peak_vram_gb": rnd(torch.cuda.max_memory_allocated(device) / 1e9, 3),
-            "notes": "",
-        })
-
     # Baseline eval at step 0 (no-op adapter = base model); all ranks compute in
     # lockstep, rank 0 prints. Reference point for the trained numbers.
     if val_examples or val2_examples:
@@ -525,7 +499,10 @@ def main():
             "model": args.model, "arch": getattr(config, "architecture", ""),
             "out": args.out, "dataset": args.dataset,
             "eval_split": args.eval_split or "", "eval_dataset": args.eval_dataset or "",
+            "eval_max_samples": args.eval_max_samples,
             "eval2_dataset": args.eval2_dataset or "",
+            "eval2_max_samples": args.eval2_max_samples,
+            "eval2_max_blocks": args.eval2_max_blocks,
             "r": args.r, "alpha": args.alpha, "lr": args.lr,
             "scheduler": args.scheduler, "warmup_steps": warmup_steps,
             "weight_decay": args.weight_decay, "batch": args.batch,
@@ -543,6 +520,7 @@ def main():
             "start_loss": rnd(start_loss), "end_loss": rnd(end_loss),
             "best_val": rnd(best_val) if best_val != float("inf") else "",
             "best_val_step": best_val_step or "",
+            "start_val": rnd(start_val), "start_eval2": rnd(start_eval2),
             "final_val": rnd(final_val), "final_eval2": rnd(final_eval2),
             "total_s": rnd(dt, 1), "s_per_step": rnd(dt / step, 4) if step else "",
             "sup_tok_s": round(sup_tok_s) if sup_tok_s else "",
