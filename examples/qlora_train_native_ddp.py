@@ -119,13 +119,17 @@ def main():
                          "'messages' for UnstableLlama/semancy). When set, the user "
                          "turn is the prompt and the assistant turn the supervised "
                          "response; the flat instruction/response keys are ignored.")
-    ap.add_argument("--prompt-format", choices=["auto", "mistral", "metharme"],
+    ap.add_argument("--prompt-format",
+                    choices=["auto", "mistral", "metharme", "gemma4-nothink"],
                     default="auto",
                     help="Chat format. auto: the model's native template "
                          "(Llama-3, Mistral [INST], mistral3 [SYSTEM_PROMPT]/[INST]). "
                          "mistral: explicit <s>[INST]{q}[/INST]{a}</s> (= auto for "
                          "the mistral3 arch, e.g. Mistral-Medium-3.5). metharme: "
-                         "Pygmalion <|user|>{q}<|model|>{a}</s>.")
+                         "Pygmalion <|user|>{q}<|model|>{a}</s>. gemma4-nothink: "
+                         "<|turn>user\\n{q}<turn|>\\n<|turn>model\\n<|channel>thought\\n"
+                         "<channel|>{a} with the thought span pre-closed empty (no "
+                         "reasoning trained).")
     ap.add_argument("--clean-text", action="store_true",
                     help="Strip [stage directions]/*actions* + normalize whitespace "
                          "(OFF by default; leave off for reasoning/code/markdown).")
