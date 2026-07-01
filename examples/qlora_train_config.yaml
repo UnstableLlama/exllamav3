@@ -63,6 +63,9 @@ shuffle: false
 shuffle_seed: 0
 seq_len: 512
 pack: false
+pack_algo: bfd            # bfd (best-fit decreasing, ~97%+ fill) | nextfit (old)
+ga_loss: token            # token (weight micro-batches by supervised tokens) | mean (old)
+profile_dequant: 0        # time trellis reconstruction for the first N steps
 inspect: 0                # single/split only
 
 # Trainable modules / memory levers
