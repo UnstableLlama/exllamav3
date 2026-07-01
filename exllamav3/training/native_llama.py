@@ -362,16 +362,21 @@ class NativeLlamaQLoRA(nn.Module):
         self._head_slice = None
         if self.head_vocab_chunk > 0:
             self._head_slice = backbone.head_weight_slice_closure(self.lm_head)
-        # Gemma2-style final-logit softcapping forces compute_loss down the
-        # materialized supervised-position head path (the chunked-vocab CE can't
-        # apply the tanh cap), so --head-vocab-chunk is silently a no-op there. Warn
-        # once: on a big-vocab softcapped model (Gemma2 = 256k vocab + softcap) the
-        # [hidden, vocab] spike the chunk flag is meant to avoid is NOT avoided.
+        # Gemma-style final-logit softcapping forces compute_loss down the
+        # supervised-position head path (the frozen fused/vocab-chunked CE can't apply
+        # the tanh cap). That path chunks over supervised tokens via --ce-chunk, but
+        # each chunk still builds [ce_chunk, vocab] logits. Warn up front on
+        # big-vocab softcapped bases so the first-step OOM points at the right knob.
+        if self.final_softcap and self.lm_head.out_features >= 100_000:
+            print(" -- note: final-logit softcap is active on a large-vocab head; "
+                  "head loss uses supervised-token chunks, so peak logits scale as "
+                  "--ce-chunk × vocab. If the first step OOMs in the LM head, lower "
+                  "--ce-chunk (try 64 or 32). --head-vocab-chunk does not apply to "
+                  "softcapped logits.")
         if self.head_vocab_chunk > 0 and self.final_softcap:
             print(" -- note: --head-vocab-chunk is ignored on this model because it "
                   "uses final-logit softcapping; the chunked-vocab CE can't apply the "
-                  "tanh cap, so compute_loss uses the materialized supervised-position "
-                  "head loss. Watch head memory on a big-vocab softcapped base.")
+                  "tanh cap.")
 
         # Sanity: every requested target name actually matched something.
         matched = {w.key.split(".")[-1] for w in wrappers if w.r > 0}
@@ -953,6 +958,51 @@ class NativeLlamaQLoRA(nn.Module):
         """Frozen LM-head weight closure in ``[hidden, vocab]`` orientation."""
         return backbone.head_weight_closure(self.lm_head)
 
+    def _supervised_head_cross_entropy(
+        self,
+        hidden_flat: torch.Tensor,
+        labels_flat: torch.Tensor,
+        valid: torch.Tensor,
+        weight: torch.Tensor,
+        token_chunk: int,
+    ) -> torch.Tensor:
+        """CE over supervised positions without materializing all logits at once.
+
+        This is the materialized-head fallback used when the frozen fused-CE path
+        cannot be used: trainable full head, head-LoRA, or final-logit softcap.
+        It preserves the usual ``reduction="mean"`` semantics by accumulating
+        per-chunk summed CE and dividing by the total number of supervised tokens.
+        Peak logit memory is therefore ``[token_chunk, vocab]`` instead of
+        ``[num_supervised_tokens, vocab]``.
+        """
+        valid_idx = valid.nonzero(as_tuple=False).flatten()
+        n_valid = int(valid_idx.numel())
+        if n_valid == 0:
+            # Kept for defensive direct calls; compute_loss handles this earlier
+            # so all trainable surfaces get a graph-preserving zero.
+            return hidden_flat.sum() * 0.0 + weight.sum() * 0.0
+
+        token_chunk = max(1, int(token_chunk))
+        total = None
+        for start in range(0, n_valid, token_chunk):
+            idx = valid_idx[start:start + token_chunk]
+            hs = backbone.to_device(hidden_flat.index_select(0, idx), weight.device).to(weight.dtype)
+            # Upcast logits to fp32 for the softmax/CE regardless of head dtype --
+            # a no-op for an fp32 head, essential for a bf16 one (the SR offload path),
+            # where a bf16 softmax over a large vocab is unstable.
+            logits = (hs @ weight).float()
+            if self.lora_head:
+                # Low-rank head shift: logits += scale * (hs @ A) @ B, in fp32.
+                lora_hs = hs.to(dtype=self.head_lora_a.dtype)
+                logits = logits + self._module_lora_scale * (
+                    (lora_hs @ self.head_lora_a) @ self.head_lora_b).float()
+            if self.final_softcap:
+                logits = self.final_softcap * torch.tanh(logits / self.final_softcap)
+            target = labels_flat.index_select(0, idx).to(weight.device)
+            part = F.cross_entropy(logits, target, reduction="sum")
+            total = part if total is None else total + part
+        return total / n_valid
+
     def logits(self, input_ids: torch.Tensor,
                attention_mask: Optional[torch.Tensor] = None,
                position_ids: Optional[torch.Tensor] = None,
@@ -999,9 +1049,12 @@ class NativeLlamaQLoRA(nn.Module):
             hs = hidden[:, :-1, :].reshape(-1, d)                 # shift
             lbl = labels[:, 1:].reshape(-1).to(hs.device)
             valid = lbl != ignore_index
-            # train_head -> the trainable full head; otherwise the frozen head weight
-            # (a lora_head delta is added to its logits below).
-            w = self.head_weight if self.train_head else self.lm_head_weight_fn()()  # [d, V]
+            # train_head -> the trainable full head; otherwise the reconstructed frozen
+            # head weight (a lora_head delta is added to its logits below). The frozen
+            # EXL3 reconstruction is an inference tensor; the autograd matmul in the
+            # supervised-head path saves its inputs for backward, so clone it into a
+            # normal tensor first (same reason Liger RMSNorm needs cloned norm weights).
+            w = self.head_weight if self.train_head else self.lm_head_weight_fn()().clone()  # [d, V]
             if not bool(valid.any()):
                 # No supervised tokens: keep the graph alive with a 0 grad for every
                 # trainable surface touched here (full head and/or head-LoRA a/b).
@@ -1011,18 +1064,7 @@ class NativeLlamaQLoRA(nn.Module):
                 if self.lora_head:
                     z = z + self.head_lora_a.sum() * 0.0 + self.head_lora_b.sum() * 0.0
                 return z
-            hs = backbone.to_device(hs[valid], w.device).to(w.dtype)
-            # Upcast logits to fp32 for the softmax/CE regardless of the head dtype --
-            # a no-op for an fp32 head, essential for a bf16 one (the SR offload path),
-            # where a bf16 softmax over a large vocab is unstable.
-            logits = (hs @ w).float()
-            if self.lora_head:
-                # Low-rank head shift: logits += scale * (hs @ A) @ B, in fp32.
-                logits = logits + self._module_lora_scale * (
-                    (hs.float() @ self.head_lora_a) @ self.head_lora_b)
-            if self.final_softcap:
-                logits = self.final_softcap * torch.tanh(logits / self.final_softcap)
-            return F.cross_entropy(logits, lbl[valid].to(w.device))
+            return self._supervised_head_cross_entropy(hs, lbl, valid, w, chunk)
         # The fused head matmuls hidden against the frozen head weight, which
         # lives on the head's device; co-locate them (no-op single-device).
         hidden = backbone.to_device(hidden, self._head_device)

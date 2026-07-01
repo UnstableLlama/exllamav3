@@ -483,6 +483,52 @@ def test_modules_to_save_param_groups():
     print("[modules_to_save] param-group split (embed/head = no weight decay) PASSED")
 
 
+def test_supervised_head_ce_chunking_matches_naive():
+    # The train_head / lora_head / final-softcap loss path must not materialize
+    # all supervised logits at once, but chunking must preserve the exact mean CE
+    # semantics and gradients for every trainable surface.
+    torch.manual_seed(7)
+    n, d, v, r = 23, 9, 31, 4
+    labels = torch.randint(0, v, (n,))
+    labels[::4] = -100
+    valid = labels != -100
+    scale = 1.7
+    softcap = 12.0
+
+    dtype = torch.float32  # production head-LoRA params are fp32; logits are CE-upcast to fp32
+    h_ref = torch.randn(n, d, dtype=dtype, requires_grad=True)
+    w_ref = torch.randn(d, v, dtype=dtype, requires_grad=True)
+    a_ref = torch.randn(d, r, dtype=dtype, requires_grad=True)
+    b_ref = torch.randn(r, v, dtype=dtype, requires_grad=True)
+
+    logits = h_ref[valid] @ w_ref + scale * ((h_ref[valid] @ a_ref) @ b_ref)
+    logits = softcap * torch.tanh(logits / softcap)
+    loss_ref = F.cross_entropy(logits, labels[valid])
+    loss_ref.backward()
+
+    h = h_ref.detach().clone().requires_grad_(True)
+    w = w_ref.detach().clone().requires_grad_(True)
+    a = a_ref.detach().clone().requires_grad_(True)
+    b = b_ref.detach().clone().requires_grad_(True)
+
+    net = NativeLlamaQLoRA.__new__(NativeLlamaQLoRA)
+    net.lora_head = True
+    net.head_lora_a = a
+    net.head_lora_b = b
+    net._module_lora_scale = scale
+    net.final_softcap = softcap
+
+    loss = net._supervised_head_cross_entropy(h, labels, valid, w, token_chunk=5)
+    loss.backward()
+
+    assert torch.allclose(loss, loss_ref, atol=1e-6), "chunked supervised CE loss mismatch"
+    assert torch.allclose(h.grad, h_ref.grad, atol=1e-6), "hidden grad mismatch"
+    assert torch.allclose(w.grad, w_ref.grad, atol=1e-6), "head weight grad mismatch"
+    assert torch.allclose(a.grad, a_ref.grad, atol=1e-6), "head LoRA A grad mismatch"
+    assert torch.allclose(b.grad, b_ref.grad, atol=1e-6), "head LoRA B grad mismatch"
+    print("[head-ce] supervised chunked CE matches naive logits PASSED")
+
+
 def main():
     test_difflinear_matches_reference_and_gradchecks()
     test_block_matches_reference()
@@ -491,6 +537,7 @@ def main():
     test_packing_block_isolation()
     test_packing_pad_no_nan()
     test_modules_to_save_param_groups()
+    test_supervised_head_ce_chunking_matches_naive()
     print("\nAll native-Llama differentiable-forward checks passed.")
 
 
