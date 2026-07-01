@@ -218,6 +218,55 @@ def test_vocab_chunked_gradcheck():
     print("[fce] vocab-chunked gradcheck PASSED")
 
 
+def test_low_precision_weight_parity():
+    # Session 11 dtype scheme: a half/bf16 head weight is no longer upcast to a
+    # full fp32 [d, V] copy -- the matmul runs in the weight's dtype and only
+    # the logits tile is upcast. Verify loss + grad_hidden stay within the
+    # half-precision noise band of the fp32 reference, for BOTH fused heads.
+    torch.manual_seed(3)
+    n, d, v = 64, 32, 512
+    weight32 = torch.randn(d, v, dtype=torch.float32)
+    weight_bf = weight32.to(torch.bfloat16)
+    hidden = torch.randn(n, d, dtype=torch.float32, requires_grad=True)
+    labels = torch.randint(0, v, (n,))
+    labels[::7] = IGNORE_INDEX
+
+    # fp32 reference on the SAME (bf16-rounded) weight values, so the only
+    # difference under test is the matmul/softmax dtype path, not the rounding
+    # of the weights themselves.
+    ref_w = weight_bf.to(torch.float32)
+    ref = _naive(hidden, ref_w, labels)
+    ref.backward()
+    g_ref, hidden.grad = hidden.grad, None
+
+    # Relative tolerance: bf16 matmul noise scales with the logit magnitude
+    # (randn weights at d=32 give large logits), so compare relatively.
+    rel = lambda a, b: abs(a - b) / max(abs(b), 1e-9)
+
+    loss = FusedLinearCrossEntropy.apply(hidden, labels, lambda: weight_bf, 16,
+                                         IGNORE_INDEX)
+    loss.backward()
+    g_fused, hidden.grad = hidden.grad, None
+    assert rel(loss.item(), ref.item()) < 2e-3, (loss.item(), ref.item())
+    cos = F.cosine_similarity(g_fused.flatten(), g_ref.flatten(), dim=0)
+    assert cos > 0.999, f"grad cosine {cos}"
+
+    loss_vc = FusedLinearCrossEntropyVocabChunked.apply(
+        hidden, labels, _slice_fn(weight_bf), v, 128, 16, IGNORE_INDEX, 1)
+    loss_vc.backward()
+    g_vc, hidden.grad = hidden.grad, None
+    assert rel(loss_vc.item(), ref.item()) < 2e-3, (loss_vc.item(), ref.item())
+    cos = F.cosine_similarity(g_vc.flatten(), g_ref.flatten(), dim=0)
+    assert cos > 0.999, f"vocab-chunked grad cosine {cos}"
+    # The two fused paths agree on the loss (same fp32 softmax stats over the
+    # same bf16 logit values); their grads differ only by bf16 tile
+    # reassociation (probs cast to bf16 against different tile shapes), which
+    # measures ~0.4% of the peak grad -- bound at 1%.
+    assert abs(loss.item() - loss_vc.item()) < 1e-5
+    assert (g_fused - g_vc).abs().max() < 1e-2 * g_fused.abs().max()
+    print("[fce] low-precision (bf16) weight parity PASSED")
+
+
 def main():
     from util import run_timed
     run_timed([
@@ -229,6 +278,7 @@ def main():
         test_vocab_chunked_parity,
         test_vocab_chunked_matches_single_shot,
         test_vocab_chunked_gradcheck,
+        test_low_precision_weight_parity,
     ], label="fused-CE")
     print("\nAll fused cross-entropy checks passed.")
 
