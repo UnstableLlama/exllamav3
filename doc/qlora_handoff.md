@@ -1417,6 +1417,82 @@ fallback handles big heads). Test models: `$LLAMA1B` (Llama-3.2-1B 4bpw, tied) a
 
 ---
 
+### Session 10 — softcap-head fixes, the liger grad bug, and the next efficiency item
+
+**DONE (branch `claude/repo-review-u6oe40`, pushed):** four fixes surfaced by a real
+Gemma-4-12B (4bpw, 262k vocab, final-logit softcap) `--parallel split` run.
+
+- **Inference-tensor backward crash.** The materialized supervised-position head loss
+  (`train_head`/`lora_head`/`final_softcap`) does `hs @ w` with the frozen head weight.
+  The EXL3 base loads under `@torch.inference_mode`, so `w` is an inference tensor and
+  `hs` requires grad → autograd tries to save `w` for backward → `RuntimeError:
+  Inference tensors cannot be saved for backward`. Clone `w` when `torch.is_inference`.
+  (Same family as #106's Liger-norm fix, different site.)
+- **Softcap-head OOM = #102's fp32 upcast.** #102 changed `logits = hs @ w` →
+  `(hs @ w).float()`. On 262k vocab at `--seq-len 8192 --pack` that fp32
+  `[~6.5k supervised tokens, 262144]` copy is ~6.7 GB — **double** the fp16 size and the
+  single biggest allocation on the head card — and OOM'd cuda:1 by ~160 MB. The matmul
+  already accumulates in fp32 internally and CE is stable on fp16 logits, so the full
+  upcast bought nothing but the blow-up. Reverted to the pre-#102 head-dtype logits.
+- **Exploding grad under `--use-liger` (~1e16 with a healthy ~4.8 loss).** The fused
+  RMSNorm call passed only `(X, W, eps, offset, casting_mode)`, so Liger's `in_place`
+  arg took its default `True` (signature confirmed:
+  `(ctx, X, W, eps, offset=0.0, casting_mode='llama', in_place=True, row_mode=None)`).
+  Its in-place backward writes `dX` into the grad-output buffer; with `use_reentrant=
+  False` checkpointing + the residual that also consumes the norm's input, that reuse
+  corrupts gradients — forward loss stays normal, grad norm explodes, and grad-clipping
+  hides it by training on a garbage direction. Pass `in_place=False`. Grad → ~100.
+  (Lesson: the `--use-liger` gate was a *smoke* test — backward runs + reaches every
+  device — so it never checked grad **values** and couldn't catch this. A liger↔torch
+  grad-**parity** check is the real gate.)
+- **Diagnosed "won't split across 2 cards" (NOT a bug).** `_load_autosplit` is a *greedy
+  fill*: it packs cuda:0 up to its `use_per_device` budget first, then spills the rest.
+  With `use_per_device [8, 24]` a ~6 GB 4bpw 12B fits under the 8 GB card-0 budget →
+  47/1 blocks, head on cuda:1. The launcher forwarded everything correctly (verified via
+  `--dry-run`); `--device cuda:0` is ignored in split mode. Key insight for the item
+  below: **even blocks ≠ even memory** — the output card additionally holds the LM head,
+  final norm, and (in training) the `[tokens, vocab]` logit spike + CE temporaries, which
+  for Gemma is several GB that exists on *no other card*.
+
+**NEXT WORK ITEM — head-aware balanced layer split + chunked head CE (do together).**
+These are one effort: the head CE is the spike that pins the output card, so chunking it
+is what makes a balanced split achievable. Layer-split is *sequential* (no compute
+parallelism) — this is purely a memory/fit lever for scaling seq-len / vocab / model
+size, which is the "idle cuda:1 will bite later" concern.
+
+1. **Chunked head CE for `--train-head` / `--lora-head` / `final_softcap`.** Today these
+   materialize `[supervised_tokens, vocab]` at once (`FusedLinearCrossEntropyVocabChunked`
+   is frozen-head, non-softcap only). Stream the head loss over supervised-token chunks,
+   recomputing in backward, while (a) emitting the head-weight / LoRA-B gradient (the
+   frozen fused CE gives a hidden-grad only), and (b) applying the tanh softcap **inside**
+   the chunk with its Jacobian `1 - tanh(z/cap)^2` in backward. Keep the **head dtype
+   (fp16)** per Session 10's revert — do not reintroduce a full-tensor fp32 copy; upcast
+   only per-chunk internally if a chunk's softmax needs it. Validate with a CPU gradcheck
+   vs `F.cross_entropy(cap*tanh((hs@w)/cap), lbl)` on loss **and** grads (hidden +
+   head/LoRA-B), mirroring `tests/test_fused_ce.py`. (Supersedes Session 9 open #7, which
+   only covered the non-softcap trainable head.)
+2. **Head-aware balanced autosplit.** Replace the greedy fill (for training) with a split
+   that balances *peak training memory* per card: estimate per-block cost `b` and the
+   output-card-only head cost `h` (head weight + logit spike at the configured
+   seq-len/supervised-token estimate + CE temporaries — smaller once #1 lands), then shift
+   ~`h/b` decoder blocks *off* the output card onto the others. Compute it dynamically
+   from the visible cards (auto when `parallel=split` and no explicit `use/reserve` given,
+   or behind a `--balance-split` flag) and realize it as an auto-computed `use_per_device`
+   so exllamav3 core's autosplit isn't forked — keep it behind the `backbone` seam. Gate
+   with the existing `--check-backward` cross-device smoke plus a peak-VRAM-per-card print.
+3. **Liger grad-parity gate (land this first — it's the safety net for re-enabling
+   `--use-liger`).** The current gate only smoke-tests that backward runs and reaches
+   every device, so it structurally cannot catch a wrong-*value* gradient — which is
+   exactly how the `in_place=True` bug shipped. Add a real parity check to
+   `qlora_validate_native.py --use-liger`: build two `NativeLlamaQLoRA` with identical
+   seed/init on the same batch, one `use_liger=False` and one `use_liger=True`, run one
+   `loss.backward()` each, and assert the per-adapter `lora_b.grad` (and `lora_a.grad`
+   where nonzero) match within a relative tolerance — plus a loss-parity check. That
+   turns the in_place-class of bug into a hard FAIL instead of a healthy-looking loss.
+   Small, isolated, and independent of #1/#2; do it before trusting liger's VRAM number.
+
+---
+
 ## 0d. Multi-GPU strategy (rationale)
 
 "Multi-GPU" splits by *goal*, and QLoRA changes which tool fits, because only the
