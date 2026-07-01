@@ -495,7 +495,13 @@ class NativeLlamaQLoRA(nn.Module):
                 # cuda:1 pointer from a cuda:0 launch ("cannot be accessed from
                 # Triton (cpu tensor?)"). Pin the launch to x's device.
                 with torch.cuda.device(x.device):
-                    return ops[0].apply(x, w, spec["eps"], spec["bias"], "gemma")
+                    # in_place=False (6th arg). Liger defaults in_place=True, whose
+                    # backward writes dX into the grad-output buffer; under
+                    # use_reentrant=False checkpointing + the residual that also consumes
+                    # this norm's input that reuse corrupts gradients (forward fine, grad
+                    # norm explodes ~1e16). A fresh dX buffer costs one [tokens, hidden]
+                    # allocation per norm and fixes it.
+                    return ops[0].apply(x, w, spec["eps"], spec["bias"], "gemma", False)
         xf = x.float()
         var = xf.pow(2).mean(dim=-1, keepdim=True) + spec["eps"]
         xn = xf * torch.rsqrt(var) * spec["scale"]
