@@ -1002,6 +1002,13 @@ class NativeLlamaQLoRA(nn.Module):
             # train_head -> the trainable full head; otherwise the frozen head weight
             # (a lora_head delta is added to its logits below).
             w = self.head_weight if self.train_head else self.lm_head_weight_fn()()  # [d, V]
+            # The frozen base loads under inference_mode, so its head weight is an
+            # inference tensor. hs requires grad, so `hs @ w` would save w for backward
+            # -- forbidden for inference tensors. Clone to a normal tensor when the head
+            # is frozen (train_head already owns a normal Parameter). Negligible: a
+            # [d, V] clone once per step. Same fix as the Liger RMSNorm weight (#106).
+            if torch.is_inference(w):
+                w = w.clone()
             if not bool(valid.any()):
                 # No supervised tokens: keep the graph alive with a 0 grad for every
                 # trainable surface touched here (full head and/or head-LoRA a/b).
