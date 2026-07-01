@@ -242,10 +242,17 @@ def format_prompt_and_eot(model, tokenizer, prompt_format):
       markers are plain text on a base model (not registered special tokens) --
       the model learns them as a literal pattern, which is the standard way these
       tunes are trained. EOS ends the turn.
+    - ``gemma4-nothink``: the Gemma4 turn format with the thought channel
+      pre-closed empty (``<|turn>user\\n{user}<turn|>\\n<|turn>model\\n
+      <|channel>thought\\n<channel|>{response}``), so the model is trained to
+      answer directly instead of emitting a reasoning span. Matches the
+      ``"gemma4"`` case in ``examples/common.py`` / ``PromptFormat_gemma4`` in
+      ``examples/chat_templates.py`` used for inference. ``<turn|>`` (a
+      registered special token) ends the turn, not EOS.
 
-    For ``mistral``/``metharme`` a literal BOS is prepended so the sequence starts
-    with one; the caller's BOS-normalization then collapses any duplicate the
-    tokenizer auto-adds.
+    For ``mistral``/``metharme``/``gemma4-nothink`` a literal BOS is prepended so
+    the sequence starts with one; the caller's BOS-normalization then collapses
+    any duplicate the tokenizer auto-adds.
     """
     if prompt_format == "mistral":
         bos = tokenizer.bos_token or ""
@@ -255,9 +262,14 @@ def format_prompt_and_eot(model, tokenizer, prompt_format):
         bos = tokenizer.bos_token or ""
         eos = tokenizer.eos_token or ""
         return (lambda user: f"{bos}<|user|>{user}<|model|>"), eos
+    if prompt_format == "gemma4-nothink":
+        bos = tokenizer.bos_token or ""
+        return (lambda user: f"{bos}<|turn>user\n{user}<turn|>\n<|turn>model\n"
+                              f"<|channel>thought\n<channel|>"), "<turn|>"
     if prompt_format == "auto":
         return (lambda user: model.default_chat_prompt(user)), turn_end_token(tokenizer)
-    raise ValueError(f"unknown prompt-format '{prompt_format}' (expected auto/mistral/metharme)")
+    raise ValueError(f"unknown prompt-format '{prompt_format}' "
+                      f"(expected auto/mistral/metharme/gemma4-nothink)")
 
 
 # Stage directions / inline actions, e.g. "[as CAMBIO]", "[TRINCULO grabs ...]",
@@ -809,14 +821,18 @@ def main():
                          "user turn is the prompt and the assistant turn the "
                          "supervised response; --instruction/context/response-key "
                          "are ignored.")
-    ap.add_argument("--prompt-format", choices=["auto", "mistral", "metharme"],
+    ap.add_argument("--prompt-format",
+                    choices=["auto", "mistral", "metharme", "gemma4-nothink"],
                     default="auto",
                     help="Chat format. auto: the model's native template "
                          "(Llama-3, Mistral [INST], mistral3 [SYSTEM_PROMPT]/[INST]). "
                          "mistral: explicit <s>[INST]{q}[/INST]{a}</s> (= auto for "
                          "the mistral3 arch, e.g. Mistral-Medium-3.5). metharme: "
-                         "Pygmalion <|user|>{q}<|model|>{a}</s>. EOS ends the turn "
-                         "for mistral/metharme.")
+                         "Pygmalion <|user|>{q}<|model|>{a}</s>. gemma4-nothink: "
+                         "<|turn>user\\n{q}<turn|>\\n<|turn>model\\n<|channel>thought\\n"
+                         "<channel|>{a} with the thought span pre-closed empty (no "
+                         "reasoning trained). EOS ends the turn for mistral/metharme; "
+                         "<turn|> ends the turn for gemma4-nothink.")
     ap.add_argument("--clean-text", action="store_true",
                     help="Strip [stage directions]/*actions* and normalize "
                          "whitespace before training (OFF by default). Helps "
