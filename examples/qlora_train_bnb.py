@@ -73,14 +73,19 @@ RUN_LOG_FIELDS = [
     "r", "alpha", "lr", "scheduler", "warmup_steps", "weight_decay",
     "batch", "grad_accum", "world_size", "eff_batch",
     "epochs", "steps_planned", "steps_done", "seq_len",
-    "targets", "compute_dtype", "attn_impl", "parallel", "shuffle",
+    "targets", "compute_dtype", "attn_impl", "parallel", "shuffle", "pack",
     "max_samples", "train_embeddings", "train_head", "prompt_format",
     "trainable_params", "n_train", "n_val", "n_eval2",
     "start_loss", "end_loss", "best_val", "best_val_step",
     "start_val", "start_eval2", "final_val", "final_eval2",
     "total_s", "s_per_step", "sup_tok_s", "tot_tok_s", "peak_vram_gb",
+    "t_data_s", "t_fwd_s", "t_bwd_s", "t_opt_s", "dequant_s_per_step",
+    "phase", "error",
     "notes",
 ]
+# NB: this copy had drifted from the native arm's (it was missing "pack"), which
+# made the two arms flip the shared CSV to .bak on every alternation. Keep it
+# BYTE-IDENTICAL to qlora_train_native.RUN_LOG_FIELDS.
 
 
 def append_run_log(path, record):
@@ -102,6 +107,91 @@ def append_run_log(path, record):
             w.writeheader()
         w.writerow({k: record.get(k, "") for k in RUN_LOG_FIELDS})
     print(f"[run-log] appended 1 row to {path}")
+
+
+class StepTimer:
+    """Per-step wall-clock sections (data/fwd/bwd/opt); inlined copy of
+    qlora_train_native.StepTimer (separate venv) -- keep in sync."""
+
+    SECTIONS = ("data", "fwd", "bwd", "opt")
+
+    def __init__(self, devices=None, window=20):
+        self.devices = devices
+        self.total = {s: 0.0 for s in self.SECTIONS}
+        self.steps = 0
+        self.win = deque(maxlen=window)
+        self._cur = None
+        self._t = None
+
+    def _now(self):
+        if torch.cuda.is_available():
+            for d in (self.devices or [None]):
+                torch.cuda.synchronize(d)
+        return time.perf_counter()
+
+    def begin_step(self):
+        self._cur = {s: 0.0 for s in self.SECTIONS}
+        self._t = self._now()
+
+    def mark(self, section):
+        t = self._now()
+        self._cur[section] += t - self._t
+        self._t = t
+
+    def end_step(self):
+        for s in self.SECTIONS:
+            self.total[s] += self._cur[s]
+        self.steps += 1
+        self.win.append(self._cur)
+        self._cur = None
+
+    def step_line(self):
+        if not self.win:
+            return ""
+        n = len(self.win)
+        avg = {s: sum(w[s] for w in self.win) / n for s in self.SECTIONS}
+        tot = sum(avg.values())
+        if tot <= 0:
+            return ""
+        parts = []
+        for key, label in (("data", "d"), ("fwd", "f"), ("bwd", "b"), ("opt", "o")):
+            pct = 100.0 * avg[key] / tot
+            if key != "data" or pct >= 1.0:
+                parts.append(f"{label} {pct:.0f}%")
+        return f"{tot:.2f}s: " + " ".join(parts)
+
+    def summary(self):
+        tot = sum(self.total.values())
+        if tot <= 0:
+            return "n/a"
+        return " ".join(f"{s} {100.0 * self.total[s] / tot:.0f}%" for s in self.SECTIONS)
+
+
+# Failure logging (inlined copy of the native arm's; keep in sync): any crash
+# appends a status=failed row + traceback sidecar, so failed BNB runs are
+# documented in the same CSV as everything else.
+_FAIL_CTX = {"run_log": None, "record": {}, "phase": "startup", "logged": False}
+
+
+def _log_failure(status, exc):
+    if _FAIL_CTX["logged"] or not _FAIL_CTX["run_log"]:
+        return
+    _FAIL_CTX["logged"] = True
+    import traceback
+    err = f"{type(exc).__name__}: {exc}".strip()[:400]
+    rec = dict(_FAIL_CTX["record"])
+    rec.update(status=status, phase=_FAIL_CTX["phase"], error=err)
+    try:
+        append_run_log(_FAIL_CTX["run_log"], rec)
+        elog = os.path.abspath(_FAIL_CTX["run_log"]) + ".errors.log"
+        with open(elog, "a", encoding="utf-8") as f:
+            f.write(f"\n===== {datetime.datetime.now().isoformat(timespec='seconds')}"
+                    f" | phase: {_FAIL_CTX['phase']} | {err}\n")
+            f.write(traceback.format_exc())
+        print(f"[run-log] failure recorded (phase: {_FAIL_CTX['phase']}); "
+              f"traceback appended to {elog}")
+    except Exception as log_exc:
+        print(f"[run-log] could not record failure: {log_exc}")
 
 
 EOT = "<|eot_id|>"
@@ -302,6 +392,23 @@ def collate(batch, pad_id):  # identical padding to qlora_train_native.collate
 
 
 def main():
+    """Run with failure capture (mirrors the native arm): exceptions append a
+    status=failed run-log row + traceback to <run_log>.errors.log, then re-raise."""
+    try:
+        _run_main()
+    except KeyboardInterrupt as e:
+        _log_failure("interrupted", e)
+        raise SystemExit(130)
+    except SystemExit as e:
+        if e.code not in (0, None):
+            _log_failure("failed", e)
+        raise
+    except BaseException as e:
+        _log_failure("failed", e)
+        raise
+
+
+def _run_main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="bf16/fp16 HF model dir")
     ap.add_argument("--out", required=True, help="Adapter output dir (PEFT)")
@@ -420,9 +527,33 @@ def main():
     is_main = rank == 0
     device = f"cuda:{local_rank}"
 
+    # Failure logger context (rank 0 only; other ranks keep run_log=None).
+    if is_main:
+        _FAIL_CTX["run_log"] = args.run_log
+        _FAIL_CTX["phase"] = "startup"
+        _FAIL_CTX["record"] = {
+            "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+            "arm": "bnb-nf4", "model": args.model, "out": args.out,
+            "dataset": args.dataset, "eval_split": args.eval_split or "",
+            "eval_dataset": args.eval_dataset or "",
+            "eval2_dataset": args.eval2_dataset or "",
+            "r": args.r, "alpha": args.alpha, "lr": args.lr,
+            "scheduler": args.scheduler, "weight_decay": args.weight_decay,
+            "batch": args.batch, "grad_accum": args.grad_accum,
+            "world_size": world_size,
+            "eff_batch": args.batch * world_size * args.grad_accum,
+            "epochs": args.epochs, "steps_planned": args.steps,
+            "seq_len": args.seq_len, "compute_dtype": "bfloat16",
+            "attn_impl": "hf-sdpa", "parallel": "ddp" if ddp else "single",
+            "shuffle": int(bool(args.shuffle)), "pack": 0,
+            "max_samples": args.max_samples, "train_embeddings": 0,
+            "train_head": 0, "prompt_format": "llama3",
+        }
+
     torch.manual_seed(args.seed)
     random.seed(args.seed)
 
+    _FAIL_CTX["phase"] = "load_model"
     tok = AutoTokenizer.from_pretrained(args.model)
     pad_id = tok.pad_token_id
     if pad_id is None:
@@ -453,6 +584,7 @@ def main():
         for p in params:
             dist.broadcast(p.data, src=0)
 
+    _FAIL_CTX["phase"] = "build_dataset"
     examples = build_sft_examples(tok, args, shuffle=args.shuffle)
     assert examples, "no usable training examples"
     # Held-out eval set. Prefer the dataset's own eval split (real held-out data);
@@ -547,6 +679,7 @@ def main():
     meter = ThroughputMeter()
 
     # Baseline eval at step 0 (no-op adapter = base NF4 model); rank 0 prints.
+    _FAIL_CTX["phase"] = "baseline_eval"
     if val_examples or val2_examples:
         start_val = evaluate()
         start_eval2 = eval_loss(val2_examples)
@@ -560,18 +693,26 @@ def main():
 
     t0 = time.time()                       # training timer after the baseline eval
     torch.cuda.reset_peak_memory_stats(device)
+    timer = StepTimer(devices=[local_rank])
     try:
       for step in range(1, args.steps + 1):
+        _FAIL_CTX["phase"] = f"train step {step}"
         step_t0 = time.time()
         accum = 0.0
         step_sup = step_tot = 0
+        timer.begin_step()
         for _ in range(args.grad_accum):
             batch = next(bgen)
             ii, ll, aa = collate(batch, pad_id)
+            timer.mark("data")
             out = model(input_ids=ii.to(device), attention_mask=aa.to(device),
                         labels=ll.to(device))
+            # .item() before backward so the fwd/bwd sections split at the sync.
+            loss_val = out.loss.item()
+            timer.mark("fwd")
             (out.loss / args.grad_accum).backward()
-            accum += out.loss.item() / args.grad_accum
+            timer.mark("bwd")
+            accum += loss_val / args.grad_accum
             step_sup += int((ll != -100).sum())
             step_tot += int(aa.sum())
         if ddp:
@@ -584,6 +725,8 @@ def main():
         opt.step()
         sched.step()
         opt.zero_grad(set_to_none=True)
+        timer.mark("opt")
+        timer.end_step()
         # Live tok/s (this rank; ×world_size for an aggregate estimate -- the
         # final [PERF] line all-reduces the true total).
         tok_seen += step_sup
@@ -598,7 +741,10 @@ def main():
             print(f"  step {step:>5}/{args.steps} | loss {accum:6.4f} | "
                   f"ema {ema:6.4f} | grad {gnorm:7.4f} | "
                   f"lr {sched.get_last_lr()[0]:.2e} | "
-                  f"~{tot_tps * world_size:,.0f} tok/s")
+                  f"~{tot_tps * world_size:,.0f} tok/s | {timer.step_line()}")
+            _FAIL_CTX["record"].update(
+                steps_done=step, end_loss=round(accum, 6),
+                peak_vram_gb=round(torch.cuda.max_memory_allocated(device) / 1e9, 3))
         if (args.eval_every and step % args.eval_every == 0
                 and (val_examples or val2_examples)):
             vl = evaluate()
@@ -620,6 +766,7 @@ def main():
         status = "interrupted"
 
     dt = time.time() - t0
+    _FAIL_CTX["phase"] = "final_eval"
     if not (args.save_best and val_examples):
         save("Done.")
 
@@ -646,8 +793,10 @@ def main():
         print(f"[PERF] {tok_t[0].item() / dt if dt else 0:,.0f} sup tok/s, "
               f"{tok_t[1].item() / dt if dt else 0:,.0f} tot tok/s "
               f"({'all ranks' if ddp else '1 GPU'}) | peak VRAM/GPU {peak_gb:.2f} "
-              f"GB | {dt:.0f}s, {args.steps} steps, world_size {world_size}")
+              f"GB | {dt:.0f}s, {args.steps} steps, world_size {world_size} | "
+              f"step time: {timer.summary()}")
 
+    _FAIL_CTX["logged"] = True     # normal completion path records the run below
     if is_main:
         rnd = lambda x, n=6: round(x, n) if isinstance(x, (int, float)) else ""
         archs = getattr(model.config, "architectures", None) or [""]
@@ -664,7 +813,8 @@ def main():
             "steps_planned": args.steps, "steps_done": step, "seq_len": args.seq_len,
             "targets": " ".join(TARGET_MODULES), "compute_dtype": "bfloat16",
             "attn_impl": "hf-sdpa", "parallel": "ddp" if ddp else "single",
-            "shuffle": int(bool(args.shuffle)), "max_samples": args.max_samples,
+            "shuffle": int(bool(args.shuffle)), "pack": 0,
+            "max_samples": args.max_samples,
             "train_embeddings": 0, "train_head": 0, "prompt_format": "llama3",
             "trainable_params": sum(p.numel() for p in params),
             "n_train": len(examples), "n_val": len(val_examples),
@@ -678,7 +828,9 @@ def main():
             "sup_tok_s": round(tok_t[0].item() / dt) if dt else "",
             "tot_tok_s": round(tok_t[1].item() / dt) if dt else "",
             "peak_vram_gb": rnd(torch.cuda.max_memory_allocated(device) / 1e9, 3),
-            "notes": "",
+            "t_data_s": rnd(timer.total["data"], 1), "t_fwd_s": rnd(timer.total["fwd"], 1),
+            "t_bwd_s": rnd(timer.total["bwd"], 1), "t_opt_s": rnd(timer.total["opt"], 1),
+            "phase": "", "error": "", "notes": "",
         })
 
     if args.gen_out and is_main:

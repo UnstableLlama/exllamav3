@@ -78,6 +78,81 @@ class ThroughputMeter:
         return sum(b[1] for b in self.buf) / tt, sum(b[2] for b in self.buf) / tt
 
 
+class StepTimer:
+    """Wall-clock breakdown of every training step into sections: ``data``
+    (batch build/collate), ``fwd`` (loss forward), ``bwd`` (backward), ``opt``
+    (grad clip + optimizer + scheduler step).
+
+    ``mark(section)`` charges the time since the previous mark to ``section``;
+    sections repeat within a step under grad accumulation and accumulate. On
+    CUDA each mark synchronizes the active devices first, so async GPU work is
+    charged to the section that launched it (a few extra syncs per step, ~µs
+    each -- the loop already syncs at ``loss.item()`` / ``gnorm.item()``).
+
+    Keeps cumulative totals (for the ``[PERF]`` summary and the run-log CSV)
+    plus a rolling window of recent steps (for the live per-step line), so a
+    run answers "where does the time go" without a separate profiling run.
+    """
+
+    SECTIONS = ("data", "fwd", "bwd", "opt")
+
+    def __init__(self, devices=None, window=20):
+        # devices: CUDA device indices to synchronize at each mark (the split
+        # load spans several); None -> current device only.
+        self.devices = devices
+        self.total = {s: 0.0 for s in self.SECTIONS}
+        self.steps = 0
+        self.win = deque(maxlen=window)
+        self._cur = None
+        self._t = None
+
+    def _now(self):
+        if torch.cuda.is_available():
+            for d in (self.devices or [None]):
+                torch.cuda.synchronize(d)
+        return time.perf_counter()
+
+    def begin_step(self):
+        self._cur = {s: 0.0 for s in self.SECTIONS}
+        self._t = self._now()
+
+    def mark(self, section):
+        t = self._now()
+        self._cur[section] += t - self._t
+        self._t = t
+
+    def end_step(self):
+        for s in self.SECTIONS:
+            self.total[s] += self._cur[s]
+        self.steps += 1
+        self.win.append(self._cur)
+        self._cur = None
+
+    def step_line(self):
+        """Compact rolling mean for the per-step line, e.g.
+        ``1.84s: f 52% b 39% o 8%`` (data shown only when it reaches 1%)."""
+        if not self.win:
+            return ""
+        n = len(self.win)
+        avg = {s: sum(w[s] for w in self.win) / n for s in self.SECTIONS}
+        tot = sum(avg.values())
+        if tot <= 0:
+            return ""
+        parts = []
+        for key, label in (("data", "d"), ("fwd", "f"), ("bwd", "b"), ("opt", "o")):
+            pct = 100.0 * avg[key] / tot
+            if key != "data" or pct >= 1.0:
+                parts.append(f"{label} {pct:.0f}%")
+        return f"{tot:.2f}s: " + " ".join(parts)
+
+    def summary(self):
+        """Run-total split for the [PERF] line, e.g. ``data 1% fwd 51% bwd 40% opt 8%``."""
+        tot = sum(self.total.values())
+        if tot <= 0:
+            return "n/a"
+        return " ".join(f"{s} {100.0 * self.total[s] / tot:.0f}%" for s in self.SECTIONS)
+
+
 # Canonical schema for the per-run CSV log. Fixed order so the "mega CSV" stays
 # consistent across runs/arms; the BNB arm inlines an identical copy (separate
 # venv) and the DDP script imports these. Unknown keys are ignored and missing
@@ -94,6 +169,13 @@ RUN_LOG_FIELDS = [
     "start_loss", "end_loss", "best_val", "best_val_step",
     "start_val", "start_eval2", "final_val", "final_eval2",
     "total_s", "s_per_step", "sup_tok_s", "tot_tok_s", "peak_vram_gb",
+    # Wall-clock section totals (seconds) from StepTimer, and the measured
+    # dequant (trellis reconstruction) time per step when --profile-dequant ran.
+    "t_data_s", "t_fwd_s", "t_bwd_s", "t_opt_s", "dequant_s_per_step",
+    # Failure forensics: where the run died and the exception summary. Blank
+    # for completed runs; status=failed rows carry them, so the CSV doubles as
+    # a lab notebook of what was tried and why it fell over.
+    "phase", "error",
     "notes",
 ]
 
@@ -123,6 +205,40 @@ def append_run_log(path, record):
             w.writeheader()
         w.writerow({k: record.get(k, "") for k in RUN_LOG_FIELDS})
     print(f"[run-log] appended 1 row to {path}")
+
+
+# Mutable context for the failure logger. _run_main() fills this in as the run
+# progresses (args first, then per-milestone phase updates, then per-step
+# progress), so a crash ANYWHERE -- dataset typo, OOM at step 3, a guard's
+# SystemExit -- still writes a meaningful run-log row: the CSV records failed
+# experiments and why, not just the ones that finished. A run that completes
+# (or is Ctrl-C'd through the normal path) sets ``logged`` and the failure
+# logger stays silent. Note a hard process kill (segfault, OOM-killer, SLURM
+# preemption) can't be caught -- those runs leave no row.
+_FAIL_CTX = {"run_log": None, "record": {}, "phase": "startup", "logged": False}
+
+
+def _log_failure(status, exc):
+    """Append a run-log row for a run that died, plus the full traceback to a
+    sidecar ``<run_log>.errors.log`` (tracebacks don't fit a CSV cell)."""
+    if _FAIL_CTX["logged"] or not _FAIL_CTX["run_log"]:
+        return
+    _FAIL_CTX["logged"] = True
+    import traceback
+    err = f"{type(exc).__name__}: {exc}".strip()[:400]
+    rec = dict(_FAIL_CTX["record"])
+    rec.update(status=status, phase=_FAIL_CTX["phase"], error=err)
+    try:
+        append_run_log(_FAIL_CTX["run_log"], rec)
+        elog = os.path.abspath(_FAIL_CTX["run_log"]) + ".errors.log"
+        with open(elog, "a", encoding="utf-8") as f:
+            f.write(f"\n===== {datetime.datetime.now().isoformat(timespec='seconds')}"
+                    f" | phase: {_FAIL_CTX['phase']} | {err}\n")
+            f.write(traceback.format_exc())
+        print(f"[run-log] failure recorded (phase: {_FAIL_CTX['phase']}); "
+              f"traceback appended to {elog}")
+    except Exception as log_exc:  # never mask the original error with a log error
+        print(f"[run-log] could not record failure: {log_exc}")
 
 
 def checkpoint_dir(out, step):
@@ -764,6 +880,28 @@ def sample(model, cache, tokenizer, generator, build_prompt, prompt, max_new_tok
 
 
 def main():
+    """Run the trainer with failure capture: any exception or non-zero
+    SystemExit appends a ``status=failed`` row (with phase + error summary) to
+    the run-log CSV and the full traceback to ``<run_log>.errors.log`` before
+    re-raising, so failed experiments are documented automatically. Ctrl-C
+    outside the training loop's own handler is recorded as ``interrupted``."""
+    try:
+        _run_main()
+    except KeyboardInterrupt as e:
+        _log_failure("interrupted", e)
+        raise SystemExit(130)
+    except SystemExit as e:
+        # SystemExit(0) is the normal Ctrl-C exit path (already logged);
+        # a message/non-zero code is a guard-rail abort worth recording.
+        if e.code not in (0, None):
+            _log_failure("failed", e)
+        raise
+    except BaseException as e:
+        _log_failure("failed", e)
+        raise
+
+
+def _run_main():
     # Line-buffer stdout/stderr so the per-step progress lines (and interleaved
     # eval/sample/checkpoint lines) flush on each newline. Python block-buffers
     # stdout when it isn't a TTY -- i.e. exactly when the run is redirected to a
@@ -1040,9 +1178,41 @@ def main():
     ap.add_argument("--run-log", default="qlora_runs.csv",
                     help="Append one metadata row per run to this CSV (model, "
                          "hyperparameters, start/end/best-val loss, timing, tok/s, "
-                         "peak VRAM, ...). Written on normal finish AND on Ctrl-C. "
-                         "Empty string disables.")
+                         "peak VRAM, ...). Written on normal finish, on Ctrl-C, AND "
+                         "on failure (status=failed + error; traceback goes to "
+                         "<run-log>.errors.log). Empty string disables.")
+    ap.add_argument("--profile-dequant", type=int, default=0, metavar="N",
+                    help="Measure frozen-weight (trellis) reconstruction time for "
+                         "the first N training steps, print its share of the step "
+                         "wall time, then disable. Adds a device sync around every "
+                         "reconstruction while active, so expect those N steps to "
+                         "run slower; the reported %% is still representative.")
     args = ap.parse_args()
+
+    # Seed the failure logger with everything knowable before work starts, so a
+    # crash at ANY later point (bad dataset name, OOM, unsupported arch guard)
+    # still produces a run-log row identifying the attempt. Progress fields
+    # (steps_done, end_loss, peak VRAM, phase) are refreshed as the run advances.
+    _FAIL_CTX["run_log"] = args.run_log
+    _FAIL_CTX["phase"] = "startup"
+    _FAIL_CTX["record"] = {
+        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+        "arm": "exl3-native", "model": args.model, "out": args.out,
+        "dataset": args.dataset, "eval_split": args.eval_split or "",
+        "eval_dataset": args.eval_dataset or "",
+        "eval2_dataset": args.eval2_dataset or "",
+        "r": args.r, "alpha": args.alpha, "lr": args.lr,
+        "scheduler": args.scheduler, "weight_decay": args.weight_decay,
+        "batch": args.batch, "grad_accum": args.grad_accum, "world_size": 1,
+        "eff_batch": args.batch * args.grad_accum, "epochs": args.epochs,
+        "steps_planned": args.steps, "seq_len": args.seq_len,
+        "compute_dtype": args.compute_dtype, "attn_impl": args.attn_impl,
+        "parallel": args.parallel, "shuffle": int(bool(args.shuffle)),
+        "pack": int(bool(args.pack)), "max_samples": args.max_samples,
+        "train_embeddings": int(bool(args.train_embeddings)),
+        "train_head": int(bool(args.train_head)),
+        "prompt_format": args.prompt_format,
+    }
 
     # Text cleaning is opt-in (--clean-text). --no-clean-text is the old default
     # and now a no-op, kept so existing commands don't break.
@@ -1055,6 +1225,7 @@ def main():
            "bfloat16": torch.bfloat16}[args.compute_dtype]
 
     # 1. Load native model + tokenizer (the forward that's correct on EXL3).
+    _FAIL_CTX["phase"] = "load_model"
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
 
@@ -1091,6 +1262,8 @@ def main():
     # bf16 embed/head master weights when the CPU-offload optimizer (bf16 stochastic
     # rounding) drives them; fp32 otherwise.
     ms_dtype = torch.bfloat16 if args.offload_embed_head_optim else torch.float32
+    _FAIL_CTX["phase"] = "build_net"
+    _FAIL_CTX["record"]["arch"] = getattr(config, "architecture", "")
     net = NativeLlamaQLoRA(
         model, r=args.r, alpha=args.alpha, target_modules=args.targets,
         compute_dtype=cdt, gradient_checkpointing=not args.no_grad_ckpt,
@@ -1117,6 +1290,7 @@ def main():
         print(f" -- decoder block devices: {dict(dist)}  (final norm + head on {net.device})")
 
     # 3. Data.
+    _FAIL_CTX["phase"] = "build_dataset"
     examples = build_sft_examples(
         model, tokenizer, args.dataset, args.max_samples, args.seq_len,
         instruction_key=args.instruction_key, context_key=args.context_key,
@@ -1360,6 +1534,29 @@ def main():
     run_started = datetime.datetime.now().isoformat(timespec="seconds")
     meter = ThroughputMeter()
 
+    # (peak_vram_gb / log_run are defined once below, after the baseline eval --
+    # an earlier duplicate pair that used to sit here was dead code and is gone.)
+
+    # Baseline eval at step 0 (the adapter is a no-op at init, B=0, so this is the
+    # base model's held-out loss) -- a reference point for the trained numbers.
+    _FAIL_CTX["phase"] = "baseline_eval"
+    if val_examples or val2_examples:
+        start_val = evaluate()
+        start_eval2 = eval_loss(val2_examples) if val2_examples else None
+        parts = []
+        if start_val is not None:
+            parts.append(f"held-out {start_val:.4f}")
+        if start_eval2 is not None:
+            parts.append(f"{eval2_label} {start_eval2:.4f}")
+        print("    [eval] step 0 (baseline): " + " | ".join(parts))
+
+    # Start the training timer + VRAM peak AFTER the baseline eval so neither is
+    # counted against training throughput.
+    t0 = time.time()
+    if torch.cuda.is_available():
+        for d in active_devices:
+            torch.cuda.reset_peak_memory_stats(d)
+
     def peak_vram_gb():
         if not torch.cuda.is_available():
             return 0.0
@@ -1368,7 +1565,12 @@ def main():
 
     def log_run(status, dt, final_val, final_eval2):
         # One CSV row capturing the run's identity, hyperparameters and results.
-        # Called on normal finish and on Ctrl-C so interrupted runs are recorded.
+        # Called on normal finish and on Ctrl-C; crashes are covered separately
+        # by _log_failure (main()'s wrapper), which this call disarms.
+        # NOTE: start_val/start_eval2 were silently missing from this record for
+        # several sessions (a duplicate-definition merge artifact shadowed the
+        # copy that had them); restored in Session 11.
+        _FAIL_CTX["logged"] = True
         rnd = lambda x, n=6: round(x, n) if isinstance(x, (int, float)) else ""
         append_run_log(args.run_log, {
             "timestamp": run_started, "arm": "exl3-native", "status": status,
@@ -1398,80 +1600,49 @@ def main():
             "total_s": rnd(dt, 1), "s_per_step": rnd(dt / step, 4) if step else "",
             "sup_tok_s": round(tok_seen / dt) if dt else "",
             "tot_tok_s": round(tot_seen / dt) if dt else "",
-            "peak_vram_gb": rnd(peak_vram_gb(), 3), "notes": "",
+            "peak_vram_gb": rnd(peak_vram_gb(), 3),
+            "t_data_s": rnd(timer.total["data"], 1), "t_fwd_s": rnd(timer.total["fwd"], 1),
+            "t_bwd_s": rnd(timer.total["bwd"], 1), "t_opt_s": rnd(timer.total["opt"], 1),
+            "dequant_s_per_step": rnd(dequant_s_per_step, 3)
+                if dequant_s_per_step is not None else "",
+            "phase": "", "error": "", "notes": "",
         })
 
-    # Baseline eval at step 0 (the adapter is a no-op at init, B=0, so this is the
-    # base model's held-out loss) -- a reference point for the trained numbers.
-    if val_examples or val2_examples:
-        start_val = evaluate()
-        start_eval2 = eval_loss(val2_examples) if val2_examples else None
-        parts = []
-        if start_val is not None:
-            parts.append(f"held-out {start_val:.4f}")
-        if start_eval2 is not None:
-            parts.append(f"{eval2_label} {start_eval2:.4f}")
-        print("    [eval] step 0 (baseline): " + " | ".join(parts))
+    # Per-step wall-clock section breakdown (data/fwd/bwd/opt). Under --parallel
+    # split the step spans several devices; sync them all at each mark.
+    timer = StepTimer(devices=active_devices if torch.cuda.is_available() else None)
 
-    # Start the training timer + VRAM peak AFTER the baseline eval so neither is
-    # counted against training throughput.
-    t0 = time.time()
-    if torch.cuda.is_available():
-        for d in active_devices:
-            torch.cuda.reset_peak_memory_stats(d)
-
-    def peak_vram_gb():
-        if not torch.cuda.is_available():
-            return 0.0
-        return max((torch.cuda.max_memory_allocated(d) / 1e9 for d in active_devices),
-                   default=0.0)
-
-    def log_run(status, dt, final_val, final_eval2):
-        # One CSV row capturing the run's identity, hyperparameters and results.
-        # Called on normal finish and on Ctrl-C so interrupted runs are recorded.
-        rnd = lambda x, n=6: round(x, n) if isinstance(x, (int, float)) else ""
-        append_run_log(args.run_log, {
-            "timestamp": run_started, "arm": "exl3-native", "status": status,
-            "model": args.model, "arch": getattr(config, "architecture", ""),
-            "out": args.out, "dataset": args.dataset,
-            "eval_split": args.eval_split or "", "eval_dataset": args.eval_dataset or "",
-            "eval2_dataset": args.eval2_dataset or "",
-            "r": args.r, "alpha": args.alpha, "lr": args.lr,
-            "scheduler": args.scheduler, "warmup_steps": warmup_steps,
-            "weight_decay": args.weight_decay, "batch": args.batch,
-            "grad_accum": args.grad_accum, "world_size": 1,
-            "eff_batch": args.batch * args.grad_accum, "epochs": args.epochs,
-            "steps_planned": args.steps, "steps_done": step, "seq_len": args.seq_len,
-            "targets": " ".join(net.target_modules), "compute_dtype": args.compute_dtype,
-            "attn_impl": args.attn_impl, "parallel": args.parallel,
-            "shuffle": int(bool(args.shuffle)), "pack": int(bool(args.pack)),
-            "max_samples": args.max_samples,
-            "train_embeddings": int(bool(args.train_embeddings)),
-            "train_head": int(bool(args.train_head)), "prompt_format": args.prompt_format,
-            "trainable_params": net.num_trainable(), "n_train": len(examples),
-            "n_val": len(val_examples), "n_eval2": len(val2_examples),
-            "start_loss": rnd(start_loss), "end_loss": rnd(end_loss),
-            "best_val": rnd(best_val) if best_val != float("inf") else "",
-            "best_val_step": best_val_step or "",
-            "final_val": rnd(final_val), "final_eval2": rnd(final_eval2),
-            "total_s": rnd(dt, 1), "s_per_step": rnd(dt / step, 4) if step else "",
-            "sup_tok_s": round(tok_seen / dt) if dt else "",
-            "tot_tok_s": round(tot_seen / dt) if dt else "",
-            "peak_vram_gb": rnd(peak_vram_gb(), 3), "notes": "",
-        })
+    # Optional dequant profiling: time every frozen-weight reconstruction for the
+    # first N steps to answer "how much of the step is trellis reconstruction".
+    dq_profile = None
+    dequant_s_per_step = None
+    if args.profile_dequant > 0:
+        from exllamav3.training import backbone as _backbone
+        dq_profile = {"calls": 0, "s": 0.0}
+        _backbone.profile_dequant(dq_profile)
+        print(f" -- profiling dequant (trellis reconstruction) for the first "
+              f"{args.profile_dequant} steps; adds sync overhead while active")
     try:
         for step in range(resume_step + 1, args.steps + 1):
+            _FAIL_CTX["phase"] = f"train step {step}"
             step_t0 = time.time()
             accum_loss = 0.0
             step_sup = step_tot = 0
+            timer.begin_step()
             for _ in range(args.grad_accum):
                 batch = next(bgen)
                 input_ids, labels, attn, pos_ids, seg_ids = collate(batch, pad_id)
+                timer.mark("data")
                 loss = net.compute_loss(input_ids, labels, attention_mask=attn,
                                         chunk=args.ce_chunk,
                                         position_ids=pos_ids, seg_ids=seg_ids)
+                # .item() before backward (harmless to the graph) so the fwd/bwd
+                # sections split cleanly at the sync.
+                loss_val = loss.item()
+                timer.mark("fwd")
                 (loss / args.grad_accum).backward()
-                accum_loss += loss.item() / args.grad_accum
+                timer.mark("bwd")
+                accum_loss += loss_val / args.grad_accum
                 step_sup += int((labels != -100).sum())   # supervised tokens
                 step_tot += int(attn.sum())                # total (non-pad) tokens
 
@@ -1496,6 +1667,8 @@ def main():
             opt.zero_grad(set_to_none=True)
             if offload_opt is not None:
                 offload_opt.zero_grad(set_to_none=True)
+            timer.mark("opt")
+            timer.end_step()
 
             # Rolling tok/s over the train-step compute only (eval/sample/save
             # below are excluded so the rate reflects steady-state throughput).
@@ -1510,7 +1683,31 @@ def main():
             ema = accum_loss if ema is None else 0.9 * ema + 0.1 * accum_loss
             print(f"  step {step:>5}/{args.steps} | loss {accum_loss:6.4f} | "
                   f"ema {ema:6.4f} | grad {gnorm:7.4f} | lr {sched.get_last_lr()[0]:.2e} | "
-                  f"|B| {adapter_b_norm():7.3f} | {tot_tps:,.0f} tok/s")
+                  f"|B| {adapter_b_norm():7.3f} | {tot_tps:,.0f} tok/s | {timer.step_line()}")
+
+            # Keep the failure record current so a later crash (or kill -9 at
+            # least leaves the errors.log short a row, see _FAIL_CTX note)
+            # carries how far the run got and its memory/loss state.
+            _FAIL_CTX["record"].update(
+                steps_done=step, end_loss=round(accum_loss, 6),
+                peak_vram_gb=round(peak_vram_gb(), 3))
+            if start_loss is not None and "start_loss" not in _FAIL_CTX["record"]:
+                _FAIL_CTX["record"]["start_loss"] = round(start_loss, 6)
+
+            # End of the dequant profiling window: report reconstruction time
+            # against the timed step wall clock, then disable the hook.
+            if dq_profile is not None and (step - resume_step) >= args.profile_dequant:
+                n_prof = step - resume_step
+                wall = sum(timer.total.values())
+                dequant_s_per_step = dq_profile["s"] / max(1, n_prof)
+                print(f"  [profile] dequant: {dq_profile['calls']:,} reconstructions, "
+                      f"{dq_profile['s']:.2f}s over {n_prof} steps = "
+                      f"{dequant_s_per_step:.3f}s/step "
+                      f"({100.0 * dq_profile['s'] / max(wall, 1e-9):.0f}% of step wall "
+                      f"time) -- profiling off from here")
+                from exllamav3.training import backbone as _backbone
+                _backbone.profile_dequant(None)
+                dq_profile = None
 
             if (args.eval_every and step % args.eval_every == 0
                     and (val_examples or val2_examples)):
@@ -1569,6 +1766,7 @@ def main():
     #    With --save-best we already kept the best-val checkpoint; don't clobber
     #    it with the (likely overfit) final-step weights.
     dt = time.time() - t0
+    _FAIL_CTX["phase"] = "final_eval"
     # Final held-out numbers. Reuse the last in-loop eval when it already ran on
     # the final step (avoids a duplicate full pass that looks like a hang after
     # "Done."); otherwise compute once, announcing it so the GPU churn is expected.
@@ -1598,7 +1796,8 @@ def main():
         peak_str = "n/a"
     print(f"[PERF] {tok_seen / dt if dt else 0:,.0f} sup tok/s, "
           f"{tot_seen / dt if dt else 0:,.0f} tot tok/s | "
-          f"peak VRAM {peak_str} | {dt:.0f}s for {step} steps")
+          f"peak VRAM {peak_str} | {dt:.0f}s for {step} steps | "
+          f"step time: {timer.summary()}")
     log_run("completed", dt, val_loss, final_eval2)
     print("Verify with: python examples/qlora_infer_native.py "
           f"--model {args.model} --adapter {args.out}")
