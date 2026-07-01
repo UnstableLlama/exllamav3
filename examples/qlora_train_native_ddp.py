@@ -177,6 +177,10 @@ def _run_main():
                          "attention). Training set only; eval stays per-example. "
                          "Packed once (identically on every rank) then sharded, so "
                          "the per-rank block counts and step math stay in lockstep.")
+    ap.add_argument("--pack-algo", choices=["bfd", "nextfit"], default="bfd",
+                    help="Bin-packing strategy for --pack (bfd = best-fit "
+                         "decreasing, ~97%%+ fill; nextfit = old behavior). "
+                         "Deterministic, so ranks stay identical.")
     ap.add_argument("--targets", nargs="*", default=None)
     ap.add_argument("--train-embeddings", action="store_true",
                     help="Also FULLY train the input embeddings (modules_to_save). "
@@ -410,12 +414,12 @@ def _run_main():
     if args.pack:
         n_docs = len(examples)
         real_tokens = sum(len(ex["input_ids"]) for ex in examples)
-        examples = pack_examples(examples, args.seq_len, pad_id)
+        examples = pack_examples(examples, args.seq_len, pad_id, algo=args.pack_algo)
         cap = max(1, len(examples) * args.seq_len)
         if is_main(rank):
-            print(f" -- packed {n_docs} docs -> {len(examples)} blocks of "
-                  f"{args.seq_len} tok ({100.0 * real_tokens / cap:.1f}% filled, "
-                  f"~{real_tokens / max(1, len(examples)):.0f} real tok/block)")
+            print(f" -- packed ({args.pack_algo}) {n_docs} docs -> {len(examples)} "
+                  f"blocks of {args.seq_len} tok ({100.0 * real_tokens / cap:.1f}% "
+                  f"filled, ~{real_tokens / max(1, len(examples)):.0f} real tok/block)")
 
     shard = examples[rank::world_size]
     assert shard, "no training examples on this rank"

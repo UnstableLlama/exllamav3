@@ -777,13 +777,25 @@ def build_lm_examples(tokenizer, dataset_name, split, seq_len,
     return examples
 
 
-def pack_examples(examples, seq_len, pad_id):
-    """Greedily pack tokenized SFT examples into ``seq_len`` blocks (sample packing).
+def pack_examples(examples, seq_len, pad_id, algo="bfd"):
+    """Pack tokenized SFT examples into ``seq_len`` blocks (sample packing).
 
-    Each input example (from :func:`build_sft_examples`) is one *document*. We
-    concatenate documents next-fit into blocks of at most ``seq_len`` tokens, so a
+    Each input example (from :func:`build_sft_examples`) is one *document*;
+    documents are concatenated into blocks of at most ``seq_len`` tokens, so a
     short-answer dataset stops wasting most of every forward on pad tokens -- the
     same real tokens are processed in far fewer, fuller sequences.
+
+    ``algo`` picks the bin-packing strategy:
+      * ``"bfd"`` (default) -- best-fit decreasing: documents sorted longest-first,
+        each placed into the block with the least remaining room that still fits
+        (found by bisect over remaining capacities, so it's O(n log n)-ish and
+        deterministic). This is the multipack approach of Axolotl (FFD) /
+        Chronicals (BFD) and lifts fill from ~80-85% (next-fit) to typically 97%+
+        -- directly ~1.15-1.2x more real tokens per step. Reordering documents
+        across blocks is harmless: attention is document-isolated, positions
+        reset per document, and the training loop shuffles blocks anyway.
+      * ``"nextfit"`` -- the pre-Session-11 behavior (arrival order, seal a block
+        when the next document doesn't fit), kept for A/B comparison.
 
     Correctness is preserved by the native forward, NOT here: each block carries
       * ``seg_ids``      -- per-token document index, so attention is restricted to
@@ -798,18 +810,62 @@ def pack_examples(examples, seq_len, pad_id):
     labels; at a document join the shifted CE predicts the next document's first
     (masked) prompt token, so boundaries contribute no loss and need no fixup.
 
-    The final block is padded to ``seq_len`` so every block is uniform. Returns a
-    list of dicts (input_ids / labels / seg_ids / position_ids), consumed by
-    :func:`collate`.
+    Every block is padded to ``seq_len`` so blocks are uniform. Deterministic for
+    a given input order (BFD ties keep dataset order), so DDP ranks packing the
+    same list get identical blocks. Returns a list of dicts (input_ids / labels /
+    seg_ids / position_ids), consumed by :func:`collate`.
     """
-    blocks = []
-    cur_ids, cur_labels, cur_seg, cur_pos = [], [], [], []
-    seg = 0
+    docs = []
+    for ex in examples:
+        ids, labs = ex["input_ids"], ex["labels"]
+        if len(ids) > seq_len:                         # shouldn't happen (build_sft
+            ids, labs = ids[:seq_len], labs[:seq_len]  # truncates), but guard
+        docs.append((ids, labs))
 
-    def flush():
-        nonlocal cur_ids, cur_labels, cur_seg, cur_pos, seg
-        if not cur_ids:
-            return
+    # Phase 1: assign document indices to blocks.
+    if algo == "nextfit":
+        assignments, cur, cur_len = [], [], 0
+        for i, (ids, _) in enumerate(docs):
+            if cur and cur_len + len(ids) > seq_len:
+                assignments.append(cur)
+                cur, cur_len = [], 0
+            cur.append(i)
+            cur_len += len(ids)
+        if cur:
+            assignments.append(cur)
+    elif algo == "bfd":
+        import bisect
+        order = sorted(range(len(docs)), key=lambda i: (-len(docs[i][0]), i))
+        assignments = []
+        rems, block_by_rem = [], []       # remaining capacity (sorted) -> block idx
+        for i in order:
+            n = len(docs[i][0])
+            j = bisect.bisect_left(rems, n)   # smallest remaining that fits (best fit)
+            if j == len(rems):
+                assignments.append([i])
+                b, rem = len(assignments) - 1, seq_len - n
+            else:
+                rem = rems.pop(j) - n
+                b = block_by_rem.pop(j)
+                assignments[b].append(i)
+            k = bisect.bisect_left(rems, rem)
+            rems.insert(k, rem)
+            block_by_rem.insert(k, b)
+        for a in assignments:
+            a.sort()                      # within-block docs in dataset order
+    else:
+        raise ValueError(f"unknown packing algo '{algo}' (expected bfd/nextfit)")
+
+    # Phase 2: materialize blocks (identical layout for both algorithms).
+    blocks = []
+    for doc_idxs in assignments:
+        cur_ids, cur_labels, cur_seg, cur_pos = [], [], [], []
+        for seg, i in enumerate(doc_idxs):
+            ids, labs = docs[i]
+            cur_ids += ids
+            cur_labels += labs
+            cur_seg += [seg] * len(ids)
+            cur_pos += list(range(len(ids)))
         pad = seq_len - len(cur_ids)
         last_seg = cur_seg[-1] if cur_seg else 0
         blocks.append({
@@ -818,20 +874,6 @@ def pack_examples(examples, seq_len, pad_id):
             "seg_ids": cur_seg + [last_seg] * pad,
             "position_ids": cur_pos + [0] * pad,
         })
-        cur_ids, cur_labels, cur_seg, cur_pos, seg = [], [], [], [], 0
-
-    for ex in examples:
-        ids, labs = ex["input_ids"], ex["labels"]
-        if len(ids) > seq_len:                         # shouldn't happen (build_sft
-            ids, labs = ids[:seq_len], labs[:seq_len]  # truncates), but guard
-        if cur_ids and len(cur_ids) + len(ids) > seq_len:
-            flush()                                    # this doc won't fit; seal block
-        cur_ids += ids
-        cur_labels += labs
-        cur_seg += [seg] * len(ids)
-        cur_pos += list(range(len(ids)))
-        seg += 1
-    flush()
     return blocks
 
 
@@ -1029,6 +1071,12 @@ def _run_main():
                          "RoPE reset + block-diagonal attention; flash-varlen on "
                          "CUDA fp16/bf16). Only the training set is packed; the "
                          "held-out eval stays per-example for comparable losses.")
+    ap.add_argument("--pack-algo", choices=["bfd", "nextfit"], default="bfd",
+                    help="Bin-packing strategy for --pack. bfd (default): best-fit "
+                         "decreasing -- typically 97%%+ fill vs ~80-85%% for the old "
+                         "next-fit, i.e. ~1.15-1.2x more real tokens per step. "
+                         "nextfit: the pre-Session-11 arrival-order behavior, kept "
+                         "for A/B comparison.")
     ap.add_argument("--inspect", type=int, default=0, metavar="N",
                     help="Tokenization check: decode the first N built examples "
                          "(prompt span vs supervised response span + whether the "
@@ -1338,9 +1386,10 @@ def _run_main():
             # Inspect decodes per-document (the tokenization check is per doc);
             # add a one-line packing summary so the fill ratio is visible too.
             real_tokens = sum(len(ex["input_ids"]) for ex in examples)
-            blocks = pack_examples(examples, args.seq_len, pad_id)
+            blocks = pack_examples(examples, args.seq_len, pad_id, algo=args.pack_algo)
             cap = max(1, len(blocks) * args.seq_len)
-            print(f"\n -- packing: {len(examples)} docs -> {len(blocks)} blocks of "
+            print(f"\n -- packing ({args.pack_algo}): {len(examples)} docs -> "
+                  f"{len(blocks)} blocks of "
                   f"{args.seq_len} tok ({100.0 * real_tokens / cap:.1f}% filled); "
                   f"block 0 holds {len(set(blocks[0]['seg_ids']))} docs")
         print(f"\n -- inspect only ({args.inspect} shown); exiting before training.")
@@ -1403,10 +1452,10 @@ def _run_main():
     if args.pack:
         n_docs = len(examples)
         real_tokens = sum(len(ex["input_ids"]) for ex in examples)
-        examples = pack_examples(examples, args.seq_len, pad_id)
+        examples = pack_examples(examples, args.seq_len, pad_id, algo=args.pack_algo)
         cap = max(1, len(examples) * args.seq_len)
-        print(f" -- packed {n_docs} docs -> {len(examples)} blocks of "
-              f"{args.seq_len} tok ({100.0 * real_tokens / cap:.1f}% filled, "
+        print(f" -- packed ({args.pack_algo}) {n_docs} docs -> {len(examples)} blocks "
+              f"of {args.seq_len} tok ({100.0 * real_tokens / cap:.1f}% filled, "
               f"~{real_tokens / max(1, len(examples)):.0f} real tok/block)")
         assert examples, "no training blocks after packing"
 
