@@ -1091,7 +1091,16 @@ def main():
         shuffle=args.shuffle, shuffle_seed=args.shuffle_seed,
     )
     print(f" -- {len(examples)} SFT examples{' (shuffled)' if args.shuffle else ''}")
-    assert examples, "no usable training examples"
+    if not examples:
+        hint = (
+            f"no usable training examples from {args.dataset!r}. "
+            f"If this is an OpenAI-style JSONL with a `messages` column, set "
+            f"`messages_key: messages` in YAML (or pass --messages-key messages). "
+            f"Otherwise check instruction/context/response keys "
+            f"({args.instruction_key!r}/{args.context_key!r}/{args.response_key!r}), "
+            f"min_response_words={args.min_response_words}, and seq_len={args.seq_len}."
+        )
+        raise SystemExit(hint)
 
     # Tokenization check: decode the prompt span (labels==-100) and the supervised
     # response span (labels!=-100) separately, so the mask boundary and any

@@ -305,6 +305,17 @@ def main():
         prompt_format=args.prompt_format,
         shuffle=args.shuffle, shuffle_seed=args.shuffle_seed,
     )
+    if not examples:
+        hint = (
+            f"no usable training examples from {args.dataset!r}. "
+            f"If this is an OpenAI-style JSONL with a `messages` column, set "
+            f"`messages_key: messages` in YAML (or pass --messages-key messages). "
+            f"Otherwise check instruction/context/response keys "
+            f"({args.instruction_key!r}/{args.context_key!r}/{args.response_key!r}), "
+            f"min_response_words={args.min_response_words}, and seq_len={args.seq_len}."
+        )
+        raise SystemExit(hint)
+
     # Held-out eval set, built identically on every rank. Prefer the dataset's own
     # eval split (real held-out data); otherwise carve the first val_frac off
     # train BEFORE sharding so those rows never leak into any training shard.
