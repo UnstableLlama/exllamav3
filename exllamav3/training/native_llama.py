@@ -362,16 +362,21 @@ class NativeLlamaQLoRA(nn.Module):
         self._head_slice = None
         if self.head_vocab_chunk > 0:
             self._head_slice = backbone.head_weight_slice_closure(self.lm_head)
-        # Gemma2-style final-logit softcapping forces compute_loss down the
-        # materialized supervised-position head path (the chunked-vocab CE can't
-        # apply the tanh cap), so --head-vocab-chunk is silently a no-op there. Warn
-        # once: on a big-vocab softcapped model (Gemma2 = 256k vocab + softcap) the
-        # [hidden, vocab] spike the chunk flag is meant to avoid is NOT avoided.
+        # Gemma-style final-logit softcapping forces compute_loss down the
+        # supervised-position head path (the frozen fused/vocab-chunked CE can't apply
+        # the tanh cap). That path chunks over supervised tokens via --ce-chunk, but
+        # each chunk still builds [ce_chunk, vocab] logits. Warn up front on
+        # big-vocab softcapped bases so the first-step OOM points at the right knob.
+        if self.final_softcap and self.lm_head.out_features >= 100_000:
+            print(" -- note: final-logit softcap is active on a large-vocab head; "
+                  "head loss uses supervised-token chunks, so peak logits scale as "
+                  "--ce-chunk × vocab. If the first step OOMs in the LM head, lower "
+                  "--ce-chunk (try 64 or 32). --head-vocab-chunk does not apply to "
+                  "softcapped logits.")
         if self.head_vocab_chunk > 0 and self.final_softcap:
             print(" -- note: --head-vocab-chunk is ignored on this model because it "
                   "uses final-logit softcapping; the chunked-vocab CE can't apply the "
-                  "tanh cap, so compute_loss uses the materialized supervised-position "
-                  "head loss. Watch head memory on a big-vocab softcapped base.")
+                  "tanh cap.")
 
         # Sanity: every requested target name actually matched something.
         matched = {w.key.split(".")[-1] for w in wrappers if w.r > 0}
@@ -1044,9 +1049,12 @@ class NativeLlamaQLoRA(nn.Module):
             hs = hidden[:, :-1, :].reshape(-1, d)                 # shift
             lbl = labels[:, 1:].reshape(-1).to(hs.device)
             valid = lbl != ignore_index
-            # train_head -> the trainable full head; otherwise the frozen head weight
-            # (a lora_head delta is added to its logits below).
-            w = self.head_weight if self.train_head else self.lm_head_weight_fn()()  # [d, V]
+            # train_head -> the trainable full head; otherwise the reconstructed frozen
+            # head weight (a lora_head delta is added to its logits below). The frozen
+            # EXL3 reconstruction is an inference tensor; the autograd matmul in the
+            # supervised-head path saves its inputs for backward, so clone it into a
+            # normal tensor first (same reason Liger RMSNorm needs cloned norm weights).
+            w = self.head_weight if self.train_head else self.lm_head_weight_fn()().clone()  # [d, V]
             if not bool(valid.any()):
                 # No supervised tokens: keep the graph alive with a 0 grad for every
                 # trainable surface touched here (full head and/or head-LoRA a/b).
