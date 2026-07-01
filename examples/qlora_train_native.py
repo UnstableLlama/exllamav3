@@ -84,7 +84,8 @@ class ThroughputMeter:
 # fields written blank, so adding a column later only needs an entry here.
 RUN_LOG_FIELDS = [
     "timestamp", "arm", "status", "model", "arch", "out",
-    "dataset", "eval_split", "eval_dataset", "eval2_dataset",
+    "dataset", "eval_split", "eval_dataset", "eval_max_samples",
+    "eval2_dataset", "eval2_max_samples", "eval2_max_blocks",
     "r", "alpha", "lr", "scheduler", "warmup_steps", "weight_decay",
     "batch", "grad_accum", "world_size", "eff_batch",
     "epochs", "steps_planned", "steps_done", "seq_len",
@@ -918,7 +919,7 @@ def main():
                          "for big-vocab models (e.g. Gemma 262k). Try 32768. Same "
                          "loss/grad as off; no extra dequant cost (vocab-outer loop).")
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
-    ap.add_argument("--sample-every", type=int, default=25,
+    ap.add_argument("--sample-every", type=int, default=0,
                     help="Generate a sample completion every N steps (0 to disable)")
     ap.add_argument("--sample-prompt", default="Tell me about your day.")
     ap.add_argument("--save-every", type=int, default=0,
@@ -957,6 +958,10 @@ def main():
                          "--val-frac.")
     ap.add_argument("--eval-dataset", default=None,
                     help="Dataset id/path for --eval-split (defaults to --dataset).")
+    ap.add_argument("--eval-max-samples", type=int, default=0,
+                    help="Cap source rows for the PRIMARY --eval-split dataset "
+                         "(0 = all). Ignored for --val-frac evals, where "
+                         "val_frac controls the eval size.")
     ap.add_argument("--eval2-dataset", default=None,
                     help="A SECOND held-out eval set, reported alongside the "
                          "primary one each --eval-every and at the end, so you can "
@@ -1135,7 +1140,7 @@ def main():
     val_examples = []
     if args.eval_split:
         val_examples = build_sft_examples(
-            model, tokenizer, args.eval_dataset or args.dataset, 0, args.seq_len,
+            model, tokenizer, args.eval_dataset or args.dataset, args.eval_max_samples, args.seq_len,
             instruction_key=args.instruction_key, context_key=args.context_key,
             response_key=args.response_key, split=args.eval_split,
             clean_text=clean_text,
@@ -1257,10 +1262,20 @@ def main():
 
     def batches():
         order = list(range(len(examples)))
+        rng = random.Random(0)
         while True:
-            random.Random(0).shuffle(order)
-            for i in range(0, len(order) - args.batch + 1, args.batch):
-                yield [examples[j] for j in order[i:i + args.batch]]
+            rng.shuffle(order)
+            i = 0
+            while i < len(order):
+                idxs = order[i:i + args.batch]
+                i += args.batch
+                # Keep micro-batches full even when the final slice is short, or
+                # when a smoke dataset is smaller than --batch. This avoids an
+                # infinite no-yield loop and stops tail examples being dropped.
+                while len(idxs) < args.batch:
+                    rng.shuffle(order)
+                    idxs.extend(order[:args.batch - len(idxs)])
+                yield [examples[j] for j in idxs]
 
     def adapter_b_norm():
         # Per-wrapper sums live on each wrapper's own device (they differ under a
@@ -1317,47 +1332,6 @@ def main():
     run_started = datetime.datetime.now().isoformat(timespec="seconds")
     meter = ThroughputMeter()
 
-    def peak_vram_gb():
-        if not torch.cuda.is_available():
-            return 0.0
-        return max((torch.cuda.max_memory_allocated(d) / 1e9 for d in active_devices),
-                   default=0.0)
-
-    def log_run(status, dt, final_val, final_eval2):
-        # One CSV row capturing the run's identity, hyperparameters and results.
-        # Called on normal finish and on Ctrl-C so interrupted runs are recorded.
-        rnd = lambda x, n=6: round(x, n) if isinstance(x, (int, float)) else ""
-        append_run_log(args.run_log, {
-            "timestamp": run_started, "arm": "exl3-native", "status": status,
-            "model": args.model, "arch": getattr(config, "architecture", ""),
-            "out": args.out, "dataset": args.dataset,
-            "eval_split": args.eval_split or "", "eval_dataset": args.eval_dataset or "",
-            "eval2_dataset": args.eval2_dataset or "",
-            "r": args.r, "alpha": args.alpha, "lr": args.lr,
-            "scheduler": args.scheduler, "warmup_steps": warmup_steps,
-            "weight_decay": args.weight_decay, "batch": args.batch,
-            "grad_accum": args.grad_accum, "world_size": 1,
-            "eff_batch": args.batch * args.grad_accum, "epochs": args.epochs,
-            "steps_planned": args.steps, "steps_done": step, "seq_len": args.seq_len,
-            "targets": " ".join(net.target_modules), "compute_dtype": args.compute_dtype,
-            "attn_impl": args.attn_impl, "parallel": args.parallel,
-            "shuffle": int(bool(args.shuffle)), "pack": int(bool(args.pack)),
-            "max_samples": args.max_samples,
-            "train_embeddings": int(bool(args.train_embeddings)),
-            "train_head": int(bool(args.train_head)), "prompt_format": args.prompt_format,
-            "trainable_params": net.num_trainable(), "n_train": len(examples),
-            "n_val": len(val_examples), "n_eval2": len(val2_examples),
-            "start_loss": rnd(start_loss), "end_loss": rnd(end_loss),
-            "best_val": rnd(best_val) if best_val != float("inf") else "",
-            "best_val_step": best_val_step or "",
-            "start_val": rnd(start_val), "start_eval2": rnd(start_eval2),
-            "final_val": rnd(final_val), "final_eval2": rnd(final_eval2),
-            "total_s": rnd(dt, 1), "s_per_step": rnd(dt / step, 4) if step else "",
-            "sup_tok_s": round(tok_seen / dt) if dt else "",
-            "tot_tok_s": round(tot_seen / dt) if dt else "",
-            "peak_vram_gb": rnd(peak_vram_gb(), 3), "notes": "",
-        })
-
     # Baseline eval at step 0 (the adapter is a no-op at init, B=0, so this is the
     # base model's held-out loss) -- a reference point for the trained numbers.
     if val_examples or val2_examples:
@@ -1392,7 +1366,10 @@ def main():
             "model": args.model, "arch": getattr(config, "architecture", ""),
             "out": args.out, "dataset": args.dataset,
             "eval_split": args.eval_split or "", "eval_dataset": args.eval_dataset or "",
+            "eval_max_samples": args.eval_max_samples,
             "eval2_dataset": args.eval2_dataset or "",
+            "eval2_max_samples": args.eval2_max_samples,
+            "eval2_max_blocks": args.eval2_max_blocks,
             "r": args.r, "alpha": args.alpha, "lr": args.lr,
             "scheduler": args.scheduler, "warmup_steps": warmup_steps,
             "weight_decay": args.weight_decay, "batch": args.batch,
@@ -1410,6 +1387,7 @@ def main():
             "start_loss": rnd(start_loss), "end_loss": rnd(end_loss),
             "best_val": rnd(best_val) if best_val != float("inf") else "",
             "best_val_step": best_val_step or "",
+            "start_val": rnd(start_val), "start_eval2": rnd(start_eval2),
             "final_val": rnd(final_val), "final_eval2": rnd(final_eval2),
             "total_s": rnd(dt, 1), "s_per_step": rnd(dt / step, 4) if step else "",
             "sup_tok_s": round(tok_seen / dt) if dt else "",

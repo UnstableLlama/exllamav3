@@ -66,7 +66,7 @@ pack: false
 inspect: 0                # single/split only
 
 # Trainable modules / memory levers
-targets: null             # e.g. [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+targets: null             # null = default projections; [] = no per-linear LoRA (embed/head only)
 train_embeddings: false
 train_head: false
 lora_embed: false         # single/split only
@@ -81,7 +81,7 @@ ce_chunk: 1024
 head_vocab_chunk: 0
 
 # Sampling / checkpoints / resume
-sample_every: 25          # single/split only
+sample_every: 0           # single/split only; 0 avoids live-sample KV-cache VRAM
 sample_prompt: Tell me about your day.
 save_every: 0
 checkpoint_every: 0
@@ -92,6 +92,7 @@ reset_optimizer: false
 # Evaluation / run log
 eval_split: null
 eval_dataset: null
+eval_max_samples: 0
 eval2_dataset: null
 eval2_split: test
 eval2_config: null

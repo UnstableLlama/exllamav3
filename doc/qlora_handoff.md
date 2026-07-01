@@ -1726,3 +1726,12 @@ Proven (don't re-verify):
 Assumed / unverified:
 - That RoPE is the specific 5.x forward bug (strong hypothesis, not yet pinned).
 - final-norm correctness on 5.x.
+
+---
+
+## QLoRA training pipeline follow-up checklist
+
+A concise, check-off-able list for the training pipeline review now lives in
+`doc/qlora_training_pipeline_todo.md`. Use that file for follow-up work on
+micro-batching, eval efficiency, trainable-head VRAM, DDP communication, and YAML
+logging defaults.
