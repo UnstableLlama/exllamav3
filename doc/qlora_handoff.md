@@ -1480,6 +1480,16 @@ size, which is the "idle cuda:1 will bite later" concern.
    or behind a `--balance-split` flag) and realize it as an auto-computed `use_per_device`
    so exllamav3 core's autosplit isn't forked — keep it behind the `backbone` seam. Gate
    with the existing `--check-backward` cross-device smoke plus a peak-VRAM-per-card print.
+3. **Liger grad-parity gate (land this first — it's the safety net for re-enabling
+   `--use-liger`).** The current gate only smoke-tests that backward runs and reaches
+   every device, so it structurally cannot catch a wrong-*value* gradient — which is
+   exactly how the `in_place=True` bug shipped. Add a real parity check to
+   `qlora_validate_native.py --use-liger`: build two `NativeLlamaQLoRA` with identical
+   seed/init on the same batch, one `use_liger=False` and one `use_liger=True`, run one
+   `loss.backward()` each, and assert the per-adapter `lora_b.grad` (and `lora_a.grad`
+   where nonzero) match within a relative tolerance — plus a loss-parity check. That
+   turns the in_place-class of bug into a hard FAIL instead of a healthy-looking loss.
+   Small, isolated, and independent of #1/#2; do it before trusting liger's VRAM number.
 
 ---
 
