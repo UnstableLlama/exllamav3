@@ -226,25 +226,33 @@ def turn_end_token(tokenizer):
 
 
 def format_prompt_and_eot(model, tokenizer, prompt_format):
-    """Return ``(build_prompt(user) -> str, eot_str)`` for the chosen chat format.
+    """Return ``(build_prompt(user, system=None) -> str, eot_str)`` for the
+    chosen chat format. ``system`` is optional and folded into the template's
+    system turn when given (falsy/None omits it entirely -- identical output
+    to before system support existed).
 
     - ``auto`` (default): the model's own template (``default_chat_prompt`` --
       Llama-3, Mistral ``[INST]``, mistral3 ``[SYSTEM_PROMPT]``/``[INST]``, etc.)
       and the architecture-correct turn-end token (:func:`turn_end_token`).
       Unchanged from prior behavior.
     - ``mistral``: the explicit Mistral V7+/V13 instruct format
-      ``<s>[INST]{user}[/INST]{response}</s>`` (no spaces; ``[INST]``/``[/INST]``
-      are control tokens). This is what ``auto`` already emits for the ``mistral3``
-      arch (Mistral Small/Medium 3.x, incl. Mistral-Medium-3.5-128B) -- the
-      explicit option just doesn't depend on arch detection. EOS ends the turn.
+      ``<s>[SYSTEM_PROMPT]{system}[/SYSTEM_PROMPT][INST]{user}[/INST]{response}</s>``
+      (no spaces; ``[INST]``/``[/INST]``/``[SYSTEM_PROMPT]`` are control tokens;
+      the system block is omitted when there's no system text). This is what
+      ``auto`` already emits for the ``mistral3`` arch (Mistral Small/Medium 3.x,
+      incl. Mistral-Medium-3.5-128B) -- the explicit option just doesn't depend
+      on arch detection. EOS ends the turn.
     - ``metharme``: the Pygmalion/Metharme format
-      ``<s><|user|>{user}<|model|>{response}</s>``. The ``<|user|>``/``<|model|>``
-      markers are plain text on a base model (not registered special tokens) --
-      the model learns them as a literal pattern, which is the standard way these
-      tunes are trained. EOS ends the turn.
+      ``<s><|system|>{system}<|user|>{user}<|model|>{response}</s>`` (the
+      ``<|system|>`` block omitted when there's no system text). The
+      ``<|system|>``/``<|user|>``/``<|model|>`` markers are plain text on a base
+      model (not registered special tokens) -- the model learns them as a
+      literal pattern, which is the standard way these tunes are trained. EOS
+      ends the turn.
     - ``gemma4-nothink``: the Gemma4 turn format with the thought channel
-      pre-closed empty (``<|turn>user\\n{user}<turn|>\\n<|turn>model\\n
-      <|channel>thought\\n<channel|>{response}``), so the model is trained to
+      pre-closed empty (``<|turn>system\\n{system}<turn|>\\n<|turn>user\\n{user}
+      <turn|>\\n<|turn>model\\n<|channel>thought\\n<channel|>{response}``, system
+      turn omitted when there's no system text), so the model is trained to
       answer directly instead of emitting a reasoning span. Matches the
       ``"gemma4"`` case in ``examples/common.py`` / ``PromptFormat_gemma4`` in
       ``examples/chat_templates.py`` used for inference. ``<turn|>`` (a
@@ -257,17 +265,27 @@ def format_prompt_and_eot(model, tokenizer, prompt_format):
     if prompt_format == "mistral":
         bos = tokenizer.bos_token or ""
         eos = tokenizer.eos_token or ""
-        return (lambda user: f"{bos}[INST]{user}[/INST]"), eos
+        def build(user, system=None):
+            sys_part = f"[SYSTEM_PROMPT]{system}[/SYSTEM_PROMPT]" if system else ""
+            return f"{bos}{sys_part}[INST]{user}[/INST]"
+        return build, eos
     if prompt_format == "metharme":
         bos = tokenizer.bos_token or ""
         eos = tokenizer.eos_token or ""
-        return (lambda user: f"{bos}<|user|>{user}<|model|>"), eos
+        def build(user, system=None):
+            sys_part = f"<|system|>{system}" if system else ""
+            return f"{bos}{sys_part}<|user|>{user}<|model|>"
+        return build, eos
     if prompt_format == "gemma4-nothink":
         bos = tokenizer.bos_token or ""
-        return (lambda user: f"{bos}<|turn>user\n{user}<turn|>\n<|turn>model\n"
-                              f"<|channel>thought\n<channel|>"), "<turn|>"
+        def build(user, system=None):
+            sys_part = f"<|turn>system\n{system}<turn|>\n" if system else ""
+            return (f"{bos}{sys_part}<|turn>user\n{user}<turn|>\n<|turn>model\n"
+                     f"<|channel>thought\n<channel|>")
+        return build, "<turn|>"
     if prompt_format == "auto":
-        return (lambda user: model.default_chat_prompt(user)), turn_end_token(tokenizer)
+        return ((lambda user, system=None: model.default_chat_prompt(user, system_prompt=system)),
+                turn_end_token(tokenizer))
     raise ValueError(f"unknown prompt-format '{prompt_format}' "
                       f"(expected auto/mistral/metharme/gemma4-nothink)")
 
@@ -287,26 +305,32 @@ def clean_style_text(s):
 
 
 def extract_single_turn(messages):
-    """Pull (user_text, assistant_text) from an OpenAI-style ``messages`` list.
+    """Pull (system_text, user_text, assistant_text) from an OpenAI-style
+    ``messages`` list.
 
     For single-turn rows (e.g. UnstableLlama/semancy: one user, one assistant,
     no system message) this is exact. We take the last user turn that precedes
     the first assistant turn as the prompt and that assistant turn as the
-    target, so the completion-only mask still supervises only the answer. System
-    messages are ignored (the dataset embeds its reasoning style in the answer
-    text rather than a system prompt). Returns ("", "") if either turn is
-    missing so the caller can skip the row.
+    target, so the completion-only mask still supervises only the answer. The
+    first system message (if any) is returned separately so the caller can
+    fold it into the chat template via ``build_prompt(user, system=...)``;
+    rows with no system message get ``""`` and behave exactly as before.
+    ``user_text``/``asst_text`` come back ``""`` if either turn is missing so
+    the caller can skip the row.
     """
-    user_text, asst_text = "", ""
+    sys_text, user_text, asst_text = "", "", ""
     for m in messages or []:
         role = (m.get("role") or "").lower()
         content = (m.get("content") or "").strip()
-        if role == "user":
+        if role == "system":
+            if not sys_text:
+                sys_text = content    # keep the first system turn only
+        elif role == "user":
             user_text = content       # remember the most recent user turn
         elif role == "assistant":
             asst_text = content
             break                     # first assistant reply is the target
-    return user_text, asst_text
+    return sys_text, user_text, asst_text
 
 
 def build_optimizer(param_groups, lr, optim="adamw"):
@@ -463,7 +487,9 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
       * OpenAI ``messages`` -- pass ``messages_key`` (e.g. "messages") for
         single-turn user/assistant rows (UnstableLlama/semancy); the user turn
         becomes the prompt and the assistant turn the supervised response. When
-        set it takes precedence over the flat-column keys.
+        set it takes precedence over the flat-column keys. A leading ``system``
+        message, if present, is folded into the chat template's system turn
+        (see :func:`extract_single_turn`); rows without one are unaffected.
 
     clean_text strips stage directions / inline actions and normalizes
     whitespace (helps play-script style sets like the Shakespeare default, whose
@@ -507,9 +533,10 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
     examples = []
     for ex in ds:
         if messages_key:
-            instr, resp = extract_single_turn(ex.get(messages_key))
+            sys_text, instr, resp = extract_single_turn(ex.get(messages_key))
             ctx = ""
         else:
+            sys_text = ""
             instr = (ex.get(instruction_key) or "").strip()
             ctx = (ex.get(context_key) or "").strip()
             resp = (ex.get(response_key) or "").strip()
@@ -533,7 +560,7 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
         # Tokenize the prompt and the response SEPARATELY and concatenate, so the
         # prompt/response boundary is exact -- masking by the prompt-string length
         # is vulnerable to tokenizer boundary merges that mis-align the mask.
-        prompt_text = build_prompt(user)
+        prompt_text = build_prompt(user, system=sys_text or None)
         prompt_ids = tokenizer.encode(
             prompt_text, add_bos=False, encode_special_tokens=True
         )[0].tolist()
