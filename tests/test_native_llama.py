@@ -529,6 +529,37 @@ def test_supervised_head_ce_chunking_matches_naive():
     print("[head-ce] supervised chunked CE matches naive logits PASSED")
 
 
+def test_supervised_head_ce_accepts_inference_weight():
+    # Frozen EXL3 head reconstruction can return an inference tensor. The
+    # supervised-head autograd path must not save/clone the whole head; it should
+    # recompute through the frozen-head custom Function and still produce the same
+    # hidden gradient as a normal cloned-weight reference.
+    torch.manual_seed(8)
+    n, d, v = 17, 7, 19
+    with torch.inference_mode():
+        frozen_weight = torch.randn(d, v, dtype=torch.float32)
+    labels = torch.randint(0, v, (n,))
+    labels[::5] = -100
+    valid = labels != -100
+
+    h_ref = torch.randn(n, d, dtype=torch.float32, requires_grad=True)
+    logits = h_ref[valid] @ frozen_weight.clone()
+    loss_ref = F.cross_entropy(logits, labels[valid])
+    loss_ref.backward()
+
+    h = h_ref.detach().clone().requires_grad_(True)
+    net = NativeLlamaQLoRA.__new__(NativeLlamaQLoRA)
+    net.lora_head = False
+    net.final_softcap = 0.0
+    loss = net._supervised_head_cross_entropy(
+        h, labels, valid, None, token_chunk=4, weight_fn=lambda: frozen_weight)
+    loss.backward()
+
+    assert torch.allclose(loss, loss_ref, atol=1e-6), "inference-weight CE loss mismatch"
+    assert torch.allclose(h.grad, h_ref.grad, atol=1e-6), "inference-weight hidden grad mismatch"
+    print("[head-ce] frozen inference-tensor head path PASSED")
+
+
 def main():
     test_difflinear_matches_reference_and_gradchecks()
     test_block_matches_reference()
@@ -538,6 +569,7 @@ def main():
     test_packing_pad_no_nan()
     test_modules_to_save_param_groups()
     test_supervised_head_ce_chunking_matches_naive()
+    test_supervised_head_ce_accepts_inference_weight()
     print("\nAll native-Llama differentiable-forward checks passed.")
 
 

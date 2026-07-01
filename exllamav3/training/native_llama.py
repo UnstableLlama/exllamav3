@@ -126,6 +126,29 @@ def _rotate_half_neox(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
+class _FrozenHeadLinear(torch.autograd.Function):
+    """Autograd linear for a frozen reconstructed LM head.
+
+    EXL3 weight reconstruction can produce inference tensors. Plain torch matmul
+    would try to save that weight for backward and fail; cloning the full head fixes
+    autograd but doubles the output-card head memory. Instead, save only the Python
+    closure and reconstruct the frozen head again in backward to compute grad_hidden.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden: torch.Tensor, weight_fn):
+        ctx.weight_fn = weight_fn
+        ctx.hidden_dtype = hidden.dtype
+        weight = weight_fn()
+        return (hidden.to(weight.dtype) @ weight).float()
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        weight = ctx.weight_fn()
+        grad_hidden = (grad_out.to(weight.dtype) @ weight.t()).to(ctx.hidden_dtype)
+        return grad_hidden, None
+
+
 class DiffLinear(nn.Module):
     """
     Differentiable linear over a frozen native ``Linear`` module.
@@ -963,8 +986,9 @@ class NativeLlamaQLoRA(nn.Module):
         hidden_flat: torch.Tensor,
         labels_flat: torch.Tensor,
         valid: torch.Tensor,
-        weight: torch.Tensor,
+        weight: Optional[torch.Tensor],
         token_chunk: int,
+        weight_fn: Optional[Callable[[], torch.Tensor]] = None,
     ) -> torch.Tensor:
         """CE over supervised positions without materializing all logits at once.
 
@@ -980,17 +1004,25 @@ class NativeLlamaQLoRA(nn.Module):
         if n_valid == 0:
             # Kept for defensive direct calls; compute_loss handles this earlier
             # so all trainable surfaces get a graph-preserving zero.
-            return hidden_flat.sum() * 0.0 + weight.sum() * 0.0
+            z = hidden_flat.sum() * 0.0
+            return z if weight is None else z + weight.sum() * 0.0
 
         token_chunk = max(1, int(token_chunk))
         total = None
         for start in range(0, n_valid, token_chunk):
             idx = valid_idx[start:start + token_chunk]
-            hs = backbone.to_device(hidden_flat.index_select(0, idx), weight.device).to(weight.dtype)
-            # Upcast logits to fp32 for the softmax/CE regardless of head dtype --
-            # a no-op for an fp32 head, essential for a bf16 one (the SR offload path),
-            # where a bf16 softmax over a large vocab is unstable.
-            logits = (hs @ weight).float()
+            if weight is None:
+                # Frozen head: avoid saving/cloning the EXL3 inference tensor by using
+                # a custom Function that reconstructs the head again in backward.
+                w0 = weight_fn()
+                hs = backbone.to_device(hidden_flat.index_select(0, idx), w0.device).to(w0.dtype)
+                logits = _FrozenHeadLinear.apply(hs, weight_fn)
+            else:
+                hs = backbone.to_device(hidden_flat.index_select(0, idx), weight.device).to(weight.dtype)
+                # Upcast logits to fp32 for the softmax/CE regardless of head dtype --
+                # a no-op for an fp32 head, essential for a bf16 one (the SR offload path),
+                # where a bf16 softmax over a large vocab is unstable.
+                logits = (hs @ weight).float()
             if self.lora_head:
                 # Low-rank head shift: logits += scale * (hs @ A) @ B, in fp32.
                 lora_hs = hs.to(dtype=self.head_lora_a.dtype)
@@ -1049,12 +1081,11 @@ class NativeLlamaQLoRA(nn.Module):
             hs = hidden[:, :-1, :].reshape(-1, d)                 # shift
             lbl = labels[:, 1:].reshape(-1).to(hs.device)
             valid = lbl != ignore_index
-            # train_head -> the trainable full head; otherwise the reconstructed frozen
-            # head weight (a lora_head delta is added to its logits below). The frozen
-            # EXL3 reconstruction is an inference tensor; the autograd matmul in the
-            # supervised-head path saves its inputs for backward, so clone it into a
-            # normal tensor first (same reason Liger RMSNorm needs cloned norm weights).
-            w = self.head_weight if self.train_head else self.lm_head_weight_fn()().clone()  # [d, V]
+            # train_head -> the trainable full head; otherwise use a frozen-head
+            # closure. Reconstructed EXL3 weights can be inference tensors, so the
+            # frozen path below uses _FrozenHeadLinear instead of cloning the full head.
+            w = self.head_weight if self.train_head else None  # [d, V] for train_head
+            w_fn = None if self.train_head else self.lm_head_weight_fn()
             if not bool(valid.any()):
                 # No supervised tokens: keep the graph alive with a 0 grad for every
                 # trainable surface touched here (full head and/or head-LoRA a/b).
@@ -1064,7 +1095,7 @@ class NativeLlamaQLoRA(nn.Module):
                 if self.lora_head:
                     z = z + self.head_lora_a.sum() * 0.0 + self.head_lora_b.sum() * 0.0
                 return z
-            return self._supervised_head_cross_entropy(hs, lbl, valid, w, chunk)
+            return self._supervised_head_cross_entropy(hs, lbl, valid, w, chunk, weight_fn=w_fn)
         # The fused head matmuls hidden against the frozen head weight, which
         # lives on the head's device; co-locate them (no-op single-device).
         hidden = backbone.to_device(hidden, self._head_device)
