@@ -1019,14 +1019,15 @@ class NativeLlamaQLoRA(nn.Module):
                     z = z + self.head_lora_a.sum() * 0.0 + self.head_lora_b.sum() * 0.0
                 return z
             hs = backbone.to_device(hs[valid], w.device).to(w.dtype)
-            # Upcast logits to fp32 for the softmax/CE regardless of the head dtype --
-            # a no-op for an fp32 head, essential for a bf16 one (the SR offload path),
-            # where a bf16 softmax over a large vocab is unstable.
-            logits = (hs @ w).float()
+            # Keep logits in the head's dtype: an extra fp32 copy of [supervised
+            # tokens, vocab] doubles the single biggest allocation on the head device
+            # (~6.7 GB on a 262k-vocab base) and OOMs. The matmul already accumulates
+            # in fp32 internally; F.cross_entropy is stable on the resulting logits.
+            logits = hs @ w
             if self.lora_head:
-                # Low-rank head shift: logits += scale * (hs @ A) @ B, in fp32.
+                # Low-rank head shift: logits += scale * (hs @ A) @ B.
                 logits = logits + self._module_lora_scale * (
-                    (hs.float() @ self.head_lora_a) @ self.head_lora_b)
+                    (hs @ self.head_lora_a) @ self.head_lora_b)
             if self.final_softcap:
                 logits = self.final_softcap * torch.tanh(logits / self.final_softcap)
             return F.cross_entropy(logits, lbl[valid].to(w.device))
