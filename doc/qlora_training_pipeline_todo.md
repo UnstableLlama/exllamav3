@@ -22,17 +22,15 @@ can land and validate them independently.
     run-log schema and payloads.
 - [x] **Clean the DDP checklist footer.**
   - The duplicated note at the bottom of `qlora_train_native_ddp.py` is gone.
+- [x] **Chunk the trainable-head / LoRA-head CE path.**
+  - The materialized supervised-position loss path now computes logits in token
+    chunks, preserving mean CE semantics while bounding peak logit memory to
+    `token_chunk × vocab`.
+  - Added a CPU numerical check against the naive full-logit path, including
+    gradients for hidden states, head weights, and head-LoRA parameters.
 
 ## High-priority follow-up work
 
-- [ ] **Chunk the trainable-head / LoRA-head CE path.**
-  - Today, when `--train-head`, `--lora-head`, or final-logit softcap is active,
-    the loss path materializes logits for all supervised positions at once. For
-    large vocabularies or long completions this can still spike VRAM. Implement a
-    chunked supervised-position CE that accumulates `reduction="sum"` across chunks
-    and divides by the total supervised token count.
-  - Validate numerics against the current unchunked path on a small model before
-    using it as the default.
 - [ ] **Make DDP eval rank-0-only plus broadcast.**
   - DDP currently evaluates the full held-out set on every rank. Rank 0 can compute
     the scalar losses and broadcast them so all ranks branch identically for
@@ -59,7 +57,5 @@ can land and validate them independently.
 
 ## Notes
 
-- The trainable-head chunking item is the one most likely to need careful numerical
-  review. It is a good candidate for a focused PR with a small CPU/GPU parity test.
 - DDP eval and DDP all-reduce improvements should be separate PRs so performance
   changes are easy to reason about and benchmark.

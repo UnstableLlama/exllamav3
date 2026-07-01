@@ -6,6 +6,13 @@
 #   parallel: split   # one process, native layer-autosplit across visible GPUs
 #   parallel: ddp     # launcher execs torchrun + examples/qlora_train_native_ddp.py
 #
+# Split-parallel quick recipe:
+#   CUDA_VISIBLE_DEVICES=0,1 python examples/qlora_train.py --config this.yaml
+#   parallel: split
+#   device: cuda:0              # ignored in split mode
+#   use_per_device: [9, 24]     # optional GB caps; one entry per visible GPU
+#   reserve_per_device: null    # or e.g. [1, 8] to leave free VRAM per GPU
+#
 # Keys mirror the CLI flags in examples/qlora_train_native.py. Use snake_case here;
 # the launcher converts to --kebab-case. DDP-only launch settings live under ddp:.
 
@@ -15,6 +22,9 @@ out: out/exl3_qlora_adapter
 
 # Execution mode
 parallel: single
+# Single-GPU target for parallel: single. For parallel: split, exllamav3 uses
+# all visible CUDA devices and you tune placement with reserve/use_per_device;
+# for parallel: ddp, torchrun assigns one cuda:LOCAL_RANK per process.
 device: cuda:0
 reserve_per_device: null   # split only, e.g. [1, 8] or [-1, 20]
 use_per_device: null       # split only, e.g. [1, 8] to force a boundary
@@ -47,6 +57,10 @@ grad_accum: 1
 max_grad_norm: 1.0
 
 # Data
+# For a local JSONL with OpenAI-style rows like
+# {"messages": [{"role": "system", ...}, {"role": "user", ...}, {"role": "assistant", ...}]}
+# set dataset to the .jsonl path and messages_key to messages. The loader ignores
+# system turns, uses the user turn as the prompt, and supervises the assistant turn.
 dataset: superdrew100/UwU_Alpaca_data
 dataset_split: train
 instruction_key: instruction
@@ -77,7 +91,13 @@ use_liger: false                 # single/split only
 compute_dtype: bfloat16
 no_grad_ckpt: false
 attn_impl: auto           # auto, eager, flash
+# Token chunk used by all CE loss paths. For --train_head / --lora_head /
+# final-logit-softcap models this bounds supervised-logit memory to
+# ce_chunk × vocab. For the frozen-head fused CE path it is the token tile size.
 ce_chunk: 1024
+# Optional vocab-column chunking for the frozen-head fused CE path only. This is
+# separate from ce_chunk and is still useful for huge vocabularies (try 32768),
+# but it is bypassed when --train_head, --lora_head, or final softcap is active.
 head_vocab_chunk: 0
 
 # Sampling / checkpoints / resume
