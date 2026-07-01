@@ -230,15 +230,19 @@ def main():
                     help="Path to a converted EXL3 model dir (enables tier 3)")
     args = ap.parse_args()
 
-    test_gradcheck_cpu_f64()
-    test_gradcheck_no_bias()
-    test_matches_reference()
-    test_module_b_zero_init_is_noop()
-
+    from util import run_timed
+    from functools import partial
+    tests = [
+        test_gradcheck_cpu_f64,
+        test_gradcheck_no_bias,
+        test_matches_reference,
+        test_module_b_zero_init_is_noop,
+    ]
     if args.model:
-        test_real_exl3_layer(args.model)
+        tests.append(partial(test_real_exl3_layer, args.model))
     else:
         print("[tier 3] skipped (pass --model or set EXL3_TEST_MODEL to run on GPU)")
+    run_timed(tests, label="qlora-grad")
 
     print("\nAll runnable QLoRA gradient PoC checks passed.")
 

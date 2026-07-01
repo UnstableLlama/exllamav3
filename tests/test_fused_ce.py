@@ -219,14 +219,17 @@ def test_vocab_chunked_gradcheck():
 
 
 def main():
-    test_loss_and_grad_parity()
-    test_ignore_index()
-    test_chunk_invariance()
-    test_gradcheck()
-    test_convenience_shift()
-    test_vocab_chunked_parity()
-    test_vocab_chunked_matches_single_shot()
-    test_vocab_chunked_gradcheck()
+    from util import run_timed
+    run_timed([
+        test_loss_and_grad_parity,
+        test_ignore_index,
+        test_chunk_invariance,
+        test_gradcheck,
+        test_convenience_shift,
+        test_vocab_chunked_parity,
+        test_vocab_chunked_matches_single_shot,
+        test_vocab_chunked_gradcheck,
+    ], label="fused-CE")
     print("\nAll fused cross-entropy checks passed.")
 
 

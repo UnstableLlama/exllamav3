@@ -484,13 +484,16 @@ def test_modules_to_save_param_groups():
 
 
 def main():
-    test_difflinear_matches_reference_and_gradchecks()
-    test_block_matches_reference()
-    test_gemma_block_matches_reference()
-    test_block_backward_reaches_adapters_only()
-    test_packing_block_isolation()
-    test_packing_pad_no_nan()
-    test_modules_to_save_param_groups()
+    from util import run_timed
+    run_timed([
+        test_difflinear_matches_reference_and_gradchecks,
+        test_block_matches_reference,
+        test_gemma_block_matches_reference,
+        test_block_backward_reaches_adapters_only,
+        test_packing_block_isolation,
+        test_packing_pad_no_nan,
+        test_modules_to_save_param_groups,
+    ], label="native-llama")
     print("\nAll native-Llama differentiable-forward checks passed.")
 
 
