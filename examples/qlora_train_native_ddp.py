@@ -271,6 +271,12 @@ def _run_main():
                     help="Measure frozen-weight (trellis) reconstruction time for "
                          "the first N steps (every rank profiles, rank 0 reports), "
                          "then disable. Adds sync overhead while active.")
+    ap.add_argument("--ga-loss", choices=["token", "mean"], default="token",
+                    help="Loss weighting across micro-batches AND ranks. token "
+                         "(default): weight each micro-batch by its supervised-"
+                         "token share of the whole step (one small all-reduce of "
+                         "the counts per step), so the step gradient equals one "
+                         "big batch. mean: the pre-Session-11 mean-of-means.")
     args = ap.parse_args()
 
     # Cleaning is opt-in (--clean-text); --no-clean-text is now a no-op kept for
@@ -300,6 +306,8 @@ def _run_main():
             "seq_len": args.seq_len, "compute_dtype": args.compute_dtype,
             "attn_impl": args.attn_impl, "parallel": "ddp",
             "shuffle": int(bool(args.shuffle)), "pack": int(bool(args.pack)),
+            "pack_algo": args.pack_algo if args.pack else "",
+            "ga_loss": args.ga_loss,
             "max_samples": args.max_samples,
             "train_embeddings": int(bool(args.train_embeddings)),
             "train_head": int(bool(args.train_head)),
@@ -568,6 +576,8 @@ def _run_main():
             "targets": " ".join(net.target_modules), "compute_dtype": args.compute_dtype,
             "attn_impl": args.attn_impl, "parallel": "ddp",
             "shuffle": int(bool(args.shuffle)), "pack": int(bool(args.pack)),
+            "pack_algo": args.pack_algo if args.pack else "",
+            "ga_loss": args.ga_loss,
             "max_samples": args.max_samples,
             "train_embeddings": int(bool(args.train_embeddings)),
             "train_head": int(bool(args.train_head)), "prompt_format": args.prompt_format,
@@ -612,10 +622,20 @@ def _run_main():
             accum_loss = 0.0
             step_sup = step_tot = 0
             timer.begin_step()
-            for _ in range(args.grad_accum):
-                batch = next(bgen)
-                input_ids, labels, attn, pos_ids, seg_ids = collate(batch, pad_id)
-                timer.mark("data")
+            # --ga-loss token (see the single-GPU arm for the rationale): weight
+            # each micro-batch by its supervised-token share of the WHOLE step --
+            # across micro-batches AND ranks, so one all-reduce of the counts.
+            # allreduce_grads() divides the summed grads by world_size, so each
+            # rank scales by world_size/total to land at loss_sum/total overall.
+            # Counts use the SHIFTED labels to match the CE denominator.
+            window = [collate(next(bgen), pad_id) for _ in range(args.grad_accum)]
+            n_sups = [int((w[1][:, 1:] != -100).sum()) for w in window]
+            if args.ga_loss == "token":
+                tot = torch.tensor(float(sum(n_sups)), device=device)
+                dist.all_reduce(tot, op=dist.ReduceOp.SUM)
+                total_sup = max(tot.item(), 1.0)
+            timer.mark("data")
+            for (input_ids, labels, attn, pos_ids, seg_ids), n_sup in zip(window, n_sups):
                 loss = net.compute_loss(input_ids, labels, attention_mask=attn,
                                         chunk=args.ce_chunk,
                                         position_ids=pos_ids, seg_ids=seg_ids)
@@ -623,9 +643,16 @@ def _run_main():
                 # sections split cleanly at the sync.
                 loss_val = loss.item()
                 timer.mark("fwd")
-                (loss / args.grad_accum).backward()
+                w_i = (n_sup * world_size / total_sup) if args.ga_loss == "token" \
+                    else (1.0 / args.grad_accum)
+                (loss * w_i).backward()
                 timer.mark("bwd")
-                accum_loss += loss_val / args.grad_accum
+                # The log line below SUMs accum_loss across ranks then divides
+                # by world_size; since the token weights w_i sum to world_size
+                # across the whole step, that reduction yields exactly the
+                # per-token mean over the step (and the old mean-of-means for
+                # --ga-loss mean).
+                accum_loss += loss_val * w_i
                 step_sup += int((labels != -100).sum())
                 step_tot += int(attn.sum())
 

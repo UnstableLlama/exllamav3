@@ -73,7 +73,7 @@ RUN_LOG_FIELDS = [
     "r", "alpha", "lr", "scheduler", "warmup_steps", "weight_decay",
     "batch", "grad_accum", "world_size", "eff_batch",
     "epochs", "steps_planned", "steps_done", "seq_len",
-    "targets", "compute_dtype", "attn_impl", "parallel", "shuffle", "pack",
+    "targets", "compute_dtype", "attn_impl", "parallel", "shuffle", "pack", "pack_algo", "ga_loss",
     "max_samples", "train_embeddings", "train_head", "prompt_format",
     "trainable_params", "n_train", "n_val", "n_eval2",
     "start_loss", "end_loss", "best_val", "best_val_step",
@@ -503,6 +503,11 @@ def _run_main():
                     help="Append one metadata row per run to this CSV (rank 0). "
                          "Same schema as the EXL3 arm, so both append to the same "
                          "mega-CSV for matched comparison. Empty string disables.")
+    ap.add_argument("--ga-loss", choices=["token", "mean"], default="token",
+                    help="Gradient-accumulation loss weighting (matches the EXL3 "
+                         "arm): token weights each micro-batch by its supervised-"
+                         "token share of the step (across ranks under DDP); mean "
+                         "is the old mean-of-means.")
     args = ap.parse_args()
 
     from transformers import (AutoModelForCausalLM, AutoTokenizer,
@@ -546,6 +551,7 @@ def _run_main():
             "seq_len": args.seq_len, "compute_dtype": "bfloat16",
             "attn_impl": "hf-sdpa", "parallel": "ddp" if ddp else "single",
             "shuffle": int(bool(args.shuffle)), "pack": 0,
+            "pack_algo": "", "ga_loss": args.ga_loss,
             "max_samples": args.max_samples, "train_embeddings": 0,
             "train_head": 0, "prompt_format": "llama3",
         }
@@ -701,18 +707,36 @@ def _run_main():
         accum = 0.0
         step_sup = step_tot = 0
         timer.begin_step()
-        for _ in range(args.grad_accum):
-            batch = next(bgen)
-            ii, ll, aa = collate(batch, pad_id)
-            timer.mark("data")
+        # --ga-loss token: weight each micro-batch by its supervised-token share
+        # of the whole step (mirrors the EXL3 arm; HF's shifted-CE mean uses the
+        # shifted label count as its denominator, hence ll[:, 1:]).
+        window = [collate(next(bgen), pad_id) for _ in range(args.grad_accum)]
+        n_sups = [int((w[1][:, 1:] != -100).sum()) for w in window]
+        local_total = max(float(sum(n_sups)), 1.0)
+        if args.ga_loss == "token":
+            if ddp:
+                tot = torch.tensor(float(sum(n_sups)), device=device)
+                dist.all_reduce(tot, op=dist.ReduceOp.SUM)
+                total_sup = max(tot.item(), 1.0)
+            else:
+                total_sup = local_total
+        timer.mark("data")
+        for (ii, ll, aa), n_sup in zip(window, n_sups):
             out = model(input_ids=ii.to(device), attention_mask=aa.to(device),
                         labels=ll.to(device))
             # .item() before backward so the fwd/bwd sections split at the sync.
             loss_val = out.loss.item()
             timer.mark("fwd")
-            (out.loss / args.grad_accum).backward()
+            # Gradient weight is GLOBAL (grads are summed then /world_size under
+            # DDP; the weights sum to world_size across the step, landing at the
+            # true per-token mean). The printed loss stays rank-local, so its
+            # weight normalizes by this rank's own token count.
+            w_i = (n_sup * world_size / total_sup) if args.ga_loss == "token" \
+                else (1.0 / args.grad_accum)
+            (out.loss * w_i).backward()
             timer.mark("bwd")
-            accum += loss_val / args.grad_accum
+            accum += loss_val * ((n_sup / local_total) if args.ga_loss == "token"
+                                 else 1.0 / args.grad_accum)
             step_sup += int((ll != -100).sum())
             step_tot += int(aa.sum())
         if ddp:
@@ -814,6 +838,7 @@ def _run_main():
             "targets": " ".join(TARGET_MODULES), "compute_dtype": "bfloat16",
             "attn_impl": "hf-sdpa", "parallel": "ddp" if ddp else "single",
             "shuffle": int(bool(args.shuffle)), "pack": 0,
+            "pack_algo": "", "ga_loss": args.ga_loss,
             "max_samples": args.max_samples,
             "train_embeddings": 0, "train_head": 0, "prompt_format": "llama3",
             "trainable_params": sum(p.numel() for p in params),

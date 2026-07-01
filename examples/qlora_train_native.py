@@ -163,7 +163,7 @@ RUN_LOG_FIELDS = [
     "r", "alpha", "lr", "scheduler", "warmup_steps", "weight_decay",
     "batch", "grad_accum", "world_size", "eff_batch",
     "epochs", "steps_planned", "steps_done", "seq_len",
-    "targets", "compute_dtype", "attn_impl", "parallel", "shuffle", "pack",
+    "targets", "compute_dtype", "attn_impl", "parallel", "shuffle", "pack", "pack_algo", "ga_loss",
     "max_samples", "train_embeddings", "train_head", "prompt_format",
     "trainable_params", "n_train", "n_val", "n_eval2",
     "start_loss", "end_loss", "best_val", "best_val_step",
@@ -1235,6 +1235,13 @@ def _run_main():
                          "wall time, then disable. Adds a device sync around every "
                          "reconstruction while active, so expect those N steps to "
                          "run slower; the reported %% is still representative.")
+    ap.add_argument("--ga-loss", choices=["token", "mean"], default="token",
+                    help="Gradient-accumulation loss weighting. token (default): "
+                         "weight each micro-batch by its supervised-token share, "
+                         "so the step gradient equals one big batch (the Oct-2024 "
+                         "HF/Unsloth GA fix). mean: the pre-Session-11 mean-of-"
+                         "means (over-weights tokens in short micro-batches), "
+                         "kept for reproducing old runs. No-op at --grad-accum 1.")
     args = ap.parse_args()
 
     # Seed the failure logger with everything knowable before work starts, so a
@@ -1256,7 +1263,9 @@ def _run_main():
         "steps_planned": args.steps, "seq_len": args.seq_len,
         "compute_dtype": args.compute_dtype, "attn_impl": args.attn_impl,
         "parallel": args.parallel, "shuffle": int(bool(args.shuffle)),
-        "pack": int(bool(args.pack)), "max_samples": args.max_samples,
+        "pack": int(bool(args.pack)),
+        "pack_algo": args.pack_algo if args.pack else "",
+        "ga_loss": args.ga_loss, "max_samples": args.max_samples,
         "train_embeddings": int(bool(args.train_embeddings)),
         "train_head": int(bool(args.train_head)),
         "prompt_format": args.prompt_format,
@@ -1636,6 +1645,8 @@ def _run_main():
             "targets": " ".join(net.target_modules), "compute_dtype": args.compute_dtype,
             "attn_impl": args.attn_impl, "parallel": args.parallel,
             "shuffle": int(bool(args.shuffle)), "pack": int(bool(args.pack)),
+            "pack_algo": args.pack_algo if args.pack else "",
+            "ga_loss": args.ga_loss,
             "max_samples": args.max_samples,
             "train_embeddings": int(bool(args.train_embeddings)),
             "train_head": int(bool(args.train_head)), "prompt_format": args.prompt_format,
@@ -1678,10 +1689,20 @@ def _run_main():
             accum_loss = 0.0
             step_sup = step_tot = 0
             timer.begin_step()
-            for _ in range(args.grad_accum):
-                batch = next(bgen)
-                input_ids, labels, attn, pos_ids, seg_ids = collate(batch, pad_id)
-                timer.mark("data")
+            # Draw the WHOLE accumulation window first so each micro-batch can be
+            # weighted by its share of the window's supervised tokens (--ga-loss
+            # token, the Oct-2024 HF/Unsloth grad-accumulation fix): compute_loss
+            # returns a mean over each micro-batch's own supervised tokens, so
+            # averaging those means (the old behavior, kept as --ga-loss mean)
+            # over-weights tokens in short micro-batches. Weighting each loss by
+            # n_sup/total_sup makes the step gradient identical to one big batch.
+            # Counts use the SHIFTED labels ([:, 1:]) to match the CE denominator.
+            # A no-op when grad_accum == 1 (weight = 1).
+            window = [collate(next(bgen), pad_id) for _ in range(args.grad_accum)]
+            n_sups = [int((w[1][:, 1:] != -100).sum()) for w in window]
+            total_sup = max(sum(n_sups), 1)
+            timer.mark("data")
+            for (input_ids, labels, attn, pos_ids, seg_ids), n_sup in zip(window, n_sups):
                 loss = net.compute_loss(input_ids, labels, attention_mask=attn,
                                         chunk=args.ce_chunk,
                                         position_ids=pos_ids, seg_ids=seg_ids)
@@ -1689,9 +1710,13 @@ def _run_main():
                 # sections split cleanly at the sync.
                 loss_val = loss.item()
                 timer.mark("fwd")
-                (loss / args.grad_accum).backward()
+                w_i = (n_sup / total_sup) if args.ga_loss == "token" \
+                    else (1.0 / args.grad_accum)
+                (loss * w_i).backward()
                 timer.mark("bwd")
-                accum_loss += loss_val / args.grad_accum
+                # accum_loss uses the same weights, so under "token" it is the
+                # true per-token mean over the whole accumulation window.
+                accum_loss += loss_val * w_i
                 step_sup += int((labels != -100).sum())   # supervised tokens
                 step_tot += int(attn.sum())                # total (non-pad) tokens
 
