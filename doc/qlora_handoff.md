@@ -1493,6 +1493,100 @@ size, which is the "idle cuda:1 will bite later" concern.
 
 ---
 
+### Session 11 — optimization audit; instrumentation + first efficiency batch
+
+> Branch `claude/qlora-familiarization-gjd9so`. A research pass over the whole
+> pipeline for wasted compute/VRAM plus a survey of modern-framework techniques
+> (Axolotl / Unsloth / Liger / CCE / Chronicals) — the full audit with sources
+> lives in **`doc/qlora_optimization_audit.md`**. Headline findings: trellis
+> dequant runs 3× per linear per step (the structural tok/s ceiling);
+> checkpointing is unconditional even with VRAM headroom; the fused CE holds a
+> full fp32 copy of the head weight (~4 GB on Gemma) and re-casts it per token
+> chunk; packing is next-fit (~82.5% fill vs ~98% for FFD); the grad-accum loss
+> is mean-of-means (the mild form of the Oct-2024 GA bug); RoPE cos/sin are
+> rebuilt ~192× per step on a 48-layer model.
+
+**PLAN for this session (batch 1 — box-free verifiable):**
+0. Instrumentation: per-step wall-clock breakdown (data/forward/backward/optim
+   via CUDA events), `--profile-dequant`, and run-log v2 — every run INCLUDING
+   CRASHES auto-appends a CSV row (status=failed + error summary; full
+   traceback to a sidecar `<run_log>.errors.log`), turning the CSV into an
+   automatic lab notebook.
+1. FFD sample packing (replace next-fit; print fill %).
+2. Fused-CE dtype fix (drop the fp32 head-weight copy; upcast per-chunk logits
+   only).
+3. Grad-accum token-weighted loss normalization (native + DDP + BNB arms).
+
+Results are recorded at the end of this section after implementation.
+
+**DONE (all four items, committed on this branch; container-verified with CPU
+torch -- box smoke runs still pending, see below):**
+
+- **Instrumentation.** `StepTimer` splits every step's wall clock into
+  data/fwd/bwd/opt: rolling mean on the per-step line (`1.84s: f 52% b 39% o
+  8%`), run split on the `[PERF]` line, cumulative `t_*_s` columns in the CSV.
+  All three arms; the DDP arm charges the grad all-reduce to `opt` (a fat opt%
+  vs single-GPU points at the interconnect). `--profile-dequant N` times every
+  trellis reconstruction (hook in `backbone`'s weight closures, incl. head +
+  head-slice) for the first N steps and prints its share of step wall time --
+  run this ONCE on the box before any dequant-count optimization work; it also
+  lands in the CSV (`dequant_s_per_step`).
+- **Failure-aware run log.** Any crash -- bad dataset name, OOM at step k, a
+  guard's SystemExit -- now appends a `status=failed` row with the phase
+  reached (`load_model`/`build_dataset`/`train step 17`/...) and an error
+  summary, plus the full traceback to `<run_log>.errors.log`. Completed and
+  Ctrl-C runs disarm it (no double rows). Rank 0 only under DDP. Hard process
+  kills (OOM-killer, segfault) can't be caught -- those still leave no row.
+- **Two latent run-log bugs found and fixed while wiring:** (1) both native
+  arms carried a DUPLICATE dead `log_run` definition whose live copy had
+  silently dropped `start_val`/`start_eval2` -- baseline evals were being
+  logged as blank; (2) the BNB arm's inlined `RUN_LOG_FIELDS` had drifted
+  (missing `pack`), so alternating arms on one CSV moved it to `.bak` every
+  run. Both fixed; arm schemas verified identical by import. NOTE the schema
+  grew (`pack_algo`, `ga_loss`, `t_*_s`, `dequant_s_per_step`, `phase`,
+  `error`), so the first post-pull run moves the existing `qlora_runs.csv` to
+  `.bak` -- expected, not data loss.
+- **BFD packing** (`--pack-algo`, default `bfd`; `nextfit` = old behavior,
+  verified byte-identical to the pre-rewrite code). Best-fit-decreasing via
+  bisect over remaining capacities; deterministic, so DDP ranks pack
+  identically. Measured on synthetic distributions: fill 73-86% -> **99%+**
+  (mixed-length: 1338 -> 988 blocks = ~26% fewer steps/epoch for the same
+  data); long-doc data caps lower (~84%) -- an inherent bin-packing bound.
+  Invariants (no doc lost/duplicated/scrambled, per-doc position reset,
+  seg/pad layout) covered in-container.
+- **Fused-CE dtype fix.** Both fused heads now matmul in the head weight's own
+  dtype and upcast only the `[chunk, vocab]` logits tile -- the full fp32
+  `[d, V]` copy (~1 GB Llama-128k / ~4 GB Gemma-262k, re-created per token
+  chunk in the single-shot forward!) is gone. fp32/fp64 weights keep bit-exact
+  old math (all gradchecks pass unchanged); new bf16-weight parity test (loss
+  rel < 2e-3, grad cos > 0.999 vs the fp32 reference).
+- **Token-weighted grad accumulation** (`--ga-loss`, default `token`; `mean` =
+  old behavior). Micro-batches are weighted by their supervised-token share of
+  the whole step (shifted-label counts, matching the CE denominator), making
+  the step gradient equal one big batch -- the Oct-2024 HF/Unsloth GA fix.
+  Under DDP the share is global (one tiny all-reduce of counts per step),
+  composed with the existing SUM/world_size grad reduction. All three arms;
+  no-op at grad_accum 1. Loss curves at grad_accum > 1 will shift slightly --
+  that's the fix, not a regression.
+- The YAML launcher + sample config expose `pack_algo`/`ga_loss`/
+  `profile_dequant`; tests print per-test wall-clock via `tests/util.run_timed`.
+
+**Box smoke list for next session (nothing here is box-verified yet):**
+1. Any short run: confirm the per-step timing line + `[PERF]` split look sane
+   and `--profile-dequant 5` prints a dequant share (record it -- it decides
+   how hard to chase audit item A1).
+2. `kill` a run / feed a bad dataset name: confirm the `status=failed` CSV row
+   + `.errors.log` traceback.
+3. A `--pack` run on real data: confirm the printed fill % jumps vs
+   `--pack-algo nextfit` and tok/s scales accordingly; loss floor unchanged.
+4. A `--grad-accum > 1` run with `--ga-loss token` vs `mean`: expect similar
+   curves on packed data (uniform blocks), a visible difference on unpacked
+   variable-length data.
+5. Big-vocab (Gemma) run WITHOUT `--head-vocab-chunk`: peak VRAM on the head
+   card should drop by roughly the head's fp32 size vs pre-Session-11.
+
+---
+
 ## 0d. Multi-GPU strategy (rationale)
 
 "Multi-GPU" splits by *goal*, and QLoRA changes which tool fits, because only the

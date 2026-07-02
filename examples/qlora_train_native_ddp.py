@@ -46,9 +46,10 @@ import torch.distributed as dist
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qlora_train_native import (  # noqa: E402
     build_sft_examples, build_lm_examples, pack_examples, collate, make_lr_scheduler,
-    resolve_steps_and_warmup, ThroughputMeter, append_run_log,
+    resolve_steps_and_warmup, ThroughputMeter, StepTimer, append_run_log,
     checkpoint_dir, prune_checkpoints,
     save_trainer_state, load_trainer_state, restore_optimizer_state,
+    _FAIL_CTX, _log_failure,
 )
 
 from exllamav3 import Config, Model, Tokenizer  # noqa: E402
@@ -73,6 +74,25 @@ def is_main(rank):
 
 
 def main():
+    """Run the DDP trainer with failure capture (mirrors the single-GPU arm):
+    any exception on rank 0 appends a status=failed row to the run-log CSV and
+    the traceback to <run_log>.errors.log before re-raising. Non-rank-0 ranks
+    never log (their _FAIL_CTX run_log stays None)."""
+    try:
+        _run_main()
+    except KeyboardInterrupt as e:
+        _log_failure("interrupted", e)
+        raise SystemExit(130)
+    except SystemExit as e:
+        if e.code not in (0, None):
+            _log_failure("failed", e)
+        raise
+    except BaseException as e:
+        _log_failure("failed", e)
+        raise
+
+
+def _run_main():
     # Line-buffer stdout/stderr so per-step progress flushes on each newline.
     # Python block-buffers stdout when it isn't a TTY -- exactly when the run is
     # redirected to a file or piped through tee -- which otherwise holds every
@@ -157,6 +177,10 @@ def main():
                          "attention). Training set only; eval stays per-example. "
                          "Packed once (identically on every rank) then sharded, so "
                          "the per-rank block counts and step math stay in lockstep.")
+    ap.add_argument("--pack-algo", choices=["bfd", "nextfit"], default="bfd",
+                    help="Bin-packing strategy for --pack (bfd = best-fit "
+                         "decreasing, ~97%%+ fill; nextfit = old behavior). "
+                         "Deterministic, so ranks stay identical.")
     ap.add_argument("--targets", nargs="*", default=None)
     ap.add_argument("--train-embeddings", action="store_true",
                     help="Also FULLY train the input embeddings (modules_to_save). "
@@ -240,7 +264,19 @@ def main():
                          "LR/schedule or the GPU count).")
     ap.add_argument("--run-log", default="qlora_runs.csv",
                     help="Append one metadata row per run to this CSV (rank 0 only). "
-                         "Same schema as the single-GPU arm. Empty string disables.")
+                         "Same schema as the single-GPU arm; failures are recorded "
+                         "too (status=failed + error, traceback to "
+                         "<run-log>.errors.log). Empty string disables.")
+    ap.add_argument("--profile-dequant", type=int, default=0, metavar="N",
+                    help="Measure frozen-weight (trellis) reconstruction time for "
+                         "the first N steps (every rank profiles, rank 0 reports), "
+                         "then disable. Adds sync overhead while active.")
+    ap.add_argument("--ga-loss", choices=["token", "mean"], default="token",
+                    help="Loss weighting across micro-batches AND ranks. token "
+                         "(default): weight each micro-batch by its supervised-"
+                         "token share of the whole step (one small all-reduce of "
+                         "the counts per step), so the step gradient equals one "
+                         "big batch. mean: the pre-Session-11 mean-of-means.")
     args = ap.parse_args()
 
     # Cleaning is opt-in (--clean-text); --no-clean-text is now a no-op kept for
@@ -249,6 +285,34 @@ def main():
 
     rank, local_rank, world_size = ddp_setup()
     device = f"cuda:{local_rank}"
+
+    # Failure logger: rank 0 only (other ranks keep run_log=None -> no-op), so a
+    # crash anywhere after this point still leaves one run-log row + traceback.
+    if is_main(rank):
+        _FAIL_CTX["run_log"] = args.run_log
+        _FAIL_CTX["phase"] = "startup"
+        _FAIL_CTX["record"] = {
+            "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+            "arm": "exl3-native-ddp", "model": args.model, "out": args.out,
+            "dataset": args.dataset, "eval_split": args.eval_split or "",
+            "eval_dataset": args.eval_dataset or "",
+            "eval2_dataset": args.eval2_dataset or "",
+            "r": args.r, "alpha": args.alpha, "lr": args.lr,
+            "scheduler": args.scheduler, "weight_decay": args.weight_decay,
+            "batch": args.batch, "grad_accum": args.grad_accum,
+            "world_size": world_size,
+            "eff_batch": args.batch * world_size * args.grad_accum,
+            "epochs": args.epochs, "steps_planned": args.steps,
+            "seq_len": args.seq_len, "compute_dtype": args.compute_dtype,
+            "attn_impl": args.attn_impl, "parallel": "ddp",
+            "shuffle": int(bool(args.shuffle)), "pack": int(bool(args.pack)),
+            "pack_algo": args.pack_algo if args.pack else "",
+            "ga_loss": args.ga_loss,
+            "max_samples": args.max_samples,
+            "train_embeddings": int(bool(args.train_embeddings)),
+            "train_head": int(bool(args.train_head)),
+            "prompt_format": args.prompt_format,
+        }
     if args.no_clean_text and is_main(rank):
         print(" -- note: --no-clean-text is deprecated; cleaning is now OFF by "
               "default (use --clean-text to enable).")
@@ -256,6 +320,7 @@ def main():
            "bfloat16": torch.bfloat16}[args.compute_dtype]
 
     # 1. Every rank loads a full copy of the (small, quantized) model on its GPU.
+    _FAIL_CTX["phase"] = "load_model"
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
     model.load(device=device, progressbar=is_main(rank))
@@ -265,6 +330,9 @@ def main():
         pad_id = tokenizer.eos_token_id or 0
 
     # 2. Build the differentiable QLoRA model (frozen base + trainable adapters).
+    _FAIL_CTX["phase"] = "build_net"
+    if is_main(rank):
+        _FAIL_CTX["record"]["arch"] = getattr(config, "architecture", "")
     net = NativeLlamaQLoRA(
         model, r=args.r, alpha=args.alpha, target_modules=args.targets,
         compute_dtype=cdt, gradient_checkpointing=not args.no_grad_ckpt,
@@ -294,6 +362,7 @@ def main():
 
     # 4. Data. Build the full set identically on every rank (same seed/order), then
     #    take a disjoint stride-shard so each GPU trains on different examples.
+    _FAIL_CTX["phase"] = "build_dataset"
     examples = build_sft_examples(
         model, tokenizer, args.dataset, args.max_samples, args.seq_len,
         instruction_key=args.instruction_key, context_key=args.context_key,
@@ -353,12 +422,12 @@ def main():
     if args.pack:
         n_docs = len(examples)
         real_tokens = sum(len(ex["input_ids"]) for ex in examples)
-        examples = pack_examples(examples, args.seq_len, pad_id)
+        examples = pack_examples(examples, args.seq_len, pad_id, algo=args.pack_algo)
         cap = max(1, len(examples) * args.seq_len)
         if is_main(rank):
-            print(f" -- packed {n_docs} docs -> {len(examples)} blocks of "
-                  f"{args.seq_len} tok ({100.0 * real_tokens / cap:.1f}% filled, "
-                  f"~{real_tokens / max(1, len(examples)):.0f} real tok/block)")
+            print(f" -- packed ({args.pack_algo}) {n_docs} docs -> {len(examples)} "
+                  f"blocks of {args.seq_len} tok ({100.0 * real_tokens / cap:.1f}% "
+                  f"filled, ~{real_tokens / max(1, len(examples)):.0f} real tok/block)")
 
     shard = examples[rank::world_size]
     assert shard, "no training examples on this rank"
@@ -461,47 +530,13 @@ def main():
     status = "completed"
     meter = ThroughputMeter()
 
-    def log_run(status, dt, final_val, final_eval2, sup_tok_s, tot_tok_s):
-        # Rank 0 writes one CSV row (same schema as the single-GPU arm). tok/s are
-        # passed in: the caller has the all-reduced totals at normal finish, or a
-        # per-rank x world_size estimate on interrupt (no collective there).
-        if not is_main(rank):
-            return
-        rnd = lambda x, n=6: round(x, n) if isinstance(x, (int, float)) else ""
-        append_run_log(args.run_log, {
-            "timestamp": run_started, "arm": "exl3-native-ddp", "status": status,
-            "model": args.model, "arch": getattr(config, "architecture", ""),
-            "out": args.out, "dataset": args.dataset,
-            "eval_split": args.eval_split or "", "eval_dataset": args.eval_dataset or "",
-            "eval2_dataset": args.eval2_dataset or "",
-            "r": args.r, "alpha": args.alpha, "lr": args.lr,
-            "scheduler": args.scheduler, "warmup_steps": warmup_steps,
-            "weight_decay": args.weight_decay, "batch": args.batch,
-            "grad_accum": args.grad_accum, "world_size": world_size,
-            "eff_batch": eff_batch, "epochs": args.epochs,
-            "steps_planned": args.steps, "steps_done": step, "seq_len": args.seq_len,
-            "targets": " ".join(net.target_modules), "compute_dtype": args.compute_dtype,
-            "attn_impl": args.attn_impl, "parallel": "ddp",
-            "shuffle": int(bool(args.shuffle)), "pack": int(bool(args.pack)),
-            "max_samples": args.max_samples,
-            "train_embeddings": int(bool(args.train_embeddings)),
-            "train_head": int(bool(args.train_head)), "prompt_format": args.prompt_format,
-            "trainable_params": net.num_trainable(), "n_train": len(examples),
-            "n_val": len(val_examples), "n_eval2": len(val2_examples),
-            "start_loss": rnd(start_loss), "end_loss": rnd(end_loss),
-            "best_val": rnd(best_val) if best_val != float("inf") else "",
-            "best_val_step": best_val_step or "",
-            "start_val": rnd(start_val), "start_eval2": rnd(start_eval2),
-            "final_val": rnd(final_val), "final_eval2": rnd(final_eval2),
-            "total_s": rnd(dt, 1), "s_per_step": rnd(dt / step, 4) if step else "",
-            "sup_tok_s": round(sup_tok_s) if sup_tok_s else "",
-            "tot_tok_s": round(tot_tok_s) if tot_tok_s else "",
-            "peak_vram_gb": rnd(torch.cuda.max_memory_allocated(device) / 1e9, 3),
-            "notes": "",
-        })
+    # (log_run is defined once below, after the baseline eval -- an earlier
+    # duplicate that used to sit here was dead code; NB the duplicate pair had
+    # drifted apart, silently dropping start_val/start_eval2 from the CSV.)
 
     # Baseline eval at step 0 (no-op adapter = base model); all ranks compute in
     # lockstep, rank 0 prints. Reference point for the trained numbers.
+    _FAIL_CTX["phase"] = "baseline_eval"
     if val_examples or val2_examples:
         start_val = evaluate()
         start_eval2 = eval_loss(val2_examples)
@@ -521,6 +556,8 @@ def main():
         # Rank 0 writes one CSV row (same schema as the single-GPU arm). tok/s are
         # passed in: the caller has the all-reduced totals at normal finish, or a
         # per-rank x world_size estimate on interrupt (no collective there).
+        # Disarms the failure logger (this run is recorded).
+        _FAIL_CTX["logged"] = True
         if not is_main(rank):
             return
         rnd = lambda x, n=6: round(x, n) if isinstance(x, (int, float)) else ""
@@ -539,6 +576,8 @@ def main():
             "targets": " ".join(net.target_modules), "compute_dtype": args.compute_dtype,
             "attn_impl": args.attn_impl, "parallel": "ddp",
             "shuffle": int(bool(args.shuffle)), "pack": int(bool(args.pack)),
+            "pack_algo": args.pack_algo if args.pack else "",
+            "ga_loss": args.ga_loss,
             "max_samples": args.max_samples,
             "train_embeddings": int(bool(args.train_embeddings)),
             "train_head": int(bool(args.train_head)), "prompt_format": args.prompt_format,
@@ -547,29 +586,78 @@ def main():
             "start_loss": rnd(start_loss), "end_loss": rnd(end_loss),
             "best_val": rnd(best_val) if best_val != float("inf") else "",
             "best_val_step": best_val_step or "",
+            "start_val": rnd(start_val), "start_eval2": rnd(start_eval2),
             "final_val": rnd(final_val), "final_eval2": rnd(final_eval2),
             "total_s": rnd(dt, 1), "s_per_step": rnd(dt / step, 4) if step else "",
             "sup_tok_s": round(sup_tok_s) if sup_tok_s else "",
             "tot_tok_s": round(tot_tok_s) if tot_tok_s else "",
             "peak_vram_gb": rnd(torch.cuda.max_memory_allocated(device) / 1e9, 3),
-            "notes": "",
+            # Section timings are rank 0's own (ranks are in lockstep, so
+            # representative of all).
+            "t_data_s": rnd(timer.total["data"], 1), "t_fwd_s": rnd(timer.total["fwd"], 1),
+            "t_bwd_s": rnd(timer.total["bwd"], 1), "t_opt_s": rnd(timer.total["opt"], 1),
+            "dequant_s_per_step": rnd(dequant_s_per_step, 3)
+                if dequant_s_per_step is not None else "",
+            "phase": "", "error": "", "notes": "",
         })
+
+    # Per-step wall-clock breakdown (this rank's own; ranks run in lockstep).
+    timer = StepTimer(devices=[local_rank])
+
+    # Optional dequant profiling window (all ranks profile so timing stays in
+    # lockstep; rank 0 reports).
+    dq_profile = None
+    dequant_s_per_step = None
+    if args.profile_dequant > 0:
+        from exllamav3.training import backbone as _backbone
+        dq_profile = {"calls": 0, "s": 0.0}
+        _backbone.profile_dequant(dq_profile)
+        if is_main(rank):
+            print(f" -- profiling dequant (trellis reconstruction) for the first "
+                  f"{args.profile_dequant} steps; adds sync overhead while active")
     try:
         for step in range(resume_step + 1, args.steps + 1):
+            _FAIL_CTX["phase"] = f"train step {step}"
             step_t0 = time.time()
             accum_loss = 0.0
             step_sup = step_tot = 0
-            for _ in range(args.grad_accum):
-                batch = next(bgen)
-                input_ids, labels, attn, pos_ids, seg_ids = collate(batch, pad_id)
+            timer.begin_step()
+            # --ga-loss token (see the single-GPU arm for the rationale): weight
+            # each micro-batch by its supervised-token share of the WHOLE step --
+            # across micro-batches AND ranks, so one all-reduce of the counts.
+            # allreduce_grads() divides the summed grads by world_size, so each
+            # rank scales by world_size/total to land at loss_sum/total overall.
+            # Counts use the SHIFTED labels to match the CE denominator.
+            window = [collate(next(bgen), pad_id) for _ in range(args.grad_accum)]
+            n_sups = [int((w[1][:, 1:] != -100).sum()) for w in window]
+            if args.ga_loss == "token":
+                tot = torch.tensor(float(sum(n_sups)), device=device)
+                dist.all_reduce(tot, op=dist.ReduceOp.SUM)
+                total_sup = max(tot.item(), 1.0)
+            timer.mark("data")
+            for (input_ids, labels, attn, pos_ids, seg_ids), n_sup in zip(window, n_sups):
                 loss = net.compute_loss(input_ids, labels, attention_mask=attn,
                                         chunk=args.ce_chunk,
                                         position_ids=pos_ids, seg_ids=seg_ids)
-                (loss / args.grad_accum).backward()
-                accum_loss += loss.item() / args.grad_accum
+                # .item() before backward (harmless to the graph) so the fwd/bwd
+                # sections split cleanly at the sync.
+                loss_val = loss.item()
+                timer.mark("fwd")
+                w_i = (n_sup * world_size / total_sup) if args.ga_loss == "token" \
+                    else (1.0 / args.grad_accum)
+                (loss * w_i).backward()
+                timer.mark("bwd")
+                # The log line below SUMs accum_loss across ranks then divides
+                # by world_size; since the token weights w_i sum to world_size
+                # across the whole step, that reduction yields exactly the
+                # per-token mean over the step (and the old mean-of-means for
+                # --ga-loss mean).
+                accum_loss += loss_val * w_i
                 step_sup += int((labels != -100).sum())
                 step_tot += int(attn.sum())
 
+            # "opt" section includes the grad all-reduce (the DDP comm cost) --
+            # a fat opt% relative to the single-GPU arm points at the interconnect.
             allreduce_grads()
             gnorm = torch.nn.utils.clip_grad_norm_(
                 net.trainable_parameters(), args.max_grad_norm or float("inf")
@@ -577,6 +665,8 @@ def main():
             opt.step()
             sched.step()
             opt.zero_grad(set_to_none=True)
+            timer.mark("opt")
+            timer.end_step()
 
             # Average the loss across ranks just for a representative log line.
             lt = torch.tensor(accum_loss, device=device)
@@ -597,7 +687,27 @@ def main():
                 print(f"  step {step:>5}/{args.steps} | loss {global_loss:6.4f} | "
                       f"ema {ema:6.4f} | grad {gnorm:7.4f} | "
                       f"lr {sched.get_last_lr()[0]:.2e} | "
-                      f"~{tot_tps * world_size:,.0f} tok/s")
+                      f"~{tot_tps * world_size:,.0f} tok/s | {timer.step_line()}")
+                # Keep the failure record current (steps reached, loss, memory).
+                _FAIL_CTX["record"].update(
+                    steps_done=step, end_loss=round(global_loss, 6),
+                    peak_vram_gb=round(torch.cuda.max_memory_allocated(device) / 1e9, 3))
+
+            # End of the dequant profiling window: report and disable (all ranks
+            # disable together so lockstep timing is preserved).
+            if dq_profile is not None and (step - resume_step) >= args.profile_dequant:
+                n_prof = step - resume_step
+                wall = sum(timer.total.values())
+                dequant_s_per_step = dq_profile["s"] / max(1, n_prof)
+                if is_main(rank):
+                    print(f"  [profile] dequant: {dq_profile['calls']:,} reconstructions, "
+                          f"{dq_profile['s']:.2f}s over {n_prof} steps = "
+                          f"{dequant_s_per_step:.3f}s/step "
+                          f"({100.0 * dq_profile['s'] / max(wall, 1e-9):.0f}% of step "
+                          f"wall time) -- profiling off from here")
+                from exllamav3.training import backbone as _backbone
+                _backbone.profile_dequant(None)
+                dq_profile = None
 
             if (args.eval_every and step % args.eval_every == 0
                     and (val_examples or val2_examples)):
@@ -655,6 +765,7 @@ def main():
 
     # Held-out loss (all ranks compute identically; rank 0 reports) + global
     # throughput (sum supervised tokens across ranks) + this rank's peak VRAM.
+    _FAIL_CTX["phase"] = "final_eval"
     dt = time.time() - t0
     # Reuse the last in-loop eval if it landed on the final step (all ranks share
     # it, computed in lockstep) instead of a duplicate full pass after the loop.
@@ -679,7 +790,8 @@ def main():
         print(f"[PERF] {tok_t[0].item() / dt if dt else 0:,.0f} sup tok/s, "
               f"{tok_t[1].item() / dt if dt else 0:,.0f} tot tok/s (all ranks) | "
               f"peak VRAM/GPU {peak_gb:.2f} GB | {dt:.0f}s, "
-              f"{step} steps, world_size {world_size}")
+              f"{step} steps, world_size {world_size} | "
+              f"step time: {timer.summary()}")
     # Record the run (rank 0 only, inside log_run) with all-reduced tok/s totals.
     log_run(status, dt, val_loss, val2_loss,
             tok_t[0].item() / dt if dt else 0, tok_t[1].item() / dt if dt else 0)

@@ -263,6 +263,45 @@ def attn_varlen(q, k, v, cu_seqlens, max_seqlen, sm_scale,
 
 # --- frozen quantized linears ----------------------------------------------
 
+# Optional dequant profiling (``--profile-dequant``). When enabled, every
+# frozen-weight reconstruction (block linears, LM head, head slices) times
+# itself into this mutable dict -- answering "how much of a training step is
+# trellis reconstruction", the load-bearing question for the dequant-count
+# optimizations (see doc/qlora_optimization_audit.md A1). Costs a device sync
+# either side of each reconstruction while enabled (a diagnostic mode; the
+# measured share of wall time is still representative). Disabled = one global
+# read per call, negligible next to the matmul it precedes.
+_DEQUANT_PROFILE: Optional[dict] = None
+
+
+def profile_dequant(state: Optional[dict]) -> None:
+    """Enable (pass a dict with ``calls``/``s`` keys) or disable (pass None)
+    reconstruction timing for all frozen-weight closures."""
+    global _DEQUANT_PROFILE
+    _DEQUANT_PROFILE = state
+
+
+def _timed_reconstruct(fn):
+    """Wrap a weight-producing closure so it accumulates into the profile dict
+    when profiling is on. The check runs at call time, so enabling/disabling
+    mid-run needs no closure rebuild."""
+    def wrapped(*a):
+        p = _DEQUANT_PROFILE
+        if p is None:
+            return fn(*a)
+        import time
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        w = fn(*a)
+        if w.is_cuda:
+            torch.cuda.synchronize(w.device)
+        p["calls"] += 1
+        p["s"] += time.perf_counter() - t0
+        return w
+    return wrapped
+
+
 def is_loaded(linear) -> bool:
     """True once a native ``Linear`` has its inner (trellis / fp16) weight."""
     return getattr(linear, "inner", None) is not None
@@ -283,7 +322,7 @@ def frozen_weight_closure(linear, dtype: torch.dtype) -> Callable[[], torch.Tens
     is what lets the backward pass avoid stashing the dense weight.
     """
     inner = linear.inner
-    return lambda: inner.get_weight_tensor().to(dtype)
+    return _timed_reconstruct(lambda: inner.get_weight_tensor().to(dtype))
 
 
 def frozen_bias(linear, dtype: torch.dtype) -> Optional[torch.Tensor]:
@@ -301,7 +340,7 @@ def head_weight_closure(lm_head) -> Callable[[], torch.Tensor]:
     dtype cast; the fused-CE head promotes to >=fp32 internally).
     """
     inner = lm_head.inner
-    return lambda: inner.get_weight_tensor()
+    return _timed_reconstruct(lambda: inner.get_weight_tensor())
 
 
 def head_weight_slice_closure(lm_head):
@@ -324,7 +363,7 @@ def head_weight_slice_closure(lm_head):
             # Module-level constant on the EXL3 linear's module.
             import exllamav3.modules.quant.exl3 as _exl3
             gran = _exl3.RECONSTRUCT_SLICE_GRANULARITY_N
-        return (lambda s, n: sliced(s, n)), inner.out_features, gran
+        return _timed_reconstruct(lambda s, n: sliced(s, n)), inner.out_features, gran
     # Generic fallback: index the full (already-resident) weight. No reconstruction
     # spike to avoid, but the chunked CE still bounds the logits/softmax memory.
     get_full = getattr(inner, "get_weight_tensor", None)
@@ -333,7 +372,7 @@ def head_weight_slice_closure(lm_head):
     out_features = getattr(inner, "out_features", None)
     if out_features is None:
         return None
-    return (lambda s, n: get_full()[:, s:s + n]), out_features, 1
+    return _timed_reconstruct(lambda s, n: get_full()[:, s:s + n]), out_features, 1
 
 
 # --- token embedding -------------------------------------------------------

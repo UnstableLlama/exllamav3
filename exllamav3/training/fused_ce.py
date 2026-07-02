@@ -39,6 +39,24 @@ class FusedLinearCrossEntropy(torch.autograd.Function):
     only; the head weight is treated as a frozen constant.
     """
 
+    # Dtype scheme (Session 11, audit item A4): the matmul runs in the WEIGHT's
+    # own dtype when it is half/bf16 -- the full [d, V] head is never upcast to
+    # fp32 (that copy was ~1 GB on a 128k vocab / ~4 GB on Gemma's 262k, and the
+    # old code re-created it on every token chunk). The matmul accumulates in
+    # fp32 internally; only the [chunk, V] logits tile is upcast for a stable
+    # softmax -- the same head-dtype contract the materialized supervised-
+    # position path settled on in #118. Full-precision (fp32/fp64) weights keep
+    # the exact old math, so the fp64 gradcheck is bit-unaffected. For half
+    # weights the loss/grad move within the half-precision noise band (parity
+    # test: test_fused_ce.test_low_precision_weight_parity).
+
+    @staticmethod
+    def _mm_dtype(hidden, weight):
+        """(matmul dtype, softmax/statistics dtype) per the scheme above."""
+        stat = torch.promote_types(hidden.dtype, torch.float32)
+        low = weight.dtype in (torch.float16, torch.bfloat16)
+        return (weight.dtype if low else stat), stat
+
     @staticmethod
     def forward(
         ctx,
@@ -50,23 +68,22 @@ class FusedLinearCrossEntropy(torch.autograd.Function):
     ) -> torch.Tensor:
         weight = weight_fn()
         n, d = hidden.shape
-        # Upcast low-precision (half/bf16) to fp32 for a stable softmax, but
-        # preserve fp64 so gradcheck stays exact.
-        compute_dtype = torch.promote_types(hidden.dtype, torch.float32)
+        mm_dtype, stat_dtype = FusedLinearCrossEntropy._mm_dtype(hidden, weight)
+        w = weight if weight.dtype == mm_dtype else weight.to(mm_dtype)
 
         valid = labels != ignore_index
         m = int(valid.sum().item())
         denom = max(m, 1)
 
-        loss_sum = hidden.new_zeros((), dtype=compute_dtype)
+        loss_sum = hidden.new_zeros((), dtype=stat_dtype)
         for start in range(0, n, chunk):
             end = min(start + chunk, n)
-            h_c = hidden[start:end].to(compute_dtype)
             lbl_c = labels[start:end]
             valid_c = valid[start:end]
             if not bool(valid_c.any()):
                 continue
-            logits_c = h_c @ weight.to(compute_dtype)           # [c, V]
+            h_c = hidden[start:end].to(mm_dtype)
+            logits_c = (h_c @ w).to(stat_dtype)                 # [c, V] tile only
             logp_c = F.log_softmax(logits_c, dim=-1)
             safe_lbl = lbl_c.clamp_min(0)
             nll = -logp_c.gather(-1, safe_lbl.unsqueeze(-1)).squeeze(-1)  # [c]
@@ -91,29 +108,33 @@ class FusedLinearCrossEntropy(torch.autograd.Function):
         denom = ctx.denom
         n, d = hidden.shape
 
-        compute_dtype = torch.promote_types(hidden.dtype, torch.float32)
-        w = weight.to(compute_dtype)
-        grad_hidden = torch.empty_like(hidden, dtype=compute_dtype)
-        g_scale = grad_output.to(compute_dtype)
+        mm_dtype, stat_dtype = FusedLinearCrossEntropy._mm_dtype(hidden, weight)
+        w = weight if weight.dtype == mm_dtype else weight.to(mm_dtype)
+        grad_hidden = torch.empty_like(hidden, dtype=stat_dtype)
+        g_scale = grad_output.to(stat_dtype)
 
         for start in range(0, n, chunk):
             end = min(start + chunk, n)
-            h_c = hidden[start:end].to(compute_dtype)
+            h_c = hidden[start:end].to(mm_dtype)
             lbl_c = labels[start:end]
             valid_c = (lbl_c != ignore_index)
 
-            logits_c = h_c @ w                                  # [c, V]
-            probs_c = torch.softmax(logits_c, dim=-1)           # [c, V]
+            logits_c = (h_c @ w).to(stat_dtype)                 # [c, V]
+            probs_c = torch.softmax(logits_c, dim=-1)           # [c, V] fp32
             # grad wrt logits = (softmax - onehot) / denom, zeroed on ignored.
             safe_lbl = lbl_c.clamp_min(0)
             probs_c.scatter_add_(
                 -1, safe_lbl.unsqueeze(-1),
-                torch.full_like(safe_lbl, -1.0, dtype=compute_dtype).unsqueeze(-1),
+                torch.full_like(safe_lbl, -1.0, dtype=stat_dtype).unsqueeze(-1),
             )
             probs_c = torch.where(valid_c.unsqueeze(-1), probs_c,
                                   torch.zeros_like(probs_c))
             probs_c = probs_c / denom
-            grad_hidden[start:end] = (probs_c @ w.t()) * g_scale
+            # The grad matmul also runs in the weight's dtype (probs cast down),
+            # accumulating into the fp32 grad buffer -- same precision class as
+            # every other matmul in a bf16 training step.
+            grad_hidden[start:end] = \
+                (probs_c.to(mm_dtype) @ w.t()).to(stat_dtype) * g_scale
 
         return grad_hidden.to(hidden.dtype), None, None, None, None
 
@@ -157,14 +178,22 @@ class FusedLinearCrossEntropyVocabChunked(torch.autograd.Function):
         run_max = hidden.new_full((n,), neg_inf, dtype=compute_dtype)   # running max [N]
         run_sum = hidden.new_zeros((n,), dtype=compute_dtype)           # running sum-exp [N]
         tgt_logit = hidden.new_zeros((n,), dtype=compute_dtype)         # target logit [N]
-        h_all = hidden.to(compute_dtype)
+        # Matmul in the weight slice's own dtype when it is half/bf16 (no fp32
+        # copy of the slice; only the [tc, vw] logits tile is upcast) -- same
+        # scheme as FusedLinearCrossEntropy._mm_dtype. h_all is cached in the
+        # matmul dtype once the first slice reveals it.
+        h_all = None
 
         for v0 in range(0, vocab_size, vc):
             v1 = min(v0 + vc, vocab_size)
-            w_v = weight_slice_fn(v0, v1 - v0).to(compute_dtype)        # [d, vw]
+            w_v = weight_slice_fn(v0, v1 - v0)                          # [d, vw]
+            if w_v.dtype not in (torch.float16, torch.bfloat16):
+                w_v = w_v.to(compute_dtype)
+            if h_all is None or h_all.dtype != w_v.dtype:
+                h_all = hidden.to(w_v.dtype)
             for t0 in range(0, n, token_chunk):
                 t1 = min(t0 + token_chunk, n)
-                logits = h_all[t0:t1] @ w_v                            # [tc, vw]
+                logits = (h_all[t0:t1] @ w_v).to(compute_dtype)        # [tc, vw]
                 # Online-softmax running stats over the vocab dimension.
                 chunk_max = logits.max(dim=-1).values                  # [tc]
                 new_max = torch.maximum(run_max[t0:t1], chunk_max)
@@ -202,7 +231,7 @@ class FusedLinearCrossEntropyVocabChunked(torch.autograd.Function):
         n, d = hidden.shape
 
         compute_dtype = torch.promote_types(hidden.dtype, torch.float32)
-        h_all = hidden.to(compute_dtype)
+        h_all = None                       # cached in the matmul dtype (see forward)
         g_scale = grad_output.to(compute_dtype)
         grad_hidden = hidden.new_zeros((n, d), dtype=compute_dtype)
         valid = (labels != ignore_index)
@@ -213,10 +242,14 @@ class FusedLinearCrossEntropyVocabChunked(torch.autograd.Function):
         # in forward), so no second normalization pass is needed.
         for v0 in range(0, vocab_size, vc):
             v1 = min(v0 + vc, vocab_size)
-            w_v = weight_slice_fn(v0, v1 - v0).to(compute_dtype)        # [d, vw]
+            w_v = weight_slice_fn(v0, v1 - v0)                          # [d, vw]
+            if w_v.dtype not in (torch.float16, torch.bfloat16):
+                w_v = w_v.to(compute_dtype)
+            if h_all is None or h_all.dtype != w_v.dtype:
+                h_all = hidden.to(w_v.dtype)
             for t0 in range(0, n, token_chunk):
                 t1 = min(t0 + token_chunk, n)
-                logits = h_all[t0:t1] @ w_v                            # [tc, vw]
+                logits = (h_all[t0:t1] @ w_v).to(compute_dtype)        # [tc, vw]
                 p = torch.exp(logits - lse[t0:t1].unsqueeze(-1))       # softmax slice
                 lbl = labels[t0:t1]
                 in_chunk = (lbl >= v0) & (lbl < v1)
@@ -227,7 +260,8 @@ class FusedLinearCrossEntropyVocabChunked(torch.autograd.Function):
                                 in_chunk.to(p.dtype).unsqueeze(-1))
                 p = p - onehot
                 p = torch.where(valid[t0:t1].unsqueeze(-1), p, torch.zeros_like(p))
-                grad_hidden[t0:t1] += (p @ w_v.t()) / denom
+                # Grad matmul in the weight's dtype, fp32 accumulation buffer.
+                grad_hidden[t0:t1] += (p.to(w_v.dtype) @ w_v.t()).to(compute_dtype) / denom
 
         grad_hidden *= g_scale
         return grad_hidden.to(hidden.dtype), None, None, None, None, None, None, None

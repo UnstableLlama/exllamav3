@@ -49,3 +49,18 @@ def assert_close_mr(
         )
         error_msg = f"{msg}\n{default_msg}" if msg else default_msg
         raise AssertionError(error_msg)
+
+def run_timed(tests, label="suite"):
+    """Run test callables sequentially, printing each one's wall-clock time and
+    the suite total -- so slow tests are visible and runtime regressions in the
+    kernels under test show up in the log. Works with plain functions and
+    functools.partial (falls back to the wrapped function's name)."""
+    import time
+    t_suite = time.perf_counter()
+    for fn in tests:
+        name = getattr(fn, "__name__", None) \
+            or getattr(getattr(fn, "func", None), "__name__", str(fn))
+        t0 = time.perf_counter()
+        fn()
+        print(f"    [time] {name}: {time.perf_counter() - t0:.2f}s")
+    print(f"[time] {label} total: {time.perf_counter() - t_suite:.2f}s")
