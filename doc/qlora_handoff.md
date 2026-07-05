@@ -1592,7 +1592,8 @@ torch -- box smoke runs still pending, see below):**
 > Branch `claude/qlora-cuda-oom-pdpb87`. Trigger: a Semancer-12B (Gemma-family,
 > 262k vocab, final-logit softcap) `--parallel split` run with `--batch 3
 > --seq-len 8192 --pack` OOM'd at train step 1 in `compute_loss`, at the
-> softcap tanh line. Container-verified (CPU tests); box smoke pending.
+> softcap tanh line. Container-verified (CPU tests) AND **box-confirmed** —
+> see "Box results" below.
 
 **Diagnosis — why this OOM'd now when smaller runs didn't (no regression):**
 
@@ -1635,14 +1636,29 @@ next-work #1, the frozen-head 80% of it.**
   ignore_index and chunk sweeps) and fp64 gradchecks for both heads. All
   fused-CE / native-llama / qlora-grad CPU suites pass.
 
-**Box smoke for next session:** re-run the failing malazan2.yaml command
-unchanged — it should now train (the head loss streams in `--ce-chunk 64` ×
-`--head-vocab-chunk 32768` tiles; `--head-vocab-chunk` no longer prints the
-"ignored" note on softcap bases). Sanity: first-step loss should look like a
-healthy SFT start (~2–5), not shift. For the idle-cuda:1 imbalance, either
-drop the cuda:0 budget (e.g. `--use-per-device 5 24` to push tail blocks +
-head onto cuda:1) or wait for the balanced-split item; with the chunked head
-the spike is small enough that all-on-cuda:0 should also fit.
+**Box results (Semancer-12B 4bpw, 2×3090, batch 3 × seq 8192 packed, the
+previously-OOMing malazan config): CONFIRMED WORKING.**
+
+- The run that OOM'd at step 1 now trains. Split came up 47/1 with final norm
+  + head on cuda:1 (the "ignored" softcap note is gone, so the head loss
+  streams in `--ce-chunk 64` × `--head-vocab-chunk 32768` tiles). All health
+  signals per the standard checklist: first loss **3.38** falling smoothly
+  (2.99 by step 6), `|B|` monotonic 0→0.126, steady **457–463 tok/s**,
+  ~53.2 s/step, step split **f 31% / b 69% / o ~1%** (backward-heavy is
+  expected: checkpoint recompute + dequant both live there).
+- **Early grad-norm spikes** (step 1: 11545; steps 3–4: 427/1646; settled to
+  25–54 from step 5 on). Read as the usual B=0-init LoRA transient, clipped by
+  `--max-grad-norm 1.0`, and the loss curve stayed clean — NOT the Session-10
+  liger in_place signature (that one persisted at ~1e16 with healthy loss;
+  this run doesn't use `--use-liger`). Only worth revisiting if spikes recur
+  mid-run.
+- **Dequant profile recorded (the Session-11 A1 datapoint):** 5,000 trellis
+  reconstructions in 50.95 s over 5 steps = **10.19 s/step ≈ 19% of step wall
+  time** on this 48-layer 12B (profiling adds sync overhead, so true share is
+  a bit lower). Implication for audit item A1 (dequant runs ~3× per linear per
+  step): collapsing 3× → 1× would save at most ~2/3 of that ≈ **~13% wall** —
+  real but not the dominant term; backward (69%) is mostly attention/MLP
+  recompute. A1 is worth doing opportunistically, not as the next big rock.
 
 **Still open (unchanged from Session 10):** trainable-head chunked CE with a
 head/LoRA-B gradient (next-work #1's other half, superseding Session 9 #7),
