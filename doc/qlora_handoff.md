@@ -1587,6 +1587,69 @@ torch -- box smoke runs still pending, see below):**
 
 ---
 
+### Session 12 — softcap in the fused CE heads (fixes the Gemma big-batch head OOM)
+
+> Branch `claude/qlora-cuda-oom-pdpb87`. Trigger: a Semancer-12B (Gemma-family,
+> 262k vocab, final-logit softcap) `--parallel split` run with `--batch 3
+> --seq-len 8192 --pack` OOM'd at train step 1 in `compute_loss`, at the
+> softcap tanh line. Container-verified (CPU tests); box smoke pending.
+
+**Diagnosis — why this OOM'd now when smaller runs didn't (no regression):**
+
+1. **The softcap forced the materialized head path, and it scales with batch.**
+   Any `final_softcap` model skipped BOTH fused heads (`--ce-chunk` and
+   `--head-vocab-chunk` silently ignored — the startup note even said so) and
+   materialized `[supervised_tokens, 262144]` logits. At `--batch 3 --seq-len
+   8192 --pack` that's ~20k supervised tokens → **9.8 GB in bf16** — and the
+   out-of-place cap chain `cap * tanh(logits / cap)` holds up to **three** such
+   buffers at its peak (~29 GB). Session 10's run survived only because it was
+   ~6.5k supervised tokens (batch 1) with the head on an otherwise-empty card.
+2. **The greedy autosplit put ALL 48 blocks + final norm + head on cuda:0.**
+   `use_per_device [8, 24]` fills cuda:0 to its budget first (Session 10
+   diagnosis); this quant fit entirely under 8 GB, so unlike the Session-10 run
+   (47/1, head on cuda:1) the whole model AND the head-loss spike shared
+   cuda:0 while cuda:1 sat idle. Known behavior, still ugly — the head-aware
+   balanced split (Session 10 next-work #2) remains open.
+
+**Fix (this session): the tanh cap is elementwise, so it chunks — Session 10
+next-work #1, the frozen-head 80% of it.**
+
+- `fused_ce.py`: both `FusedLinearCrossEntropy` and
+  `FusedLinearCrossEntropyVocabChunked` take a `softcap` arg (0 = off, exact
+  old behavior). Forward applies `cap * tanh(z / cap)` inside each logits tile
+  (elementwise → online-softmax stats over capped tiles are exact); backward
+  chains the Jacobian `1 - (z_capped/cap)^2` into the logit gradient before
+  the transposed matmul. Wrappers gain `softcap=0.0`.
+- `native_llama.compute_loss`: a **frozen** softcapped head now routes to the
+  fused heads (softcap passed through) — the materialized supervised-position
+  path is only for `--train-head` / `--lora-head`. So on Gemma-family bases
+  `--ce-chunk` and `--head-vocab-chunk` work again and the `[tokens, vocab]`
+  spike is gone; the startup "ignored" note now fires on trainable-head runs
+  instead of softcap ones.
+- The remaining materialized path (trainable head + softcap) applies the cap
+  in place (`div_().tanh_() * cap`): peak drops from 3 to 2 logit-sized
+  buffers. Verified safe/equal (matmul/add save inputs not outputs; tanh_
+  backward uses its own output, left unmodified by the final out-of-place mul).
+- Tests: `test_fused_ce.py` gains softcap parity vs
+  `F.cross_entropy(cap*tanh((h@w)/cap))` (both heads, loss + grad, with
+  ignore_index and chunk sweeps) and fp64 gradchecks for both heads. All
+  fused-CE / native-llama / qlora-grad CPU suites pass.
+
+**Box smoke for next session:** re-run the failing malazan2.yaml command
+unchanged — it should now train (the head loss streams in `--ce-chunk 64` ×
+`--head-vocab-chunk 32768` tiles; `--head-vocab-chunk` no longer prints the
+"ignored" note on softcap bases). Sanity: first-step loss should look like a
+healthy SFT start (~2–5), not shift. For the idle-cuda:1 imbalance, either
+drop the cuda:0 budget (e.g. `--use-per-device 5 24` to push tail blocks +
+head onto cuda:1) or wait for the balanced-split item; with the chunked head
+the spike is small enough that all-on-cuda:0 should also fit.
+
+**Still open (unchanged from Session 10):** trainable-head chunked CE with a
+head/LoRA-B gradient (next-work #1's other half, superseding Session 9 #7),
+head-aware balanced autosplit (#2), liger grad-parity gate (#3).
+
+---
+
 ## 0d. Multi-GPU strategy (rationale)
 
 "Multi-GPU" splits by *goal*, and QLoRA changes which tool fits, because only the

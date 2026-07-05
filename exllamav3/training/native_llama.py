@@ -343,8 +343,9 @@ class NativeLlamaQLoRA(nn.Module):
 
         self._wrappers = wrappers
         self.final_norm_spec = backbone.norm_spec(self.final_norm)
-        # Final-logit tanh softcapping (Gemma2; 0 = none). Materialized-logit path
-        # applies it; the fused-CE training path can't, so compute_loss guards.
+        # Final-logit tanh softcapping (Gemma2; 0 = none). Applied by logits(),
+        # by the materialized supervised-position loss, and by both fused-CE
+        # heads (softcap arg -- the cap is elementwise, so it chunks cleanly).
         self.final_softcap = backbone.head_softcap(self.lm_head)
         # Output device = where the final norm + LM head live. Under a single
         # load this is the one decoder device; under layer-autosplit it is the
@@ -362,16 +363,18 @@ class NativeLlamaQLoRA(nn.Module):
         self._head_slice = None
         if self.head_vocab_chunk > 0:
             self._head_slice = backbone.head_weight_slice_closure(self.lm_head)
-        # Gemma2-style final-logit softcapping forces compute_loss down the
-        # materialized supervised-position head path (the chunked-vocab CE can't
-        # apply the tanh cap), so --head-vocab-chunk is silently a no-op there. Warn
-        # once: on a big-vocab softcapped model (Gemma2 = 256k vocab + softcap) the
-        # [hidden, vocab] spike the chunk flag is meant to avoid is NOT avoided.
-        if self.head_vocab_chunk > 0 and self.final_softcap:
-            print(" -- note: --head-vocab-chunk is ignored on this model because it "
-                  "uses final-logit softcapping; the chunked-vocab CE can't apply the "
-                  "tanh cap, so compute_loss uses the materialized supervised-position "
-                  "head loss. Watch head memory on a big-vocab softcapped base.")
+        # A *trainable* head (train_head/lora_head) forces compute_loss down the
+        # materialized supervised-position path (the fused heads are frozen-head
+        # only: they emit no weight/LoRA gradient), so --head-vocab-chunk is
+        # silently a no-op there. Warn once: on a big-vocab model the [tokens,
+        # vocab] spike the chunk flag is meant to avoid is NOT avoided. (Final-
+        # logit softcapping alone no longer forces this path -- both fused heads
+        # apply the tanh cap in-tile since Session 12.)
+        if self.head_vocab_chunk > 0 and (train_head or lora_head):
+            print(" -- note: --head-vocab-chunk is ignored when the LM head trains "
+                  "(--train-head / --lora-head); the chunked-vocab CE is frozen-head "
+                  "only, so compute_loss uses the materialized supervised-position "
+                  "head loss. Watch head memory on a big-vocab base.")
 
         # Sanity: every requested target name actually matched something.
         matched = {w.key.split(".")[-1] for w in wrappers if w.r > 0}
@@ -984,12 +987,11 @@ class NativeLlamaQLoRA(nn.Module):
         """Shifted causal-LM cross-entropy.
 
         Frozen head: the streaming fused head (never materializes ``[tokens,
-        vocab]``). Trainable head (``train_head``): standard autograd so the head
-        weight gets a gradient -- but logits are computed only at the *supervised*
-        positions (labels != ignore_index), so memory scales with the number of
-        supervised tokens, not the full sequence. Final-logit softcapping (Gemma2)
-        also takes the supervised-position path, since the fused head can't apply
-        the tanh cap.
+        vocab]``), which also applies any final-logit softcap (Gemma2) in-tile.
+        Trainable head (``train_head``/``lora_head``): standard autograd so the
+        head weight gets a gradient -- but logits are computed only at the
+        *supervised* positions (labels != ignore_index), so memory scales with
+        the number of supervised tokens, not the full sequence.
 
         ``position_ids`` / ``seg_ids`` enable sample packing (per-document position
         resets + block-diagonal attention). The shifted CE needs no packing special
@@ -998,9 +1000,11 @@ class NativeLlamaQLoRA(nn.Module):
         loss."""
         hidden = self.forward(input_ids, attention_mask, position_ids, seg_ids)
         # Materialize logits only at supervised positions when the head trains
-        # (train_head OR lora_head) OR a final softcap must be applied -- the fused
-        # head supports none of these. Memory scales with the supervised token count.
-        if self.train_head or self.lora_head or self.final_softcap:
+        # (train_head OR lora_head) -- the fused heads are frozen-head only (no
+        # weight/LoRA gradient). Memory scales with the supervised token count.
+        # A frozen softcapped head (Gemma) stays on the fused paths below, which
+        # apply the tanh cap in-tile.
+        if self.train_head or self.lora_head:
             d = hidden.shape[-1]
             hs = hidden[:, :-1, :].reshape(-1, d)                 # shift
             lbl = labels[:, 1:].reshape(-1).to(hs.device)
@@ -1035,7 +1039,13 @@ class NativeLlamaQLoRA(nn.Module):
                 logits = logits + self._module_lora_scale * (
                     (hs @ self.head_lora_a) @ self.head_lora_b)
             if self.final_softcap:
-                logits = self.final_softcap * torch.tanh(logits / self.final_softcap)
+                # In place: the out-of-place chain (`cap * tanh(logits / cap)`)
+                # holds three [supervised, vocab] buffers at its peak; div_/tanh_
+                # reuse the logits buffer so the peak is two. Safe: matmul/add
+                # save their inputs, not outputs; div-by-scalar saves nothing;
+                # tanh_'s backward uses its own output, which the final
+                # out-of-place scalar mul leaves unmodified.
+                logits = logits.div_(self.final_softcap).tanh_() * self.final_softcap
             return F.cross_entropy(logits, lbl[valid].to(w.device))
         # The fused head matmuls hidden against the frozen head weight, which
         # lives on the head's device; co-locate them (no-op single-device).
@@ -1051,10 +1061,12 @@ class NativeLlamaQLoRA(nn.Module):
                 hidden, slice_fn, labels, vocab_size,
                 vocab_chunk=self.head_vocab_chunk, token_chunk=chunk,
                 ignore_index=ignore_index, granularity=granularity, shift=True,
+                softcap=self.final_softcap,
             )
         return fused_linear_cross_entropy(
             hidden, self.lm_head_weight_fn(), labels,
             chunk=chunk, ignore_index=ignore_index, shift=True,
+            softcap=self.final_softcap,
         )
 
     # --- adapter parameters / IO ------------------------------------------
