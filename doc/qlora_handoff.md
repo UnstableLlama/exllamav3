@@ -1592,7 +1592,8 @@ torch -- box smoke runs still pending, see below):**
 > Branch `claude/qlora-cuda-oom-pdpb87`. Trigger: a Semancer-12B (Gemma-family,
 > 262k vocab, final-logit softcap) `--parallel split` run with `--batch 3
 > --seq-len 8192 --pack` OOM'd at train step 1 in `compute_loss`, at the
-> softcap tanh line. Container-verified (CPU tests); box smoke pending.
+> softcap tanh line. Container-verified (CPU tests) AND **box-confirmed** —
+> see "Box results" below.
 
 **Diagnosis — why this OOM'd now when smaller runs didn't (no regression):**
 
@@ -1635,18 +1636,67 @@ next-work #1, the frozen-head 80% of it.**
   ignore_index and chunk sweeps) and fp64 gradchecks for both heads. All
   fused-CE / native-llama / qlora-grad CPU suites pass.
 
-**Box smoke for next session:** re-run the failing malazan2.yaml command
-unchanged — it should now train (the head loss streams in `--ce-chunk 64` ×
-`--head-vocab-chunk 32768` tiles; `--head-vocab-chunk` no longer prints the
-"ignored" note on softcap bases). Sanity: first-step loss should look like a
-healthy SFT start (~2–5), not shift. For the idle-cuda:1 imbalance, either
-drop the cuda:0 budget (e.g. `--use-per-device 5 24` to push tail blocks +
-head onto cuda:1) or wait for the balanced-split item; with the chunked head
-the spike is small enough that all-on-cuda:0 should also fit.
+**Box results (Semancer-12B 4bpw, 2×3090, batch 3 × seq 8192 packed, the
+previously-OOMing malazan config): CONFIRMED WORKING.**
+
+- The run that OOM'd at step 1 now trains. Split came up 47/1 with final norm
+  + head on cuda:1 (the "ignored" softcap note is gone, so the head loss
+  streams in `--ce-chunk 64` × `--head-vocab-chunk 32768` tiles). All health
+  signals per the standard checklist: first loss **3.38** falling smoothly
+  (2.99 by step 6), `|B|` monotonic 0→0.126, steady **457–463 tok/s**,
+  ~53.2 s/step, step split **f 31% / b 69% / o ~1%** (backward-heavy is
+  expected: checkpoint recompute + dequant both live there).
+- **Early grad-norm spikes** (step 1: 11545; steps 3–4: 427/1646; settled to
+  25–54 from step 5 on). Read as the usual B=0-init LoRA transient, clipped by
+  `--max-grad-norm 1.0`, and the loss curve stayed clean — NOT the Session-10
+  liger in_place signature (that one persisted at ~1e16 with healthy loss;
+  this run doesn't use `--use-liger`). Only worth revisiting if spikes recur
+  mid-run.
+- **Dequant profile recorded (the Session-11 A1 datapoint):** 5,000 trellis
+  reconstructions in 50.95 s over 5 steps = **10.19 s/step ≈ 19% of step wall
+  time** on this 48-layer 12B (profiling adds sync overhead, so true share is
+  a bit lower). Implication for audit item A1 (dequant runs ~3× per linear per
+  step): collapsing 3× → 1× would save at most ~2/3 of that ≈ **~13% wall** —
+  real but not the dominant term; backward (69%) is mostly attention/MLP
+  recompute. A1 is worth doing opportunistically, not as the next big rock.
+- **Full run completed and converged** — the user reports this dataset "wasn't
+  converging before"; this run: loss 3.38 → EMA **2.68** (final step 2.36)
+  over 34 steps (2 epochs), grad settled 3–4, `|B|` → 0.377, 398 sup tok/s /
+  456 tot tok/s, peak VRAM **18.32 GB (cuda:0) / 11.88 GB (cuda:1)**, 1832 s.
+  Adapter saved + generation is coherent, in-style long-form RP. (Don't
+  attribute the convergence win to any single change without an ablation —
+  candidates since the last attempt: BFD packing at 98.4% fill, the fused
+  softcap head, batch 3 at 8k now fitting at all.)
+- **Observed at inference: the base's thinking-channel tokens leak** — the
+  trained model's output opened with stray `<|channel|>thought`-style markers
+  before the response. The SFT supervises clean metharme responses, so the
+  base's channel habit survives 2 light epochs. Options if it persists:
+  train with `--prompt-format gemma4-nothink` (#121, added for exactly this
+  base family), more epochs/stronger adapter, or ban the channel tokens at
+  sampling time in the frontend.
+
+**Also this session — liger grad-parity gate built (Session 10 #3; write-
+confirmed, box run pending).** `qlora_validate_native.py --use-liger` now runs
+`check_liger_parity` automatically: two identically-seeded r=8 adapter nets
+over the same frozen base (targets q/gate/up/down so both the Liger RMSNorm
+and SwiGLU backwards are on the path, grad-checkpointing ON to reproduce the
+#119 corruption conditions), one `loss.backward()` each on the same batch,
+then hard-compare the losses (rel < 2e-2) and every adapter grad (per-adapter
+cosine > 0.99, rel err < 0.15 — bf16 reassociation passes; the #119 failure
+mode was ~14 orders of magnitude out). Skips with a message under fp32 (the
+liger path is inactive there). Container-verified: compile + the metric
+thresholds against synthetic noise/blowup/sign-flip cases. Box gate:
+```
+python examples/qlora_validate_native.py --model $GEMMA4 \
+    --compute-dtype bfloat16 --use-liger --parallel split
+```
+Only after this prints `liger parity: PASS` is `--use-liger` trustworthy for
+real runs (and its VRAM number worth recording).
 
 **Still open (unchanged from Session 10):** trainable-head chunked CE with a
 head/LoRA-B gradient (next-work #1's other half, superseding Session 9 #7),
-head-aware balanced autosplit (#2), liger grad-parity gate (#3).
+head-aware balanced autosplit (#2, deprioritized now that the head CE is
+chunked).
 
 ---
 

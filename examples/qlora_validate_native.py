@@ -85,6 +85,106 @@ def check_backward(model, tokenizer, prompt, device, cdt, attn_impl="auto",
     return ok
 
 
+def check_liger_parity(model, tokenizer, prompt, device, cdt, attn_impl="auto"):
+    """
+    The Liger correctness gate (Session 10 #3). The old --use-liger coverage
+    only proved backward *runs* and reaches every device, so a wrong-VALUE
+    gradient -- exactly the in_place=True corruption fixed in #119 -- sailed
+    through with a healthy-looking loss. This builds two identically-seeded
+    adapter nets over the same frozen base (one torch, one Liger), runs one
+    loss.backward() each on the same batch, and requires the losses AND every
+    adapter's gradient to agree within low-precision tolerance. A silent grad
+    corruption now reads FAIL instead of training on a garbage direction.
+    """
+    print("\n" + "-" * 78)
+    print("liger parity: torch vs liger loss/grad on identically-seeded adapters")
+    if cdt == torch.float32:
+        print("  SKIP -- the Liger path is inactive under fp32 (it needs CUDA "
+              "half/bf16); rerun with --compute-dtype bfloat16 to gate it")
+        return True
+
+    def build(use_liger):
+        # Same seed -> identical kaiming init of every lora_a (B starts at 0),
+        # so the two nets are the same function and gradients are comparable.
+        torch.manual_seed(0)
+        net = NativeLlamaQLoRA(
+            model, r=8, alpha=16.0,
+            # gate/up/down exercise the Liger SwiGLU; q_proj sits after the
+            # input RMSNorm so it sees the Liger norm's backward too.
+            target_modules=["q_proj", "gate_proj", "up_proj", "down_proj"],
+            compute_dtype=cdt, gradient_checkpointing=True,
+            attn_impl=attn_impl, use_liger=use_liger)
+        net.train()
+        return net
+
+    net_t = build(False)
+    net_l = build(True)
+    # Sanity: the seeded inits really are identical, else the compare is void.
+    for wt, wl in zip(net_t._wrappers, net_l._wrappers):
+        if wt.r > 0:
+            if not torch.equal(wt.lora_a, wl.lora_a):
+                print("  FAIL -- seeded adapter inits differ; parity compare is void")
+                return False
+            break
+
+    ids = tokenizer.encode(prompt, add_bos=True).to(device)
+
+    def run(net):
+        loss = net.compute_loss(ids, ids.clone())
+        loss.backward()
+        grads = {}
+        for w in net._wrappers:
+            if w.r <= 0:
+                continue
+            # First-step grads: B==0 makes grad_A exactly zero, so lora_b.grad
+            # carries the signal; grab both (a compares as zero-vs-zero).
+            for name, p in (("a", w.lora_a), ("b", w.lora_b)):
+                g = p.grad
+                grads[f"{w.key}.{name}"] = (
+                    None if g is None else g.detach().float().cpu())
+        return loss.item(), grads
+
+    loss_t, g_t = run(net_t)
+    del net_t
+    loss_l, g_l = run(net_l)
+    del net_l
+
+    loss_rel = abs(loss_t - loss_l) / max(abs(loss_t), 1e-9)
+    ok = loss_rel < 2e-2
+    worst_cos, worst_cos_key = 1.0, ""
+    worst_rel, worst_rel_key = 0.0, ""
+    n_cmp = 0
+    for key in g_t:
+        gt, gl = g_t[key], g_l[key]
+        if gt is None or gl is None:
+            if gt is not gl:                      # grad on one side only
+                ok = False
+                print(f"  FAIL -- {key}: grad present on only one side")
+            continue
+        nt = gt.norm().item()
+        nl = gl.norm().item()
+        if nt == 0.0 and nl == 0.0:
+            continue                              # e.g. all lora_a at step 1
+        n_cmp += 1
+        cos = torch.cosine_similarity(gt.flatten(), gl.flatten(), dim=0).item()
+        rel = (gt - gl).norm().item() / max(nt, 1e-12)
+        if cos < worst_cos:
+            worst_cos, worst_cos_key = cos, key
+        if rel > worst_rel:
+            worst_rel, worst_rel_key = rel, key
+        # Tolerances sized for bf16 kernel reassociation across a deep stack;
+        # the failure mode being gated (corrupted backward) is orders of
+        # magnitude out, e.g. #119 showed grad ~1e16 against a normal ~1e2.
+        ok &= (cos > 0.99) and (rel < 0.15)
+    print(f"  loss: torch {loss_t:.6f} vs liger {loss_l:.6f}  (rel {loss_rel:.2e})")
+    print(f"  {n_cmp} adapter grads compared")
+    print(f"  worst cosine : {worst_cos:.6f}  ({worst_cos_key})")
+    print(f"  worst rel err: {worst_rel:.2e}  ({worst_rel_key})")
+    print("  liger parity:", "PASS" if ok else
+          "FAIL -- liger backward diverges from torch; do NOT train with --use-liger")
+    return ok
+
+
 def check_packing(net, tokenizer, prompts, device):
     """
     Prove sample packing isolates documents: the logits for each document inside a
@@ -193,8 +293,9 @@ def main():
                          "--compute-dtype bfloat16 to exercise/validate the flash path.")
     ap.add_argument("--use-liger", action="store_true",
                     help="Validate the Liger RMSNorm/SwiGLU path (needs liger-kernel + "
-                         "--compute-dtype bfloat16/float16; ignored under fp32). Run "
-                         "this to confirm Liger parity before a --use-liger training run.")
+                         "--compute-dtype bfloat16/float16; ignored under fp32). Runs "
+                         "the torch-vs-liger loss/grad parity gate automatically -- "
+                         "REQUIRED green before any --use-liger training run.")
     ap.add_argument("--prompts", nargs="*", default=None)
     ap.add_argument("--check-backward", action="store_true",
                     help="also smoke-test cross-device gradient flow (tiny adapter + backward)")
@@ -301,6 +402,12 @@ def main():
     if args.check_backward:
         all_ok &= check_backward(model, tokenizer, prompts[0], args.device, cdt,
                                  attn_impl=args.attn_impl, use_liger=args.use_liger)
+
+    if args.use_liger:
+        # The grad-parity gate (Session 10 #3): always runs with --use-liger --
+        # a smoke test alone cannot catch a wrong-value gradient (#119).
+        all_ok &= check_liger_parity(model, tokenizer, " ".join(prompts),
+                                     args.device, cdt, attn_impl=args.attn_impl)
 
     if args.check_packing:
         all_ok &= check_packing(net, tokenizer, prompts, args.device)
