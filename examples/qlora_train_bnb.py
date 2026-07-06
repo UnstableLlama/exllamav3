@@ -70,7 +70,7 @@ class ThroughputMeter:  # identical to qlora_train_native.ThroughputMeter
 RUN_LOG_FIELDS = [
     "timestamp", "arm", "status", "model", "arch", "out",
     "dataset", "eval_split", "eval_dataset", "eval2_dataset",
-    "r", "alpha", "lr", "scheduler", "warmup_steps", "weight_decay",
+    "r", "alpha", "use_rslora", "init_lora", "lr", "scheduler", "warmup_steps", "weight_decay",
     "batch", "grad_accum", "world_size", "eff_batch",
     "epochs", "steps_planned", "steps_done", "seq_len",
     "targets", "compute_dtype", "attn_impl", "parallel", "shuffle", "pack", "pack_algo", "ga_loss",

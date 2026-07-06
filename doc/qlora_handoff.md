@@ -1340,8 +1340,9 @@ passes. Confirmed results + the bugs found and fixed while running them:
     Liger training run, not just the gate.)
   - **Liger parity finding:** Liger is a *wash* vs the plain-torch norm/MLP path — same
     bf16 noise band (cos ~0.9998), borderline top-1 flips go both ways (Liger better on
-    one prompt, worse on another). Not more/less accurate; its win is memory+speed,
-    which still needs quantifying on a real-size run (with vs without `--use-liger`).
+    one prompt, worse on another). Not more/less accurate; its win is memory+speed —
+    since quantified at real size (§0c Session 12 addendum: +8.8% tok/s, −1.1 GB/GPU,
+    identical convergence on the 12B malamus config).
 - **C (`--offload-activations`)**: confirmed numerically equivalent; at 1B/seq-2048/
   batch-2 it saved only ~0.07 GB (4.78→4.71) at ~3% slower — small because that config
   is model/optimizer-dominated. The saving scales with seq-len × batch × depth; measure
@@ -1736,10 +1737,186 @@ Interpretation table for the next box run (same command as above):
 **tier1 PASS + tier2 FAIL** → the tier-2 calibration is wrong for this
 config; recalibrate from the printed distribution, don't force it.
 
+**BOX VERDICT: tier1 PASS + tier2 PASS → LIGER CLEARED.** Semancer-12B, bf16,
+split. Tier 1: loss rel **1.67e-6**, 0/192 outside, median cos 1.000000, all
+rel ~4–6e-5 — liger's RMSNorm backward math is **exactly right**; the bf16
+spread (median 0.9976 / worst 0.9818, identical across runs) is pure kernel
+reassociation noise of correct math. The original FAIL was uncalibrated
+thresholds, nothing more. The #119-corruption class and the wrong-formula
+class each now have a tier that catches them. `--use-liger` is trustworthy;
+what remains is measuring whether it's *worth it*: run the malamus config
+with `use_liger: true` and record Δpeak-VRAM and Δtok/s vs the 18.32/11.88 GB
+/ 456 tok/s baseline (liger's win is fused-norm activation memory; with
+activations already offloaded it may be modest — that's the datapoint to
+capture before deciding if it becomes a default).
+
+**LIGER COST/BENEFIT: MEASURED — WORTH TURNING ON.** The A/B run above is
+in: identical malamus config (same seed/shuffle/data/packing; `--use-liger`
+the only delta) vs the Session-12 baseline on Semancer-12B 4bpw, 2×3090,
+batch 3 × seq 8192, `--offload-activations` on both sides:
+- **Throughput: 496 vs 456 tot tok/s (+8.8%)**, 432 vs 398 sup tok/s;
+  ~49.3 vs ~53.2 s/step; **wall 1686 vs 1832 s for 34 steps (−8.0%)**.
+- **Peak VRAM: 17.21/10.78 vs 18.32/11.88 GB — −1.1 GB on *each* GPU**, on
+  top of activation offload.
+- **Convergence run-level identical:** first loss 3.3789 vs 3.38, final EMA
+  **2.6807 vs 2.68**, final-step 2.3663 vs 2.36, `|B|` 0.373 vs 0.377; step
+  split f 31 / b 69 unchanged; dequant profile 9.50 vs 10.19 s/step (~19%
+  share both). Early grad spikes (999/465/3071 at steps 3–5, settled to
+  ~18–20 by step 6, one 216 blip at step 31) are the baseline's B=0-init
+  transient class (it had 11545 at step 1), clipped as usual — not the #119
+  signature (persistent ~1e16).
+
+So the "may be modest" caveat resolved in liger's favor: **set
+`use_liger: true` in the malamus config going forward** (the guard already
+falls back to torch off-CUDA / fp32, and the two-tier gate is there for any
+new base). Note the whole win comes from the **RMSNorm swap alone** — this
+GeGLU base keeps liger's (silu-only) SwiGLU kernel out — which upgrades
+Session 9 #9 (liger GeGLU + 4D per-head q/k/v norm) from "if the win
+justifies it" to *justified; wire when convenient* for another increment of
+the same kind.
+
 **Still open (unchanged from Session 10):** trainable-head chunked CE with a
 head/LoRA-B gradient (next-work #1's other half, superseding Session 9 #7),
 head-aware balanced autosplit (#2, deprioritized now that the head CE is
 chunked).
+
+---
+
+### Session 13 — PEFT-variant strategy (decision record) + PiSSA / qerr SVD inits built
+
+> Container-verified (CPU tests); **nothing here is box-verified yet** — the
+> gates and A/B runs are the next box session. Context: the user's goal is
+> training good RP models for release on HF in **full merged + quantized**
+> formats; tokens/time are limited, so this session picked the highest
+> value-per-effort item from the modern-PEFT menu and built it.
+
+**Decision record — modern PEFT variants (DoRA / PiSSA / EVA / LoRA-GA),
+ordered for THIS pipeline.** A survey report (HF-PEFT-centric) was reviewed;
+the ranking below reweights it for our constraints, which the papers can't
+see: (1) nothing here is a config flag for us — each method is an
+implementation project in the native trainer; (2) the frozen EXL3 trellis
+base **cannot be modified**, so any "residual/compensated base" scheme must
+become adapter-side bookkeeping; (3) the end goal is merged-then-requantized
+models, so adapter-swap ergonomics are irrelevant; (4) our regime is short
+runs on tiny SFT sets — the Session-12 runs' `|B|` was **still climbing
+(0→0.37) at the final step**, i.e. the default zero-init spends a large
+fraction of the whole run getting off the ground. Initialization is
+disproportionately valuable here; per-step reparameterizations are not.
+
+1. **PiSSA (+ the qerr sibling) — BUILT this session, see below.** Cheapest
+   real implementation (SVD of weights we already dequantize everywhere),
+   strongest quantization story, directly attacks the short-run init
+   problem.
+2. **EVA — next, if init proves out.** Broadest paper evidence; activation-SVD
+   init computed from the *quantized* forward (adapts to the model we actually
+   ship). Build the fixed-rank version first (skip rank redistribution — it
+   touches adapter config/save/merge for a secondary effect). Cost: an
+   activation-capture + incremental-SVD pre-pass.
+3. **LoRA-GA — deferred.** Tuned for exactly our fast-convergence problem, but
+   needs `∇_W` of the frozen weights, which `EXL3LoRAFunction` deliberately
+   never computes; would need a per-layer `dY^T X` estimation pass + scale
+   bookkeeping, for a benefit PiSSA/EVA partially capture with less machinery.
+4. **DoRA — last, possibly never.** The only method that changes every
+   training step: per-column norms of `(W0 + BA)` need a cross-term against
+   the dequantized base *per step*, in a backward that is already
+   dequant-bound (~19% of wall). Its edge is at low rank (we run r=64
+   comfortably) and its small-adapter win is void when shipping merged.
+- **rsLoRA:** at a FIXED rank it is literally an alpha rescale
+  (`s = α/√r` vs `α/r`; r=64/α=64 → s=8 vs s=1). Not a project — a
+  hyperparameter. `--use-rslora` (already supported by the module) is now
+  exposed in the trainer; treat it as the tuned-baseline knob in sweeps, per
+  HF's "don't benchmark against untuned vanilla LoRA" warning.
+- **Eval prerequisite (hard, for ALL of the above):** every A/B here is
+  unjudgeable on train loss. The dataset is RP (MMLU is not the metric) —
+  the right harness is the one the trainer already has: the dataset's own
+  held-out split (`--eval2-split test` / `--val-frac`) plus fixed sample
+  prompts, in same-seed A/B pairs exactly like the Session-12/13 liger
+  comparison.
+
+**BUILT: `--init-lora {default,pissa,qerr}` — SVD adapter inits for the
+native trainer** (`exllamav3/training/lora_init.py`; wired through
+`native_llama.py`, the trainer, the validate gate, the YAML launcher).
+
+- **pissa** (Meng et al., NeurIPS'24): adapter starts as the top-r principal
+  component of the dequantized base. The paper retrains against a residual
+  base `W_res = W − principal`; our trellis is immutable, so the residual is
+  realized as a **frozen rank-r offset folded into the frozen-weight
+  closure**: `W_eff = W_q − s·A0B0` served by `DiffLinear._weight_closure()`,
+  adapter initialized to `A0/B0` → the effective delta `s·(AB − A0B0)`
+  starts at exactly 0 (function-preserving). The offset rides the same
+  closure the backward recomputes, so gradients see the residual base too;
+  cost is one rank-r matmul per reconstruction (noise next to the trellis
+  dequant, which `--profile-dequant` still times). Use α=r with pissa
+  (s=1, the canonical setting).
+- **qerr** (the LoftQ idea, single-shot): adapter starts as the top-r SVD of
+  the **quantization error** `E = W_orig − dequant(W_q)`, i.e. step 0 is the
+  closest rank-r repair of the ORIGINAL bf16 model. No offset, no
+  bookkeeping — the nonzero start is the point. Needs `--init-ref-model`
+  (the original HF dir; padding regions are explicitly zeroed). The lower
+  the bpw, the bigger E: this is the natural companion of the low-bitrate
+  EXL3 story (2.5–3bpw), and may speak to the Session-3 finding that LoRAs
+  come out attenuated on quantized bases.
+- Both use PiSSA's fast randomized SVD (`--init-svd-niter 16`, 0 = exact) and
+  divide factors by √s so the *scaled* delta equals the SVD component for any
+  α/r/rslora. Embed/head LoRA keeps default init (pissa is ill-defined on the
+  token-indexed embedding; the head isn't trellis-quantized).
+- **Save/export correctness (the HF-release path):** a pissa adapter's true
+  delta is `s·(AB − A0B0)`, so `save_adapter` writes the **converted rank-2r
+  standard LoRA** (`[A | A0]` / `[s·B ; −s·B0]`, exported α′ = r′ = 2r →
+  loader scale 1.0) — correct for ANY consumer (PEFT, `LoRA.from_directory`,
+  merge scripts) — plus a `pissa_init.safetensors` **sidecar** with the exact
+  fp32 A/B/A0/B0. `load_adapter` prefers the sidecar (randomized SVD is not
+  reproducible, so offsets cannot be recomputed on resume; a pissa resume
+  without the sidecar is a hard error). `adapter_config.json` records
+  `init_lora` + `init_lora_r` (the rank that actually trained). qerr saves
+  through the standard path unchanged. `apply_to_native` (live 🎭 samples)
+  pushes the same rank-2r concatenation so generation matches training.
+  Size note: a pissa checkpoint carries the fp32 sidecar + the 2r export —
+  ~2 GB at r=64 on the 12B vs ~340 MB today; mind `--keep-checkpoints`.
+- **Step-0 gate** (`qlora_validate_native.py --init-lora pissa|qerr
+  [--init-ref-model …]`), in the two-tier tradition: pissa must be
+  **function-preserving** vs the base model — fp32 near-exact (loss rel <
+  1e-4, hard FAIL otherwise: offset sign/scale/orientation bugs land here),
+  bf16/fp16 in a loose noise band (2e-2; the cancellation of the large
+  principal component is inherently noisier — calibrate from the first box
+  run if needed). qerr is not function-preserving by design (step 0 ≈ the
+  bf16 model), so it gets a wide sanity bound + printed deltas; its exact
+  factor math is CPU-tested.
+- **Tests** (`tests/test_lora_init.py`, all pass in-container): exact/truncated
+  principal recovery; pissa step-0 function preservation + residual-base math
+  after B moves; qerr reconstructing a synthetic low-rank quantization error
+  through a real temp-dir reference safetensors (incl. α/r scale folding and
+  the padding guard); pissa converted-export delta parity + sidecar resume
+  round-trip (bit-exact fp32, offsets restored); rslora scale. Existing
+  native-llama + qlora-grad CPU suites pass unchanged.
+- Also: `--use-rslora` exposed in the native trainer; YAML launcher + sample
+  config gained `use_rslora` / `init_lora` / `init_svd_niter` /
+  `init_ref_model` (single/split only — the DDP arm is NOT wired, mirroring
+  A/B/C). **Run-log schema grew** (`use_rslora`, `init_lora` — native + BNB
+  field lists kept byte-identical): the first post-pull run moves the
+  existing `qlora_runs.csv` to `.bak` — expected, not data loss.
+
+**Box list for next session (in order):**
+1. **Gates first:** `qlora_validate_native.py --model $SEMANCER --compute-dtype
+   bfloat16 --init-lora pissa` (runs the fp32 function-preservation gate +
+   bf16 band), then `--init-lora qerr --init-ref-model <original HF dir>`.
+   Nothing trains on these inits until both print PASS.
+2. **The A/B/A2 experiment** (the reason this exists): three same-seed malamus
+   runs — `default` vs `pissa` (with α=r) vs `qerr` — **with the eval split
+   enabled** (`--eval2-split test` or `--val-frac`, + `--eval-every`), which
+   is also checklist prereq #1. Watch: held-out loss, the `|B|` ramp (init
+   runs should start with |B| already at working magnitude), early-step loss
+   drop, and init wall time (expect seconds with niter 16). Record captured
+   variance medians the init prints.
+3. If either init wins on held-out loss: it becomes the malamus default, and
+   EVA gets built next session for the same harness. If neither moves the
+   needle at r=64: raise the prior that init matters less at generous rank,
+   and re-test qerr at low bpw where E is large before shelving.
+
+**Still open (carried):** trainable-head chunked CE, head-aware balanced
+autosplit (deprioritized), liger GeGLU + 4D per-head norm wiring (promoted by
+the Session-12/13 liger win), audit item A1 (dequant 3×→1×, the biggest
+remaining perf lever at ~19% of wall).
 
 ---
 

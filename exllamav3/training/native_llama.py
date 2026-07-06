@@ -166,7 +166,8 @@ class DiffLinear(nn.Module):
             self.scale = float(alpha) / float(denom)
             dev = backbone.linear_device(self.linear)
             # B starts at zero so the adapter is a no-op at init (training begins
-            # from the exact base model); A uses the PEFT kaiming init.
+            # from the exact base model); A uses the PEFT kaiming init. An SVD init
+            # (lora_init.apply_init_lora) may overwrite both afterwards.
             self.lora_a = nn.Parameter(torch.empty(self.in_features, r, dtype=torch.float32, device=dev))
             self.lora_b = nn.Parameter(torch.zeros(r, self.out_features, dtype=torch.float32, device=dev))
             nn.init.kaiming_uniform_(self.lora_a, a=5 ** 0.5)
@@ -175,9 +176,43 @@ class DiffLinear(nn.Module):
             self.register_parameter("lora_a", None)
             self.register_parameter("lora_b", None)
 
+        # Frozen PiSSA offset (see lora_init): when set, the frozen weight is
+        # served as W_q - scale·(a0@b0), realizing the PiSSA residual base
+        # without touching the trellis. Not persisted in state_dict -- the
+        # adapter save/load path round-trips it via pissa_init.safetensors.
+        self.register_buffer("init_a0", None, persistent=False)
+        self.register_buffer("init_b0", None, persistent=False)
+
         # The wrapped native Linear (an exllamav3 ABC Module, not an nn.Module)
         # holds its weights as plain tensors / buffers, never nn.Parameters, so
         # there is nothing to freeze: no gradient can ever reach the base.
+
+    @torch.no_grad()
+    def set_init_offset(self, a0: torch.Tensor, b0: torch.Tensor) -> None:
+        """Install the frozen PiSSA offset factors (fp32, adapter shapes)."""
+        assert self.r > 0
+        dev = backbone.linear_device(self.linear)
+        assert a0.shape == self.lora_a.shape and b0.shape == self.lora_b.shape
+        self.init_a0 = a0.detach().to(dev, torch.float32).contiguous()
+        self.init_b0 = b0.detach().to(dev, torch.float32).contiguous()
+
+    def _weight_closure(self):
+        wfn = backbone.frozen_weight_closure(self.linear, self.compute_dtype)
+        if self.init_a0 is None:
+            return wfn
+        # PiSSA residual base: subtract the frozen principal component on every
+        # reconstruction (forward AND the backward recompute -- the closure is
+        # what EXL3LoRAFunction re-invokes, so grads see the residual too). The
+        # product runs in the compute dtype: the result is stored at that
+        # precision regardless, and the rank-r matmul is noise next to the
+        # trellis dequant inside wfn (which --profile-dequant still times).
+        a0, b0, s = self.init_a0, self.init_b0, self.scale
+
+        def residual_fn():
+            w = wfn()
+            return w - s * (a0.to(w.dtype) @ b0.to(w.dtype))
+
+        return residual_fn
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         xc = x.to(self.compute_dtype)
@@ -185,12 +220,13 @@ class DiffLinear(nn.Module):
             xc, self.lora_a, self.lora_b,
             backbone.frozen_bias(self.linear, self.compute_dtype),
             self.scale,
-            backbone.frozen_weight_closure(self.linear, self.compute_dtype),
+            self._weight_closure(),
         )
 
     def extra_repr(self) -> str:
         return (f"key={self.key}, in={self.in_features}, out={self.out_features}, "
-                f"r={self.r}, compute_dtype={self.compute_dtype}")
+                f"r={self.r}, compute_dtype={self.compute_dtype}"
+                f"{', pissa_offset' if self.init_a0 is not None else ''}")
 
 
 class NativeLlamaQLoRA(nn.Module):
@@ -225,6 +261,7 @@ class NativeLlamaQLoRA(nn.Module):
     # it from nn.Module's __getattr__, so those are read via getattr() in the accessor.
     use_liger = False
     offload_activations = False
+    init_lora = "default"
 
     def __init__(
         self,
@@ -1081,6 +1118,21 @@ class NativeLlamaQLoRA(nn.Module):
 
     # --- adapter parameters / IO ------------------------------------------
 
+    @torch.no_grad()
+    def apply_init_lora(self, mode: str, ref_model_dir: Optional[str] = None,
+                        svd_niter: int = 16, verbose: bool = True) -> None:
+        """
+        Replace the default (kaiming/zeros) adapter init with an SVD-based one:
+        ``"pissa"`` (principal components of the frozen base, trained against a
+        frozen-offset residual) or ``"qerr"`` (top-r of the quantization error
+        vs the original model at ``ref_model_dir``). See ``training.lora_init``.
+        Call after construction and BEFORE ``load_adapter`` -- a resume restores
+        the exact saved tensors (including pissa offsets) over this.
+        """
+        from .lora_init import apply_init_lora as _apply
+        _apply(self, mode, ref_model_dir=ref_model_dir,
+               svd_niter=svd_niter, verbose=verbose)
+
     def lora_parameters(self) -> list[nn.Parameter]:
         ps: list[nn.Parameter] = []
         for w in self._wrappers:
@@ -1143,9 +1195,15 @@ class NativeLlamaQLoRA(nn.Module):
         for w in self._wrappers:
             if w.r <= 0:
                 continue
-            a = w.lora_a.detach().to(torch.float16)
-            b = (w.lora_b.detach() * (w.scale * scaling)).to(torch.float16)
-            backbone.set_runtime_lora(w.linear, self, a, b)
+            a = w.lora_a.detach()
+            b = w.lora_b.detach() * (w.scale * scaling)
+            if w.init_a0 is not None:
+                # PiSSA: the effective delta is s·(AB - A0B0); the runtime slot
+                # gets the rank-2r concatenation so generation matches training.
+                a = torch.cat([a, w.init_a0], dim=1)
+                b = torch.cat([b, w.init_b0 * (-w.scale * scaling)], dim=0)
+            backbone.set_runtime_lora(w.linear, self, a.to(torch.float16),
+                                      b.to(torch.float16))
 
     @torch.no_grad()
     def remove_from_native(self) -> None:
@@ -1169,7 +1227,20 @@ class NativeLlamaQLoRA(nn.Module):
         from safetensors.torch import save_file
         os.makedirs(directory, exist_ok=True)
 
+        # PiSSA (init_lora="pissa") trains against a frozen-offset residual base;
+        # its true delta is s·(AB - A0B0). Exported adapters must be correct for
+        # ANY consumer (PEFT, LoRA.from_directory, merge scripts), so the main
+        # adapter_model.safetensors gets the rank-2r standard-LoRA conversion
+        # [A | A0] / [s·B ; -s·B0] with alpha'=2r (loader scale 1.0), and the
+        # exact fp32 training state (A/B/A0/B0) goes to a pissa_init.safetensors
+        # sidecar that load_adapter prefers on resume.
+        offsets = [w.init_a0 is not None for w in self._wrappers if w.r > 0]
+        has_offset = any(offsets)
+        assert not has_offset or all(offsets), \
+            "mixed pissa/non-pissa wrappers can't share one adapter export"
+
         state: dict[str, torch.Tensor] = {}
+        sidecar: dict[str, torch.Tensor] = {}
         target_leaves: set[str] = set()
         r = alpha = None
         use_rslora = self.use_rslora
@@ -1179,15 +1250,32 @@ class NativeLlamaQLoRA(nn.Module):
             r, alpha = w.r, w.lora_alpha
             target_leaves.add(w.key.split(".")[-1])
             key = f"base_model.model.{w.key}"
-            state[f"{key}.lora_A.weight"] = w.lora_a.detach().t().contiguous().to(torch.float16).cpu()
-            state[f"{key}.lora_B.weight"] = w.lora_b.detach().t().contiguous().to(torch.float16).cpu()
+            if has_offset:
+                a = torch.cat([w.lora_a.detach(), w.init_a0], dim=1)        # [in, 2r]
+                b = torch.cat([w.lora_b.detach() * w.scale,
+                               w.init_b0 * (-w.scale)], dim=0)              # [2r, out]
+                sidecar[f"{w.key}.lora_a"] = w.lora_a.detach().float().cpu()
+                sidecar[f"{w.key}.lora_b"] = w.lora_b.detach().float().cpu()
+                sidecar[f"{w.key}.init_a0"] = w.init_a0.float().cpu()
+                sidecar[f"{w.key}.init_b0"] = w.init_b0.float().cpu()
+            else:
+                a = w.lora_a.detach()
+                b = w.lora_b.detach()
+            state[f"{key}.lora_A.weight"] = a.t().contiguous().to(torch.float16).cpu()
+            state[f"{key}.lora_B.weight"] = b.t().contiguous().to(torch.float16).cpu()
 
         if r is None:
             # No per-linear LoRA (e.g. only --lora-embed/--lora-head requested); the
             # saved config still needs a rank/alpha -- use the configured ones.
             r, alpha = self.r, self.lora_alpha
+        init_lora_r = r
+        if has_offset:
+            # The exported tensors are rank 2r with the scale folded in.
+            r, alpha, use_rslora = 2 * r, float(2 * r), False
         if state:
             save_file(state, os.path.join(directory, "adapter_model.safetensors"))
+        if sidecar:
+            save_file(sidecar, os.path.join(directory, "pissa_init.safetensors"))
 
         # Fully-trained embed/head (PEFT modules_to_save). Kept in a SEPARATE file
         # so the LoRA loader (which expects only lora_A/lora_B) is undisturbed;
@@ -1242,6 +1330,11 @@ class NativeLlamaQLoRA(nn.Module):
             "lora_head": self.lora_head,
             "tie_word_embeddings": self.tie_word_embeddings,
             "base_model_name_or_path": base_model_name_or_path,
+            # Provenance: how the adapter was initialized. For pissa the
+            # exported r/alpha above describe the CONVERTED rank-2r tensors;
+            # init_lora_r is the rank that actually trained.
+            "init_lora": getattr(self, "init_lora", "default"),
+            "init_lora_r": init_lora_r,
         }
         with open(os.path.join(directory, "adapter_config.json"), "w", encoding="utf8") as f:
             json.dump(config, f, indent=2)
@@ -1263,34 +1356,77 @@ class NativeLlamaQLoRA(nn.Module):
         number of wrappers loaded.
         """
         from safetensors.torch import load_file
-        path = os.path.join(directory, "adapter_model.safetensors")
-        # adapter_model.safetensors holds the per-linear LoRA; it may be absent for a
-        # checkpoint that only trained the embed/head (--lora-embed/--lora-head or
-        # --train-embeddings/--train-head). The per-linear loop below still raises if
-        # this model HAS per-linear targets but the file/tensors are missing.
-        state = load_file(path) if os.path.exists(path) else {}
 
+        # A pissa checkpoint's adapter_model.safetensors holds the CONVERTED
+        # rank-2r export (correct for external consumers, wrong shapes for
+        # resume); the exact fp32 training state lives in the sidecar. Restore
+        # from it when present -- including the frozen offsets, which cannot be
+        # recomputed (randomized SVD is not deterministic across runs).
+        sidecar_path = os.path.join(directory, "pissa_init.safetensors")
         loaded = 0
-        for w in self._wrappers:
-            if w.r <= 0:
-                continue
-            key = f"base_model.model.{w.key}"
-            ak, bk = f"{key}.lora_A.weight", f"{key}.lora_B.weight"
-            if ak not in state or bk not in state:
-                raise KeyError(f"checkpoint missing tensors for {w.key} ({ak})")
-            a = state[ak].t()  # [r, in] -> [in, r]
-            b = state[bk].t()  # [out, r] -> [r, out]
-            if a.shape != w.lora_a.shape or b.shape != w.lora_b.shape:
-                raise ValueError(
-                    f"adapter shape mismatch for {w.key}: checkpoint "
-                    f"a{tuple(a.shape)}/b{tuple(b.shape)} vs model "
-                    f"a{tuple(w.lora_a.shape)}/b{tuple(w.lora_b.shape)} "
-                    f"-- do --r/--targets match the checkpoint?"
-                )
+        if os.path.exists(sidecar_path):
+            sc = load_file(sidecar_path)
             with torch.no_grad():
-                w.lora_a.copy_(a.to(w.lora_a.dtype).to(w.lora_a.device))
-                w.lora_b.copy_(b.to(w.lora_b.dtype).to(w.lora_b.device))
-            loaded += 1
+                for w in self._wrappers:
+                    if w.r <= 0:
+                        continue
+                    try:
+                        a = sc[f"{w.key}.lora_a"]
+                        b = sc[f"{w.key}.lora_b"]
+                        a0 = sc[f"{w.key}.init_a0"]
+                        b0 = sc[f"{w.key}.init_b0"]
+                    except KeyError as e:
+                        raise KeyError(f"pissa checkpoint missing tensors for "
+                                       f"{w.key}") from e
+                    if a.shape != w.lora_a.shape or b.shape != w.lora_b.shape:
+                        raise ValueError(
+                            f"pissa adapter shape mismatch for {w.key}: "
+                            f"checkpoint a{tuple(a.shape)}/b{tuple(b.shape)} vs "
+                            f"model a{tuple(w.lora_a.shape)}/"
+                            f"b{tuple(w.lora_b.shape)} -- do --r/--targets "
+                            f"match the checkpoint?")
+                    w.lora_a.copy_(a.to(w.lora_a.dtype).to(w.lora_a.device))
+                    w.lora_b.copy_(b.to(w.lora_b.dtype).to(w.lora_b.device))
+                    w.set_init_offset(a0, b0)
+                    loaded += 1
+            self.init_lora = "pissa"
+            print(f" -- resumed {loaded} pissa adapters (+frozen offsets) from "
+                  f"{directory}")
+        elif getattr(self, "init_lora", "default") == "pissa":
+            raise SystemExit(
+                f"resuming a pissa run but {directory} has no "
+                f"pissa_init.safetensors -- the frozen offsets cannot be "
+                f"recovered from the converted adapter. Was this checkpoint "
+                f"written by an --init-lora pissa run?")
+        else:
+            path = os.path.join(directory, "adapter_model.safetensors")
+            # adapter_model.safetensors holds the per-linear LoRA; it may be absent
+            # for a checkpoint that only trained the embed/head (--lora-embed/
+            # --lora-head or --train-embeddings/--train-head). The per-linear loop
+            # below still raises if this model HAS per-linear targets but the
+            # file/tensors are missing.
+            state = load_file(path) if os.path.exists(path) else {}
+
+            for w in self._wrappers:
+                if w.r <= 0:
+                    continue
+                key = f"base_model.model.{w.key}"
+                ak, bk = f"{key}.lora_A.weight", f"{key}.lora_B.weight"
+                if ak not in state or bk not in state:
+                    raise KeyError(f"checkpoint missing tensors for {w.key} ({ak})")
+                a = state[ak].t()  # [r, in] -> [in, r]
+                b = state[bk].t()  # [out, r] -> [r, out]
+                if a.shape != w.lora_a.shape or b.shape != w.lora_b.shape:
+                    raise ValueError(
+                        f"adapter shape mismatch for {w.key}: checkpoint "
+                        f"a{tuple(a.shape)}/b{tuple(b.shape)} vs model "
+                        f"a{tuple(w.lora_a.shape)}/b{tuple(w.lora_b.shape)} "
+                        f"-- do --r/--targets match the checkpoint?"
+                    )
+                with torch.no_grad():
+                    w.lora_a.copy_(a.to(w.lora_a.dtype).to(w.lora_a.device))
+                    w.lora_b.copy_(b.to(w.lora_b.dtype).to(w.lora_b.device))
+                loaded += 1
 
         # Restore fully-trained embed/head if present and currently enabled.
         restored_extra = 0

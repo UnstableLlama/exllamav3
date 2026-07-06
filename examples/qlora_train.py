@@ -57,6 +57,7 @@ SINGLE_ONLY_KEYS = {
     "device", "parallel", "reserve_per_device", "use_per_device", "optim",
     "inspect", "lora_embed", "lora_head", "offload_embed_head_optim",
     "offload_activations", "use_liger", "sample_every", "sample_prompt",
+    "use_rslora", "init_lora", "init_svd_niter", "init_ref_model",
 }
 DDP_ONLY_KEYS = set()
 ALIASES = {"lora_r": "r"}  # DDP backend spells this --lora-r; config uses r.
@@ -74,6 +75,10 @@ SINGLE_ONLY_DEFAULTS = {
     "use_liger": False,
     "sample_every": 25,
     "sample_prompt": "Tell me about your day.",
+    "use_rslora": False,
+    "init_lora": "default",
+    "init_svd_niter": 16,
+    "init_ref_model": None,
 }
 
 
