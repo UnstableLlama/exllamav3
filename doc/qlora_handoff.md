@@ -1675,9 +1675,28 @@ previously-OOMing malazan config): CONFIRMED WORKING.**
   base family), more epochs/stronger adapter, or ban the channel tokens at
   sampling time in the frontend.
 
+**Also this session — liger grad-parity gate built (Session 10 #3; write-
+confirmed, box run pending).** `qlora_validate_native.py --use-liger` now runs
+`check_liger_parity` automatically: two identically-seeded r=8 adapter nets
+over the same frozen base (targets q/gate/up/down so both the Liger RMSNorm
+and SwiGLU backwards are on the path, grad-checkpointing ON to reproduce the
+#119 corruption conditions), one `loss.backward()` each on the same batch,
+then hard-compare the losses (rel < 2e-2) and every adapter grad (per-adapter
+cosine > 0.99, rel err < 0.15 — bf16 reassociation passes; the #119 failure
+mode was ~14 orders of magnitude out). Skips with a message under fp32 (the
+liger path is inactive there). Container-verified: compile + the metric
+thresholds against synthetic noise/blowup/sign-flip cases. Box gate:
+```
+python examples/qlora_validate_native.py --model $GEMMA4 \
+    --compute-dtype bfloat16 --use-liger --parallel split
+```
+Only after this prints `liger parity: PASS` is `--use-liger` trustworthy for
+real runs (and its VRAM number worth recording).
+
 **Still open (unchanged from Session 10):** trainable-head chunked CE with a
 head/LoRA-B gradient (next-work #1's other half, superseding Session 9 #7),
-head-aware balanced autosplit (#2), liger grad-parity gate (#3).
+head-aware balanced autosplit (#2, deprioritized now that the head CE is
+chunked).
 
 ---
 
