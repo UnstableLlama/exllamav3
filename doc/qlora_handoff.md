@@ -1736,6 +1736,19 @@ Interpretation table for the next box run (same command as above):
 **tier1 PASS + tier2 FAIL** → the tier-2 calibration is wrong for this
 config; recalibrate from the printed distribution, don't force it.
 
+**BOX VERDICT: tier1 PASS + tier2 PASS → LIGER CLEARED.** Semancer-12B, bf16,
+split. Tier 1: loss rel **1.67e-6**, 0/192 outside, median cos 1.000000, all
+rel ~4–6e-5 — liger's RMSNorm backward math is **exactly right**; the bf16
+spread (median 0.9976 / worst 0.9818, identical across runs) is pure kernel
+reassociation noise of correct math. The original FAIL was uncalibrated
+thresholds, nothing more. The #119-corruption class and the wrong-formula
+class each now have a tier that catches them. `--use-liger` is trustworthy;
+what remains is measuring whether it's *worth it*: run the malamus config
+with `use_liger: true` and record Δpeak-VRAM and Δtok/s vs the 18.32/11.88 GB
+/ 456 tok/s baseline (liger's win is fused-norm activation memory; with
+activations already offloaded it may be modest — that's the datapoint to
+capture before deciding if it becomes a default).
+
 **Still open (unchanged from Session 10):** trainable-head chunked CE with a
 head/LoRA-B gradient (next-work #1's other half, superseding Session 9 #7),
 head-aware balanced autosplit (#2, deprioritized now that the head CE is
