@@ -1659,6 +1659,21 @@ previously-OOMing malazan config): CONFIRMED WORKING.**
   step): collapsing 3× → 1× would save at most ~2/3 of that ≈ **~13% wall** —
   real but not the dominant term; backward (69%) is mostly attention/MLP
   recompute. A1 is worth doing opportunistically, not as the next big rock.
+- **Full run completed and converged** — the user reports this dataset "wasn't
+  converging before"; this run: loss 3.38 → EMA **2.68** (final step 2.36)
+  over 34 steps (2 epochs), grad settled 3–4, `|B|` → 0.377, 398 sup tok/s /
+  456 tot tok/s, peak VRAM **18.32 GB (cuda:0) / 11.88 GB (cuda:1)**, 1832 s.
+  Adapter saved + generation is coherent, in-style long-form RP. (Don't
+  attribute the convergence win to any single change without an ablation —
+  candidates since the last attempt: BFD packing at 98.4% fill, the fused
+  softcap head, batch 3 at 8k now fitting at all.)
+- **Observed at inference: the base's thinking-channel tokens leak** — the
+  trained model's output opened with stray `<|channel|>thought`-style markers
+  before the response. The SFT supervises clean metharme responses, so the
+  base's channel habit survives 2 light epochs. Options if it persists:
+  train with `--prompt-format gemma4-nothink` (#121, added for exactly this
+  base family), more epochs/stronger adapter, or ban the channel tokens at
+  sampling time in the frontend.
 
 **Still open (unchanged from Session 10):** trainable-head chunked CE with a
 head/LoRA-B gradient (next-work #1's other half, superseding Session 9 #7),
