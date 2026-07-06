@@ -480,10 +480,16 @@ class NativeLlamaQLoRA(nn.Module):
             if ops is not None:
                 w = spec["weight"]
                 if w is not None:
-                    # Move the norm weight to x's device too (not just dtype): under
-                    # --parallel split a block's weights and activations share a card,
-                    # but the Triton kernel below launches on the *current* CUDA device.
-                    w = w.to(device=x.device, dtype=x.dtype)
+                    # Move the norm weight to x's device (under --parallel split a
+                    # block's weights and activations share a card, but the Triton
+                    # kernel launches on the *current* CUDA device) -- but keep the
+                    # weight's OWN dtype. casting_mode="gemma" upcasts W to fp32
+                    # inside the kernel, so passing the original (fp16) weight
+                    # reproduces the torch path's w.float() exactly; casting to
+                    # x.dtype first (bf16, 7 mantissa bits vs fp16's 10) rounded
+                    # every norm weight by up to ~0.4% on the liger side only --
+                    # the systematic drift the parity gate measured (Session 12).
+                    w = w.to(device=x.device)
                     # The frozen base weight is an inference tensor (the EXL3 model
                     # loads under @torch.inference_mode), and Liger's autograd Function
                     # saves W for backward -- which forbids inference tensors. When the

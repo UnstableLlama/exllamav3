@@ -151,9 +151,7 @@ def check_liger_parity(model, tokenizer, prompt, device, cdt, attn_impl="auto"):
 
     loss_rel = abs(loss_t - loss_l) / max(abs(loss_t), 1e-9)
     ok = loss_rel < 2e-2
-    worst_cos, worst_cos_key = 1.0, ""
-    worst_rel, worst_rel_key = 0.0, ""
-    n_cmp = 0
+    stats = []                                    # (cos, rel, key)
     for key in g_t:
         gt, gl = g_t[key], g_l[key]
         if gt is None or gl is None:
@@ -165,21 +163,26 @@ def check_liger_parity(model, tokenizer, prompt, device, cdt, attn_impl="auto"):
         nl = gl.norm().item()
         if nt == 0.0 and nl == 0.0:
             continue                              # e.g. all lora_a at step 1
-        n_cmp += 1
         cos = torch.cosine_similarity(gt.flatten(), gl.flatten(), dim=0).item()
         rel = (gt - gl).norm().item() / max(nt, 1e-12)
-        if cos < worst_cos:
-            worst_cos, worst_cos_key = cos, key
-        if rel > worst_rel:
-            worst_rel, worst_rel_key = rel, key
-        # Tolerances sized for bf16 kernel reassociation across a deep stack;
-        # the failure mode being gated (corrupted backward) is orders of
-        # magnitude out, e.g. #119 showed grad ~1e16 against a normal ~1e2.
-        ok &= (cos > 0.99) and (rel < 0.15)
+        stats.append((cos, rel, key))
+    # Tolerances sized for bf16 kernel reassociation across a deep stack; the
+    # failure mode being gated (corrupted backward) is orders of magnitude out,
+    # e.g. #119 showed grad ~1e16 against a normal ~1e2.
+    fails = [(c, r, k) for c, r, k in stats if not (c > 0.99 and r < 0.15)]
+    ok &= not fails
+    by_cos = sorted(stats)
     print(f"  loss: torch {loss_t:.6f} vs liger {loss_l:.6f}  (rel {loss_rel:.2e})")
-    print(f"  {n_cmp} adapter grads compared")
-    print(f"  worst cosine : {worst_cos:.6f}  ({worst_cos_key})")
-    print(f"  worst rel err: {worst_rel:.2e}  ({worst_rel_key})")
+    print(f"  {len(stats)} adapter grads compared, {len(fails)} outside tolerance "
+          f"(cos > 0.99, rel < 0.15)")
+    if by_cos:
+        med = by_cos[len(by_cos) // 2]
+        print(f"  median cosine: {med[0]:.6f}   rel {med[1]:.2e}")
+        # The distribution separates the two failure classes: a wrapper/kernel
+        # numerics gap shows a handful of deep-layer outliers over a tight
+        # median; a corrupted backward blows out most of the list.
+        for c, r, k in by_cos[:5]:
+            print(f"    {c:.6f}  rel {r:.2e}  {k}")
     print("  liger parity:", "PASS" if ok else
           "FAIL -- liger backward diverges from torch; do NOT train with --use-liger")
     return ok
