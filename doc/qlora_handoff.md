@@ -1693,24 +1693,48 @@ python examples/qlora_validate_native.py --model $GEMMA4 \
 Only after this prints `liger parity: PASS` is `--use-liger` trustworthy for
 real runs (and its VRAM number worth recording).
 
-**First box run of the gate: FAIL — and it found a real wrapper bug.** On
-Semancer-12B (bf16, split): loss parity fine (rel 6.4e-3), 192 grads compared,
-worst at **layer 1** `q_proj.b` (cos 0.9818, rel 0.20) — i.e. systematic
-low-precision drift accumulating toward the deepest backward layers, not
-#119-style corruption (that was ~14 orders of magnitude out). Root cause,
-confirmed against liger's kernel source: our `_norm` liger branch cast the
-norm weight `w.to(dtype=x.dtype)` — the base's **fp16** weights rounded to
-**bf16** (7 vs 10 mantissa bits, up to ~0.4%/element) on the liger side only,
-while the torch reference path uses `w.float()` on the original fp16 values.
-`casting_mode="gemma"` upcasts W to fp32 *inside* the kernel and
-`rms_norm_forward` has no X/W dtype-match assert, so the cast was never
-needed. Fixed: device-move only, keep the weight's own dtype. The gate also
-now prints the failure count + median + 5 worst adapters (distribution
-separates "handful of deep-layer outliers over a tight median" = numerics gap
-from "most of the list blown out" = corrupted backward). **Re-run the gate on
-the box after pulling**; if a residual marginal outlier remains at layer 0/1
-it's candidate bf16-reassociation floor — calibrate thresholds from the
-printed distribution, don't guess.
+**First box run of the gate: FAIL** on Semancer-12B (bf16, split): loss
+parity fine (rel 6.4e-3), 192 grads compared, worst at **layer 1** `q_proj.b`
+(cos 0.9818, rel 0.20) — systematic low-precision drift accumulating toward
+the deepest backward layers, not #119-style corruption (that was ~14 orders
+of magnitude out).
+
+**Wrong first hypothesis (kept for the record):** the `_norm` liger branch
+cast the norm weight to the compute dtype (`w.to(dtype=x.dtype)`), which
+would round an **fp16**-normed base to **bf16** on the liger side only (the
+torch path uses `w.float()` on the originals). The cast is indeed pointless —
+`casting_mode="gemma"` upcasts W to fp32 *inside* the kernel, no X/W
+dtype-match assert — and it stays removed (device-move only, dtype kept).
+BUT the re-run produced **bit-identical numbers** (loss 5.685615/5.649086,
+worst 0.981780/0.201), proving the cast was a no-op here: this Gemma-family
+base already stores its norm weights in the compute dtype. Not the cause on
+this model.
+
+**Second run's distribution (diagnostic report):** 3/192 outside (cos>0.99,
+rel<0.15); median cos 0.9976 / rel 7.1e-2; worst five all `q_proj.b` /
+`down_proj.b` at layers 0–4 (plus one at 23). A *shifted distribution* with
+deep-backward-layer outliers, not one broken op. Key scoping fact: on this
+base liger is **RMSNorm only** — Gemma's GeGLU keeps the (silu-only) liger
+SwiGLU kernel out — so the whole spread comes from the RMSNorm substitution.
+
+**Gate rebuilt as two tiers (the decisive experiment — run it next):**
+- **Tier 1 — fp32 math gate** (always runs): the same torch-vs-liger compare
+  at fp32 compute, where the only legitimate difference is kernel
+  reassociation. Bounds: per-adapter cos > 0.9999, rel < 5e-3, loss rel <
+  1e-4. FAIL here = the liger backward **formula** is wrong (or a buffer is
+  corrupted) — no half-precision excuse available. The `_norm`/SwiGLU liger
+  guards now allow fp32 (gemma-mode upcasts are no-ops there) to make this
+  tier possible.
+- **Tier 2 — noise-band gate** (at the training dtype, when half): bounds
+  calibrated to the measured benign spread above (cos > 0.95, rel < 0.35;
+  median printed for eyeballing).
+
+Interpretation table for the next box run (same command as above):
+**tier1 PASS + tier2 PASS** → liger cleared; record its VRAM/tok-s.
+**tier1 FAIL** → real liger/wrapper bug; bisect the RMSNorm call
+(in_place/casting_mode/offset) before any liger use.
+**tier1 PASS + tier2 FAIL** → the tier-2 calibration is wrong for this
+config; recalibrate from the printed distribution, don't force it.
 
 **Still open (unchanged from Session 10):** trainable-head chunked CE with a
 head/LoRA-B gradient (next-work #1's other half, superseding Session 9 #7),

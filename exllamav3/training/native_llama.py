@@ -467,28 +467,30 @@ class NativeLlamaQLoRA(nn.Module):
         # stream stays in compute_dtype rather than being silently upcast to fp32.
         # Mirrors HF RMSNorm (fp32 internals, cast back to the activation dtype).
         #
-        # Liger fast path (opt-in, CUDA + fp16/bf16): the fused RMSNorm kernel with
-        # in-place backward cuts activation memory. Only for the 2D/3D norms (attn/mlp/
+        # Liger fast path (opt-in, CUDA): the fused RMSNorm kernel with fused
+        # backward cuts activation memory. Only for the 2D/3D norms (attn/mlp/
         # post/final) -- the 4D per-head q/k/v norm falls through to torch. Requires
         # constant_scale == 1.0 (Liger has no scale param). casting_mode="gemma" =
         # full-fp32 normalize, matching this module's fp32-internal numerics for every
-        # arch; offset = constant_bias reproduces Gemma's (1 + weight).
+        # arch; offset = constant_bias reproduces Gemma's (1 + weight). fp32 is
+        # allowed (the gemma-mode upcasts are no-ops there): pointless for VRAM but
+        # required by the parity gate's fp32 math tier, which separates wrong-math
+        # from half-precision reassociation noise.
         if (self.use_liger and x.is_cuda and x.dim() in (2, 3)
                 and spec["scale"] == 1.0
-                and self.compute_dtype in (torch.float16, torch.bfloat16)):
+                and self.compute_dtype in (torch.float16, torch.bfloat16,
+                                           torch.float32)):
             ops = _liger_ops()
             if ops is not None:
                 w = spec["weight"]
                 if w is not None:
                     # Move the norm weight to x's device (under --parallel split a
                     # block's weights and activations share a card, but the Triton
-                    # kernel launches on the *current* CUDA device) -- but keep the
-                    # weight's OWN dtype. casting_mode="gemma" upcasts W to fp32
-                    # inside the kernel, so passing the original (fp16) weight
-                    # reproduces the torch path's w.float() exactly; casting to
-                    # x.dtype first (bf16, 7 mantissa bits vs fp16's 10) rounded
-                    # every norm weight by up to ~0.4% on the liger side only --
-                    # the systematic drift the parity gate measured (Session 12).
+                    # kernel launches on the *current* CUDA device), keeping the
+                    # weight's OWN dtype: casting_mode="gemma" upcasts W to fp32
+                    # inside the kernel, so the storage dtype reproduces the torch
+                    # path's w.float() exactly for any base (a cast to x.dtype
+                    # would round fp16-normed bases when compute is bf16).
                     w = w.to(device=x.device)
                     # The frozen base weight is an inference tensor (the EXL3 model
                     # loads under @torch.inference_mode), and Liger's autograd Function
@@ -727,10 +729,12 @@ class NativeLlamaQLoRA(nn.Module):
         normed2 = self._norm(hidden, entry.mlp_norm_spec)
         is_silu = meta["activation"] == "silu"
         act = F.silu if is_silu else (lambda z: F.gelu(z, approximate="tanh"))
-        # Liger fused SiLU*mul (CUDA + fp16/bf16, silu only -- GeGLU stays torch):
-        # fuses the activation+multiply into one kernel, saving an intermediate.
+        # Liger fused SiLU*mul (CUDA, silu only -- GeGLU stays torch): fuses the
+        # activation+multiply into one kernel, saving an intermediate. fp32 is
+        # allowed for the parity gate's math tier (see _norm).
         liger_silu = (self.use_liger and is_silu and normed2.is_cuda
-                      and self.compute_dtype in (torch.float16, torch.bfloat16))
+                      and self.compute_dtype in (torch.float16, torch.bfloat16,
+                                                 torch.float32))
         liger_ops = _liger_ops() if liger_silu else None
         mlp_out = None
         for gate, up, down in zip(entry.gates, entry.ups, entry.downs):
