@@ -213,6 +213,82 @@ def check_liger_parity(model, tokenizer, prompt, device, cdt, attn_impl="auto"):
     return all_ok
 
 
+def check_init_lora(model, tokenizer, prompt, device, cdt, mode,
+                    ref_model_dir=None, svd_niter=16, attn_impl="auto"):
+    """
+    Step-0 gate for the SVD adapter inits (--init-lora pissa/qerr): before any
+    training run trusts them, verify the model they produce at step 0 is the
+    one the math promises. The whole class of bookkeeping bugs (offset sign,
+    scale folding, orientation, padding) shows up here as a hard FAIL instead
+    of a mysteriously worse training run.
+
+    pissa: function-preserving by construction -- the trainable adapter starts
+    equal to the frozen offset, so the step-0 loss must match the base model's.
+    Gated near-exactly at fp32 compute (tier-1 style: only reassociation of
+    the subtract-then-add-back may differ); at a half training dtype the
+    cancellation of the large principal component is inherently noisier, so
+    that tier gets a loose calibrated bound and a printed delta.
+
+    qerr: NOT function-preserving by design -- step 0 is the closest rank-r
+    repair of the ORIGINAL (unquantized) model, so the loss should move a
+    little, typically toward the bf16 model's. Reported with a wide sanity
+    bound only; the exact factor math is covered by the CPU unit tests
+    (tests/test_lora_init.py).
+    """
+    print("\n" + "-" * 78)
+    print(f"init-lora gate ({mode}): step-0 model vs frozen base")
+
+    ids = tokenizer.encode(prompt, add_bos=True).to(device)
+
+    def loss_of(dtype, with_init):
+        torch.manual_seed(0)
+        net = NativeLlamaQLoRA(
+            model, r=8, alpha=8.0,
+            target_modules=["q_proj", "v_proj", "down_proj"],
+            compute_dtype=dtype, gradient_checkpointing=True,
+            attn_impl=attn_impl)
+        net.train()
+        if with_init:
+            net.apply_init_lora(mode, ref_model_dir=ref_model_dir,
+                                svd_niter=svd_niter)
+        with torch.no_grad():
+            loss = net.compute_loss(ids, ids.clone()).item()
+        del net
+        return loss
+
+    def tier(label, dtype, rel_bound, hard):
+        base = loss_of(dtype, False)       # B=0 default init == exact base model
+        init = loss_of(dtype, True)
+        rel = abs(init - base) / max(abs(base), 1e-9)
+        ok = rel < rel_bound
+        print(f"  [{label}] base loss {base:.6f} vs {mode}-init {init:.6f}  "
+              f"(rel {rel:.2e}, bound {rel_bound:.0e})"
+              f"{'' if hard else '  [informational]'}")
+        print(f"    {label}:", "PASS" if ok else
+              ("FAIL" if hard else "OUTSIDE BOUND (informational)"))
+        return ok if hard else True
+
+    if mode == "pissa":
+        # fp32: the offset must cancel the init adapter near-exactly.
+        all_ok = tier("fp32 function-preservation gate", torch.float32,
+                      rel_bound=1e-4, hard=True)
+        if cdt in (torch.float16, torch.bfloat16):
+            all_ok &= tier(f"{str(cdt).split('.')[-1]} noise band", cdt,
+                           rel_bound=2e-2, hard=True)
+    else:  # qerr
+        # The shift toward the bf16 model is expected and small; a blown
+        # scale/orientation shows up as a loss excursion orders bigger.
+        all_ok = tier("fp32 step-0 sanity", torch.float32,
+                      rel_bound=0.5, hard=True)
+        if cdt in (torch.float16, torch.bfloat16):
+            all_ok &= tier(f"{str(cdt).split('.')[-1]} step-0 sanity", cdt,
+                           rel_bound=0.5, hard=False)
+
+    print(f"  init-lora {mode} gate:", "PASS" if all_ok else
+          f"FAIL -- do NOT train with --init-lora {mode}")
+    return all_ok
+
+
 def check_packing(net, tokenizer, prompts, device):
     """
     Prove sample packing isolates documents: the logits for each document inside a
@@ -326,6 +402,16 @@ def main():
                          "wrong) plus, under --compute-dtype bfloat16/float16, a "
                          "noise-band gate at the training dtype. REQUIRED green "
                          "before any --use-liger training run.")
+    ap.add_argument("--init-lora", choices=["pissa", "qerr"], default=None,
+                    help="Run the step-0 gate for an SVD adapter init: pissa "
+                         "must be function-preserving vs the base model "
+                         "(fp32 near-exact), qerr must land within a sane "
+                         "step-0 loss shift. REQUIRED green before any "
+                         "--init-lora training run.")
+    ap.add_argument("--init-ref-model", default=None,
+                    help="Original (unquantized) HF model dir for --init-lora qerr.")
+    ap.add_argument("--init-svd-niter", type=int, default=16,
+                    help="Randomized-SVD iterations for the init gate (0 = exact SVD).")
     ap.add_argument("--prompts", nargs="*", default=None)
     ap.add_argument("--check-backward", action="store_true",
                     help="also smoke-test cross-device gradient flow (tiny adapter + backward)")
@@ -438,6 +524,13 @@ def main():
         # a smoke test alone cannot catch a wrong-value gradient (#119).
         all_ok &= check_liger_parity(model, tokenizer, " ".join(prompts),
                                      args.device, cdt, attn_impl=args.attn_impl)
+
+    if args.init_lora:
+        all_ok &= check_init_lora(model, tokenizer, " ".join(prompts),
+                                  args.device, cdt, args.init_lora,
+                                  ref_model_dir=args.init_ref_model,
+                                  svd_niter=args.init_svd_niter,
+                                  attn_impl=args.attn_impl)
 
     if args.check_packing:
         all_ok &= check_packing(net, tokenizer, prompts, args.device)

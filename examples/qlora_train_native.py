@@ -160,7 +160,7 @@ class StepTimer:
 RUN_LOG_FIELDS = [
     "timestamp", "arm", "status", "model", "arch", "out",
     "dataset", "eval_split", "eval_dataset", "eval2_dataset",
-    "r", "alpha", "lr", "scheduler", "warmup_steps", "weight_decay",
+    "r", "alpha", "use_rslora", "init_lora", "lr", "scheduler", "warmup_steps", "weight_decay",
     "batch", "grad_accum", "world_size", "eff_batch",
     "epochs", "steps_planned", "steps_done", "seq_len",
     "targets", "compute_dtype", "attn_impl", "parallel", "shuffle", "pack", "pack_algo", "ga_loss",
@@ -979,6 +979,30 @@ def _run_main():
                     help="(split) GB budget per device; caps a card to force/tune the split")
     ap.add_argument("--r", type=int, default=32)
     ap.add_argument("--alpha", type=float, default=64.0)
+    ap.add_argument("--use-rslora", action="store_true",
+                    help="Rank-stabilized LoRA scaling: scale = alpha/sqrt(r) "
+                         "instead of alpha/r. At a FIXED rank this is just an "
+                         "alpha rescale (r=64: alpha/8 -> same scale), but it "
+                         "keeps the effective scale stable across rank sweeps.")
+    ap.add_argument("--init-lora", choices=["default", "pissa", "qerr"],
+                    default="default",
+                    help="Adapter initialization. default: kaiming A / zero B. "
+                         "pissa: top-r principal components of the frozen base "
+                         "(trained against a frozen-offset residual; adapter "
+                         "exports as a converted rank-2r standard LoRA). "
+                         "qerr: top-r SVD of the quantization error vs the "
+                         "ORIGINAL model (needs --init-ref-model); training "
+                         "starts from the closest rank-r repair of the bf16 "
+                         "model. Both need a validated step-0 gate: run "
+                         "qlora_validate_native.py --init-lora first.")
+    ap.add_argument("--init-svd-niter", type=int, default=16,
+                    help="Randomized-SVD subspace iterations for --init-lora "
+                         "(PiSSA's fast-SVD recipe; 0 = exact full SVD, much "
+                         "slower). Default 16.")
+    ap.add_argument("--init-ref-model", default=None,
+                    help="Path to the ORIGINAL (unquantized) HF model dir; "
+                         "required by --init-lora qerr to form the "
+                         "quantization error.")
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--weight-decay", type=float, default=0.01,
                     help="AdamW weight decay on the LoRA params (default 0.01).")
@@ -1256,7 +1280,9 @@ def _run_main():
         "dataset": args.dataset, "eval_split": args.eval_split or "",
         "eval_dataset": args.eval_dataset or "",
         "eval2_dataset": args.eval2_dataset or "",
-        "r": args.r, "alpha": args.alpha, "lr": args.lr,
+        "r": args.r, "alpha": args.alpha,
+        "use_rslora": int(bool(args.use_rslora)), "init_lora": args.init_lora,
+        "lr": args.lr,
         "scheduler": args.scheduler, "weight_decay": args.weight_decay,
         "batch": args.batch, "grad_accum": args.grad_accum, "world_size": 1,
         "eff_batch": args.batch * args.grad_accum, "epochs": args.epochs,
@@ -1323,6 +1349,7 @@ def _run_main():
     _FAIL_CTX["record"]["arch"] = getattr(config, "architecture", "")
     net = NativeLlamaQLoRA(
         model, r=args.r, alpha=args.alpha, target_modules=args.targets,
+        use_rslora=args.use_rslora,
         compute_dtype=cdt, gradient_checkpointing=not args.no_grad_ckpt,
         train_embeddings=args.train_embeddings, train_head=args.train_head,
         attn_impl=args.attn_impl, head_vocab_chunk=args.head_vocab_chunk,
@@ -1334,6 +1361,13 @@ def _run_main():
     if args.head_vocab_chunk and net._head_slice is None:
         print(" -- note: --head-vocab-chunk set but this head can't slice; using "
               "the single-shot fused head.")
+    if args.init_lora != "default":
+        # SVD init from the loaded weights. On resume this is recomputed and then
+        # OVERWRITTEN by load_adapter below (pissa restores its exact offsets from
+        # the checkpoint sidecar) -- a few wasted seconds, kept for simplicity.
+        _FAIL_CTX["phase"] = "init_lora"
+        net.apply_init_lora(args.init_lora, ref_model_dir=args.init_ref_model,
+                            svd_niter=args.init_svd_niter)
     if args.resume:
         net.load_adapter(args.resume)
     ms = [n for n, p in [("embed", net.embed_weight), ("head", net.head_weight)] if p is not None]
@@ -1636,7 +1670,9 @@ def _run_main():
             "out": args.out, "dataset": args.dataset,
             "eval_split": args.eval_split or "", "eval_dataset": args.eval_dataset or "",
             "eval2_dataset": args.eval2_dataset or "",
-            "r": args.r, "alpha": args.alpha, "lr": args.lr,
+            "r": args.r, "alpha": args.alpha,
+            "use_rslora": int(bool(args.use_rslora)), "init_lora": args.init_lora,
+            "lr": args.lr,
             "scheduler": args.scheduler, "warmup_steps": warmup_steps,
             "weight_decay": args.weight_decay, "batch": args.batch,
             "grad_accum": args.grad_accum, "world_size": 1,
