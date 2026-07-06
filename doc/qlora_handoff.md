@@ -1340,8 +1340,9 @@ passes. Confirmed results + the bugs found and fixed while running them:
     Liger training run, not just the gate.)
   - **Liger parity finding:** Liger is a *wash* vs the plain-torch norm/MLP path — same
     bf16 noise band (cos ~0.9998), borderline top-1 flips go both ways (Liger better on
-    one prompt, worse on another). Not more/less accurate; its win is memory+speed,
-    which still needs quantifying on a real-size run (with vs without `--use-liger`).
+    one prompt, worse on another). Not more/less accurate; its win is memory+speed —
+    since quantified at real size (§0c Session 12 addendum: +8.8% tok/s, −1.1 GB/GPU,
+    identical convergence on the 12B malamus config).
 - **C (`--offload-activations`)**: confirmed numerically equivalent; at 1B/seq-2048/
   batch-2 it saved only ~0.07 GB (4.78→4.71) at ~3% slower — small because that config
   is model/optimizer-dominated. The saving scales with seq-len × batch × depth; measure
@@ -1748,6 +1749,31 @@ with `use_liger: true` and record Δpeak-VRAM and Δtok/s vs the 18.32/11.88 GB
 / 456 tok/s baseline (liger's win is fused-norm activation memory; with
 activations already offloaded it may be modest — that's the datapoint to
 capture before deciding if it becomes a default).
+
+**LIGER COST/BENEFIT: MEASURED — WORTH TURNING ON.** The A/B run above is
+in: identical malamus config (same seed/shuffle/data/packing; `--use-liger`
+the only delta) vs the Session-12 baseline on Semancer-12B 4bpw, 2×3090,
+batch 3 × seq 8192, `--offload-activations` on both sides:
+- **Throughput: 496 vs 456 tot tok/s (+8.8%)**, 432 vs 398 sup tok/s;
+  ~49.3 vs ~53.2 s/step; **wall 1686 vs 1832 s for 34 steps (−8.0%)**.
+- **Peak VRAM: 17.21/10.78 vs 18.32/11.88 GB — −1.1 GB on *each* GPU**, on
+  top of activation offload.
+- **Convergence run-level identical:** first loss 3.3789 vs 3.38, final EMA
+  **2.6807 vs 2.68**, final-step 2.3663 vs 2.36, `|B|` 0.373 vs 0.377; step
+  split f 31 / b 69 unchanged; dequant profile 9.50 vs 10.19 s/step (~19%
+  share both). Early grad spikes (999/465/3071 at steps 3–5, settled to
+  ~18–20 by step 6, one 216 blip at step 31) are the baseline's B=0-init
+  transient class (it had 11545 at step 1), clipped as usual — not the #119
+  signature (persistent ~1e16).
+
+So the "may be modest" caveat resolved in liger's favor: **set
+`use_liger: true` in the malamus config going forward** (the guard already
+falls back to torch off-CUDA / fp32, and the two-tier gate is there for any
+new base). Note the whole win comes from the **RMSNorm swap alone** — this
+GeGLU base keeps liger's (silu-only) SwiGLU kernel out — which upgrades
+Session 9 #9 (liger GeGLU + 4D per-head q/k/v norm) from "if the win
+justifies it" to *justified; wire when convenient* for another increment of
+the same kind.
 
 **Still open (unchanged from Session 10):** trainable-head chunked CE with a
 head/LoRA-B gradient (next-work #1's other half, superseding Session 9 #7),
