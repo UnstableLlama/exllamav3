@@ -1693,6 +1693,25 @@ python examples/qlora_validate_native.py --model $GEMMA4 \
 Only after this prints `liger parity: PASS` is `--use-liger` trustworthy for
 real runs (and its VRAM number worth recording).
 
+**First box run of the gate: FAIL — and it found a real wrapper bug.** On
+Semancer-12B (bf16, split): loss parity fine (rel 6.4e-3), 192 grads compared,
+worst at **layer 1** `q_proj.b` (cos 0.9818, rel 0.20) — i.e. systematic
+low-precision drift accumulating toward the deepest backward layers, not
+#119-style corruption (that was ~14 orders of magnitude out). Root cause,
+confirmed against liger's kernel source: our `_norm` liger branch cast the
+norm weight `w.to(dtype=x.dtype)` — the base's **fp16** weights rounded to
+**bf16** (7 vs 10 mantissa bits, up to ~0.4%/element) on the liger side only,
+while the torch reference path uses `w.float()` on the original fp16 values.
+`casting_mode="gemma"` upcasts W to fp32 *inside* the kernel and
+`rms_norm_forward` has no X/W dtype-match assert, so the cast was never
+needed. Fixed: device-move only, keep the weight's own dtype. The gate also
+now prints the failure count + median + 5 worst adapters (distribution
+separates "handful of deep-layer outliers over a tight median" = numerics gap
+from "most of the list blown out" = corrupted backward). **Re-run the gate on
+the box after pulling**; if a residual marginal outlier remains at layer 0/1
+it's candidate bf16-reassociation floor — calibrate thresholds from the
+printed distribution, don't guess.
+
 **Still open (unchanged from Session 10):** trainable-head chunked CE with a
 head/LoRA-B gradient (next-work #1's other half, superseding Session 9 #7),
 head-aware balanced autosplit (#2, deprioritized now that the head CE is
