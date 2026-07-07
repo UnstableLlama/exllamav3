@@ -180,8 +180,16 @@ class DiffLinear(nn.Module):
         # served as W_q - scale·(a0@b0), realizing the PiSSA residual base
         # without touching the trellis. Not persisted in state_dict -- the
         # adapter save/load path round-trips it via pissa_init.safetensors.
+        # The on-device copies live in the COMPUTE dtype (the closure casts to
+        # it on every reconstruction regardless, so this is bit-identical for
+        # training while halving the offsets' VRAM); the exact fp32 factors are
+        # kept on CPU (init_a0_master/init_b0_master) for the sidecar, the
+        # converted export and apply_to_native, where fp16/bf16-level
+        # cancellation against the fp32 adapter would poison the tiny delta.
         self.register_buffer("init_a0", None, persistent=False)
         self.register_buffer("init_b0", None, persistent=False)
+        self.init_a0_master: Optional[torch.Tensor] = None
+        self.init_b0_master: Optional[torch.Tensor] = None
 
         # The wrapped native Linear (an exllamav3 ABC Module, not an nn.Module)
         # holds its weights as plain tensors / buffers, never nn.Parameters, so
@@ -193,8 +201,10 @@ class DiffLinear(nn.Module):
         assert self.r > 0
         dev = backbone.linear_device(self.linear)
         assert a0.shape == self.lora_a.shape and b0.shape == self.lora_b.shape
-        self.init_a0 = a0.detach().to(dev, torch.float32).contiguous()
-        self.init_b0 = b0.detach().to(dev, torch.float32).contiguous()
+        self.init_a0_master = a0.detach().to("cpu", torch.float32).contiguous()
+        self.init_b0_master = b0.detach().to("cpu", torch.float32).contiguous()
+        self.init_a0 = a0.detach().to(dev, self.compute_dtype).contiguous()
+        self.init_b0 = b0.detach().to(dev, self.compute_dtype).contiguous()
 
     def _weight_closure(self):
         wfn = backbone.frozen_weight_closure(self.linear, self.compute_dtype)
@@ -206,11 +216,16 @@ class DiffLinear(nn.Module):
         # product runs in the compute dtype: the result is stored at that
         # precision regardless, and the rank-r matmul is noise next to the
         # trellis dequant inside wfn (which --profile-dequant still times).
+        # Fused out-of-place addmm: never materializes the [in, out] a0@b0
+        # product as a separate temporary (in-place on w is unsafe -- for an
+        # fp16 inner layer wfn can return the stored weight itself).
         a0, b0, s = self.init_a0, self.init_b0, self.scale
 
         def residual_fn():
             w = wfn()
-            return w - s * (a0.to(w.dtype) @ b0.to(w.dtype))
+            if a0.dtype != w.dtype:      # off-dtype path (e.g. float64 tests)
+                return w - s * (a0.to(w.dtype) @ b0.to(w.dtype))
+            return torch.addmm(w, a0, b0, alpha=-s)
 
         return residual_fn
 
@@ -1120,18 +1135,22 @@ class NativeLlamaQLoRA(nn.Module):
 
     @torch.no_grad()
     def apply_init_lora(self, mode: str, ref_model_dir: Optional[str] = None,
-                        svd_niter: int = 16, verbose: bool = True) -> None:
+                        svd_niter: int = 16, verbose: bool = True,
+                        eva_batches=None) -> None:
         """
         Replace the default (kaiming/zeros) adapter init with an SVD-based one:
         ``"pissa"`` (principal components of the frozen base, trained against a
-        frozen-offset residual) or ``"qerr"`` (top-r of the quantization error
-        vs the original model at ``ref_model_dir``). See ``training.lora_init``.
+        frozen-offset residual), ``"qerr"`` (top-r of the quantization error
+        vs the original model at ``ref_model_dir``) or ``"eva"`` (top-r
+        right-singular vectors of each target's input activations, streamed
+        from ``eva_batches`` -- an iterable of :meth:`forward` kwargs dicts of
+        real training data). See ``training.lora_init``.
         Call after construction and BEFORE ``load_adapter`` -- a resume restores
         the exact saved tensors (including pissa offsets) over this.
         """
         from .lora_init import apply_init_lora as _apply
         _apply(self, mode, ref_model_dir=ref_model_dir,
-               svd_niter=svd_niter, verbose=verbose)
+               svd_niter=svd_niter, verbose=verbose, eva_batches=eva_batches)
 
     def lora_parameters(self) -> list[nn.Parameter]:
         ps: list[nn.Parameter] = []
@@ -1200,8 +1219,13 @@ class NativeLlamaQLoRA(nn.Module):
             if w.init_a0 is not None:
                 # PiSSA: the effective delta is s·(AB - A0B0); the runtime slot
                 # gets the rank-2r concatenation so generation matches training.
-                a = torch.cat([a, w.init_a0], dim=1)
-                b = torch.cat([b, w.init_b0 * (-w.scale * scaling)], dim=0)
+                # Concatenate from the exact fp32 masters, not the compute-dtype
+                # device copies: A ≈ A0 early in training, and a bf16-rounded A0
+                # against an fp32 A leaves a spurious residual comparable to the
+                # trained delta itself.
+                a = torch.cat([a, w.init_a0_master.to(a.device)], dim=1)
+                b = torch.cat([b, w.init_b0_master.to(b.device)
+                               * (-w.scale * scaling)], dim=0)
             backbone.set_runtime_lora(w.linear, self, a.to(torch.float16),
                                       b.to(torch.float16))
 
@@ -1251,13 +1275,18 @@ class NativeLlamaQLoRA(nn.Module):
             target_leaves.add(w.key.split(".")[-1])
             key = f"base_model.model.{w.key}"
             if has_offset:
-                a = torch.cat([w.lora_a.detach(), w.init_a0], dim=1)        # [in, 2r]
-                b = torch.cat([w.lora_b.detach() * w.scale,
-                               w.init_b0 * (-w.scale)], dim=0)              # [2r, out]
-                sidecar[f"{w.key}.lora_a"] = w.lora_a.detach().float().cpu()
-                sidecar[f"{w.key}.lora_b"] = w.lora_b.detach().float().cpu()
-                sidecar[f"{w.key}.init_a0"] = w.init_a0.float().cpu()
-                sidecar[f"{w.key}.init_b0"] = w.init_b0.float().cpu()
+                # Convert on CPU from the exact fp32 masters (the on-device
+                # offsets are compute-dtype; rounding them against the fp32
+                # adapter would corrupt the exported delta).
+                a_cpu = w.lora_a.detach().float().cpu()
+                b_cpu = w.lora_b.detach().float().cpu()
+                a = torch.cat([a_cpu, w.init_a0_master], dim=1)             # [in, 2r]
+                b = torch.cat([b_cpu * w.scale,
+                               w.init_b0_master * (-w.scale)], dim=0)       # [2r, out]
+                sidecar[f"{w.key}.lora_a"] = a_cpu
+                sidecar[f"{w.key}.lora_b"] = b_cpu
+                sidecar[f"{w.key}.init_a0"] = w.init_a0_master
+                sidecar[f"{w.key}.init_b0"] = w.init_b0_master
             else:
                 a = w.lora_a.detach()
                 b = w.lora_b.detach()

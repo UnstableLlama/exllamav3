@@ -12,6 +12,12 @@ CPU tests for the SVD-based LoRA inits (exllamav3/training/lora_init.py):
   * pissa save/load: adapter_model.safetensors carries the CONVERTED rank-2r
     standard-LoRA delta (correct for external consumers) while the sidecar
     round-trips the exact fp32 training state including the offsets.
+  * pissa offsets are stored on-device in the compute dtype (VRAM) with exact
+    fp32 masters kept for save/export.
+  * eva: the streaming sketch recovers the activations' top right-singular
+    subspace; the apply path shares one sketch across same-input sites
+    (q/k/v), drops pad-token rows, keeps B at zero (bit-exact function
+    preservation) and demands a data pre-pass.
 
 All fp32 on CPU; no GPU, no real model.
 """
@@ -34,6 +40,7 @@ from test_native_llama import MockLinear, _load, _nl
 _li = _load("lora_init")
 principal_factors = _li.principal_factors
 apply_init_lora = _li.apply_init_lora
+EvaSketch = _li.EvaSketch
 
 DiffLinear = _nl.DiffLinear
 
@@ -223,6 +230,168 @@ def test_pissa_save_convert_and_sidecar_roundtrip():
     print("[lora_init] pissa converted export + sidecar resume PASSED")
 
 
+def _orthonormal(in_f, k, seed):
+    g = torch.Generator().manual_seed(seed)
+    return torch.linalg.qr(torch.randn(in_f, k, generator=g))[0]
+
+
+def _subspace_gap(v_est, v_ref):
+    """Frobenius distance between the column-span projectors."""
+    return ((v_est @ v_est.t()) - (v_ref @ v_ref.t())).norm().item()
+
+
+def test_eva_sketch_recovers_subspace():
+    torch.manual_seed(0)
+    in_f, r, n = 40, 5, 600
+    g = torch.Generator().manual_seed(11)
+    basis = _orthonormal(in_f, r, seed=12)                      # [in, r]
+    z = torch.randn(n, r, generator=g) * torch.tensor([8., 6., 5., 4., 3.])
+    x = z @ basis.t() + 0.01 * torch.randn(n, in_f, generator=g)
+
+    _, s_ref, _ = torch.linalg.svd(x, full_matrices=False)
+    cap_ref = float((s_ref[:r] ** 2).sum())
+    for niter in (0, 8):
+        sk = EvaSketch(in_f, k=r + 8, niter=niter)
+        for chunk in x.split(64):                               # stream in folds
+            sk.update(chunk)
+        assert sk.rows == n
+        v, cap, tot = sk.top(r)
+        assert v.shape == (in_f, r)
+        eye = v.t() @ v
+        assert (eye - torch.eye(r)).abs().max() < 1e-4, "A not orthonormal"
+        gap = _subspace_gap(v, basis)
+        assert gap < 0.05, f"sketch missed the signal subspace (niter={niter}, gap {gap:.3f})"
+        assert abs(cap - cap_ref) / cap_ref < 0.02, \
+            f"captured variance off vs exact SVD (niter={niter})"
+        assert abs(tot - float(x.pow(2).sum())) / tot < 1e-5
+
+    # Too few rows for the requested rank must fail loudly, not silently.
+    sk = EvaSketch(10, k=8)
+    sk.update(torch.randn(2, 10))
+    try:
+        sk.top(4)
+        assert False, "rank-starved sketch should raise"
+    except SystemExit:
+        pass
+    print("[lora_init] eva sketch subspace recovery PASSED")
+
+
+class _EvaNet(nn.Module):
+    """Minimal stand-in exposing the surface _apply_eva touches: _wrappers,
+    .r, .forward(**batch) that invokes the wrappers the way the real block
+    forward does (q/k on the SAME tensor; o on its own)."""
+
+    def __init__(self, wrappers, r, basis, basis_o, junk):
+        super().__init__()
+        self._wrappers = wrappers
+        self.mods = nn.ModuleList(wrappers)
+        self.r = r
+        self.init_lora = "default"
+        self.basis = basis        # [r_true, in] signal subspace for q/k
+        self.basis_o = basis_o    # [r_true, in] different subspace for o
+        self.junk = junk          # [in] direction ONLY pad rows excite
+
+    def forward(self, input_ids, attention_mask=None, position_ids=None,
+                seg_ids=None):
+        b, t = input_ids.shape
+        g = torch.Generator().manual_seed(int(input_ids.sum().item()))
+        x = torch.randn(b, t, self.basis.shape[0], generator=g) @ self.basis
+        x2 = torch.randn(b, t, self.basis_o.shape[0], generator=g) @ self.basis_o
+        if attention_mask is not None:
+            pad = attention_mask == 0
+            # Pad rows carry huge activations in a direction orthogonal to the
+            # signal; if the pre-pass fails to drop them, they dominate the SVD.
+            x[pad] = 50.0 * self.junk
+            x2[pad] = 50.0 * self.junk
+        q, k, o = self._wrappers
+        return q(x) + k(x) + o(x2)
+
+
+def test_eva_apply_shared_sites_masking_and_preservation():
+    torch.manual_seed(0)
+    in_f, out_f, r, r_true = 24, 16, 4, 6
+    basis = _orthonormal(in_f, r_true, seed=5).t()              # [r_true, in]
+    basis_o = _orthonormal(in_f, r_true, seed=6).t()
+    junk = torch.randn(in_f, generator=torch.Generator().manual_seed(7))
+    junk -= basis.t() @ (basis @ junk)                          # orthogonal to signal
+    junk /= junk.norm()
+
+    keys = [f"model.layers.0.self_attn.{l}"
+            for l in ("q_proj", "k_proj", "o_proj")]
+    wrappers = [DiffLinear(MockLinear(in_f, out_f, key=k2, dtype=torch.float32),
+                           r=r, alpha=float(r), compute_dtype=torch.float32)
+                for k2 in keys]
+    net = _EvaNet(wrappers, r, basis, basis_o, junk)
+
+    x_probe = torch.randn(3, in_f)
+    y_before = [w(x_probe) for w in wrappers]
+
+    mask = torch.ones(2, 8, dtype=torch.long)
+    mask[:, 5:] = 0                                             # right padding
+    batches = [dict(input_ids=torch.arange(2 * 8).reshape(2, 8) + 100 * i,
+                    attention_mask=mask) for i in range(3)]
+    apply_init_lora(net, "eva", svd_niter=8, verbose=False,
+                    eva_batches=iter(batches))
+
+    assert net.init_lora == "eva"
+    q, k, o = wrappers
+    # q/k consumed the same tensor -> one shared sketch -> identical A.
+    assert torch.equal(q.lora_a, k.lora_a)
+    assert not torch.equal(q.lora_a, o.lora_a)
+    for w in wrappers:
+        assert w.init_a0 is None, "eva must not install a frozen offset"
+        assert w.lora_b.abs().max().item() == 0.0, "eva must keep B at zero"
+        eye = w.lora_a.t() @ w.lora_a
+        assert (eye - torch.eye(r)).abs().max() < 1e-4, "A not orthonormal"
+    # Pad rows were dropped: their (huge) junk direction is absent from A.
+    assert (q.lora_a.t() @ junk).abs().max() < 1e-3, \
+        "pad-token activations leaked into the eva init"
+    # B = 0: the forward is bit-identical to the pre-init model.
+    for w, y0 in zip(wrappers, y_before):
+        assert torch.equal(w(x_probe), y0), "eva step 0 not function-preserving"
+
+    # And the pre-pass is mandatory.
+    try:
+        apply_init_lora(net, "eva", verbose=False)
+        assert False, "eva without a data pre-pass should raise"
+    except SystemExit:
+        pass
+    print("[lora_init] eva shared sites + pad masking + preservation PASSED")
+
+
+def test_pissa_offset_compute_dtype_storage():
+    # Under a half-precision compute dtype the on-device offsets are stored in
+    # that dtype (they are cast to it on every reconstruction anyway, so this
+    # only halves their VRAM), while the fp32 masters keep the exact factors
+    # for the sidecar / converted export / apply_to_native.
+    torch.manual_seed(0)
+    lin = MockLinear(32, 24, key="model.layers.0.self_attn.q_proj",
+                     dtype=torch.float32)
+    dl = DiffLinear(lin, r=4, alpha=4.0, compute_dtype=torch.bfloat16)
+    w = lin.inner.get_weight_tensor()
+    a0, b0, _, _ = principal_factors(w, 4, niter=0)
+    root_s = dl.scale ** 0.5
+    a0, b0 = a0 / root_s, b0 / root_s
+    with torch.no_grad():
+        dl.lora_a.copy_(a0)
+        dl.lora_b.copy_(b0)
+    dl.set_init_offset(a0, b0)
+
+    assert dl.init_a0.dtype == torch.bfloat16
+    assert dl.init_b0.dtype == torch.bfloat16
+    assert dl.init_a0_master.dtype == torch.float32
+    assert torch.equal(dl.init_a0_master, a0)
+    assert torch.equal(dl.init_b0_master, b0)
+
+    # The served weight is the residual base at bf16 precision (fused addmm).
+    got = dl._weight_closure()().float()
+    ref = (w - dl.scale * (a0 @ b0)).float()
+    tol = 0.05 * w.abs().max().item()          # bf16 rounding of the base
+    assert (got - ref).abs().max().item() < tol, \
+        "bf16 residual weight too far from the fp32 residual"
+    print("[lora_init] pissa compute-dtype offset storage PASSED")
+
+
 def test_rslora_scale():
     lin = MockLinear(16, 16, key="model.layers.0.self_attn.q_proj",
                      dtype=torch.float32)
@@ -239,6 +408,9 @@ def main():
         test_pissa_function_preserving_and_residual_math,
         test_qerr_init_reconstructs_error,
         test_pissa_save_convert_and_sidecar_roundtrip,
+        test_pissa_offset_compute_dtype_storage,
+        test_eva_sketch_recovers_subspace,
+        test_eva_apply_shared_sites_masking_and_preservation,
         test_rslora_scale,
     ], label="lora-init")
     print("\nAll LoRA-init checks passed.")

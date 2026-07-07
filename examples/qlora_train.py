@@ -58,6 +58,7 @@ SINGLE_ONLY_KEYS = {
     "inspect", "lora_embed", "lora_head", "offload_embed_head_optim",
     "offload_activations", "use_liger", "sample_every", "sample_prompt",
     "use_rslora", "init_lora", "init_svd_niter", "init_ref_model",
+    "init_eva_tokens",
 }
 DDP_ONLY_KEYS = set()
 ALIASES = {"lora_r": "r"}  # DDP backend spells this --lora-r; config uses r.
@@ -79,6 +80,7 @@ SINGLE_ONLY_DEFAULTS = {
     "init_lora": "default",
     "init_svd_niter": 16,
     "init_ref_model": None,
+    "init_eva_tokens": 65536,
 }
 
 

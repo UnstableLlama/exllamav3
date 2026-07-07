@@ -234,6 +234,12 @@ def check_init_lora(model, tokenizer, prompt, device, cdt, mode,
     little, typically toward the bf16 model's. Reported with a wide sanity
     bound only; the exact factor math is covered by the CPU unit tests
     (tests/test_lora_init.py).
+
+    eva: B stays zero, so the step-0 delta is exactly zero in EVERY dtype;
+    the gate proves the activation pre-pass (hooks, shared-input sites,
+    sketch SVD) runs on the real model and leaves the function untouched,
+    with the gate prompt itself as the pre-pass data. Tight bound at both
+    tiers -- any deviation means the init path corrupted something.
     """
     print("\n" + "-" * 78)
     print(f"init-lora gate ({mode}): step-0 model vs frozen base")
@@ -249,8 +255,9 @@ def check_init_lora(model, tokenizer, prompt, device, cdt, mode,
             attn_impl=attn_impl)
         net.train()
         if with_init:
-            net.apply_init_lora(mode, ref_model_dir=ref_model_dir,
-                                svd_niter=svd_niter)
+            net.apply_init_lora(
+                mode, ref_model_dir=ref_model_dir, svd_niter=svd_niter,
+                eva_batches=([{"input_ids": ids}] if mode == "eva" else None))
         with torch.no_grad():
             loss = net.compute_loss(ids, ids.clone()).item()
         del net
@@ -275,6 +282,14 @@ def check_init_lora(model, tokenizer, prompt, device, cdt, mode,
         if cdt in (torch.float16, torch.bfloat16):
             all_ok &= tier(f"{str(cdt).split('.')[-1]} noise band", cdt,
                            rel_bound=2e-2, hard=True)
+    elif mode == "eva":
+        # x@A@B with B=0 adds exactly zero, so both tiers are hard and tight:
+        # any deviation at all means the pre-pass corrupted the model/adapter.
+        all_ok = tier("fp32 function-preservation gate", torch.float32,
+                      rel_bound=1e-6, hard=True)
+        if cdt in (torch.float16, torch.bfloat16):
+            all_ok &= tier(f"{str(cdt).split('.')[-1]} function-preservation "
+                           f"gate", cdt, rel_bound=1e-6, hard=True)
     else:  # qerr
         # The shift toward the bf16 model is expected and small; a blown
         # scale/orientation shows up as a loss excursion orders bigger.
@@ -402,12 +417,13 @@ def main():
                          "wrong) plus, under --compute-dtype bfloat16/float16, a "
                          "noise-band gate at the training dtype. REQUIRED green "
                          "before any --use-liger training run.")
-    ap.add_argument("--init-lora", choices=["pissa", "qerr"], default=None,
+    ap.add_argument("--init-lora", choices=["pissa", "qerr", "eva"], default=None,
                     help="Run the step-0 gate for an SVD adapter init: pissa "
                          "must be function-preserving vs the base model "
                          "(fp32 near-exact), qerr must land within a sane "
-                         "step-0 loss shift. REQUIRED green before any "
-                         "--init-lora training run.")
+                         "step-0 loss shift, eva must be EXACTLY function-"
+                         "preserving (B=0) after its activation pre-pass. "
+                         "REQUIRED green before any --init-lora training run.")
     ap.add_argument("--init-ref-model", default=None,
                     help="Original (unquantized) HF model dir for --init-lora qerr.")
     ap.add_argument("--init-svd-niter", type=int, default=16,
