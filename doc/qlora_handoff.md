@@ -2026,6 +2026,19 @@ malamus, r=128, α=128, 1 epoch = 17 steps, bf16, 2-GPU split, liger):**
    shelving it; the standing eval-prereq note applies to any decision-grade
    run.
 
+**Repo tidy (toward a PR-able boundary):** experiment-specific tooling moved
+to `examples/experiments/` (`make_style_dataset.py`, `score_style_density.py`,
+`train_rocinante_yoda.sh`, + a README defining the product-vs-experiment
+boundary). Live path references updated; historical session records above
+keep the old paths. Inventory vs the upstream fork point (v0.0.43,
+`c5d9c65`): ~13.1k inserted lines total, of which only ~250 touch core
+inference files (the backbone-seam discipline paid off) — the four standalone
+core bugfixes (gemma4 device, xformers ImportError, attn view→reshape,
+transformers nn.Parameter) are upstream-PR-able today independent of any
+training decision; the training subsystem's home (in-tree PR vs separate
+repo) is an open decision pending upstream appetite — see the Session-14
+discussion.
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)

@@ -625,7 +625,7 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
     from datasets import load_dataset
 
     # Accept either a Hub dataset id or a local file (e.g. a styled set produced
-    # by examples/make_style_dataset.py). load_dataset() can't sniff a bare local
+    # by examples/experiments/make_style_dataset.py). load_dataset() can't sniff a bare local
     # path, so pick the builder from the extension when the path exists.
     if os.path.exists(dataset_name):
         ext = os.path.splitext(dataset_name)[1].lower()

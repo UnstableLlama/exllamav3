@@ -876,7 +876,7 @@ def _run_main():
             for r in recs:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
         print(f"\nGenerations written to {args.gen_out} "
-              f"(score with examples/score_style_density.py)")
+              f"(score with examples/experiments/score_style_density.py)")
 
     if ddp:
         dist.barrier()

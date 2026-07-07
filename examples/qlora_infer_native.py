@@ -66,7 +66,7 @@ def main():
                     help="Sampling seed for reproducible before/after comparison")
     ap.add_argument("--gen-out", default=None,
                     help="Write the ADAPTED generations to this jsonl ('output' "
-                         "field) for score_style_density.py (symmetric with the "
+                         "field) for experiments/score_style_density.py (symmetric with the "
                          "BNB arm's --gen-out). Use --temperature 0 for greedy.")
     args = ap.parse_args()
 
@@ -120,7 +120,7 @@ def main():
             for r in dump:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
         print(f"Adapted generations written to {args.gen_out} "
-              f"(score with examples/score_style_density.py)")
+              f"(score with examples/experiments/score_style_density.py)")
 
 
 if __name__ == "__main__":
