@@ -4,9 +4,9 @@
 
 ### Why train on EXL3 instead of bitsandbytes?
 
-- **You train against the exact weights you deploy.** The adapter is fitted to the *quantized* model, so there is no train/serve quantization mismatch when you load it for inference.
-- **EXL3 stays coherent at 2.5–3 bpw where NF4 falls apart**, which makes a bitrate regime trainable that BNB-QLoRA can't reach — a 70B at ~2.5 bpw is ~22 GB and fits (and trains) on a single 24 GB card.
-- **The frozen base is never materialized.** Weights are reconstructed on the fly from the trellis in both forward and backward, and the fused cross-entropy head never builds the `[tokens, vocab]` logits tensor, so memory goes to your batch, not to bookkeeping.
+- Train on 2-8bpw quants, including non-integer. BNB is 4 or 8 bit.
+- EXL3 is higher accuracy than BNB, theoretically this should help? - still needs benchmarking
+- EXL3 is more performant in the lower and mid-size batches that are often used when squeezing big models onto consumer cards.
 
 ### Quick start
 
