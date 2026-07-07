@@ -61,6 +61,7 @@ SINGLE_ONLY_KEYS = {
     "offload_activations", "use_liger", "sample_every", "sample_prompt",
     "use_rslora", "init_lora", "init_svd_niter", "init_ref_model",
     "init_eva_tokens",
+    "quant_aware", "quant_aware_scale", "quant_aware_ref_model",
 }
 DDP_ONLY_KEYS = set()
 ALIASES = {"lora_r": "r"}  # DDP backend spells this --lora-r; config uses r.
@@ -83,6 +84,9 @@ SINGLE_ONLY_DEFAULTS = {
     "init_svd_niter": 16,
     "init_ref_model": None,
     "init_eva_tokens": 65536,
+    "quant_aware": "none",
+    "quant_aware_scale": 1.0,
+    "quant_aware_ref_model": None,
 }
 
 

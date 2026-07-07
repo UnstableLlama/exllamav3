@@ -71,6 +71,15 @@ Short SFT runs spend a large fraction of their steps just growing the adapter of
 
 Each init has a hard step-0 gate in `qlora_validate_native.py --init-lora <mode>`.
 
+### Quantization-aware LoRA (`quant_aware`)
+
+The deploy path for a trained adapter is merge-and-requantize, and ordinary QLoRA training is blind to it: the adapter is optimized against one fixed, exactly-known quantized base, so nothing stops it from relying on precision the requantize will destroy. Set `quant_aware` to make the *training forward* see that deploy-time uncertainty (adapted layers only; eval, checkpoints and validation always use exact weights):
+
+- **`noise`** — fresh per-step pseudo-quantization noise on the frozen weights, scaled per output channel to each layer's quantization-error magnitude (the [NIPQ](https://arxiv.org/abs/2206.00820)-style differentiable proxy for the requantize the merged model will undergo).
+- **`ste`** — the effective adapter delta is snapped to the quantization floor in the forward with a straight-through gradient: sub-floor delta components contribute nothing, exactly as after a requantize ([QA-LoRA](https://arxiv.org/abs/2309.14717)'s objective, rebuilt for a trellis base — its group-wise exact-merge operator needs affine zero-points that trellis quantization doesn't have).
+
+The per-layer error scale is measured exactly against the original bf16 model when `quant_aware_ref_model` is set, else estimated from the trellis bitrate; `quant_aware_scale` multiplies it. Freshly built; being A/B-evaluated on the merge-and-requantize path now.
+
 ### Credits
 
 The DPO/KTO preference-training implementation follows the loss semantics of **[HuggingFace TRL](https://github.com/huggingface/trl)**'s stable `DPOTrainer` and `KTOTrainer` (KTO stabilized in [trl#6175](https://github.com/huggingface/trl/pull/6175)). TRL is Apache-2.0 licensed, Copyright The HuggingFace Team; this fork reimplements the formulations independently against the EXL3 native training path rather than reusing TRL code. Underlying methods: DPO ([Rafailov et al. 2023](https://arxiv.org/abs/2305.18290)), KTO ([Ethayarajh et al. 2024](https://arxiv.org/abs/2402.01306)), IPO, SLiC.

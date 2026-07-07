@@ -45,6 +45,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import backbone
+from . import quant_aware as _qa
 from .qlora_linear import EXL3LoRAFunction
 from .fused_ce import (
     fused_linear_cross_entropy, fused_linear_cross_entropy_vocab_chunked,
@@ -153,6 +154,15 @@ class DiffLinear(nn.Module):
     # pre-toggle checkpoints behave as before.
     adapter_enabled = True
 
+    # Quantization-aware training mode (training.quant_aware): "" = off (the
+    # default; eval/validate paths and pre-feature checkpoints are exact).
+    # configure_quant_aware() sets these per adapted wrapper; nothing here is
+    # persisted -- it is run configuration, reapplied by the trainer.
+    qa_mode = ""
+    qa_sigma = None       # [out] fp32 per-channel error scale (incl. scale knob)
+    qa_state = None       # shared {"tick", "seed"} dict owned by the net
+    qa_layer_id = 0       # stable per-layer seed offset
+
     def __init__(
         self,
         linear: nn.Module,
@@ -241,6 +251,12 @@ class DiffLinear(nn.Module):
 
         return residual_fn
 
+    def _weight_closure_qa(self):
+        """The frozen-weight closure with the quantization-aware perturbation
+        (training.quant_aware) composed on top when a mode is active; the
+        plain closure otherwise (off / eval -- exact weights always)."""
+        return _qa.wrap_weight_closure(self, self._weight_closure())
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         xc = x.to(self.compute_dtype)
         if not self.adapter_enabled:
@@ -256,7 +272,7 @@ class DiffLinear(nn.Module):
             xc, self.lora_a, self.lora_b,
             backbone.frozen_bias(self.linear, self.compute_dtype),
             self.scale,
-            self._weight_closure(),
+            self._weight_closure_qa(),
         )
 
     def extra_repr(self) -> str:
@@ -298,6 +314,12 @@ class NativeLlamaQLoRA(nn.Module):
     use_liger = False
     offload_activations = False
     init_lora = "default"
+    # Quant-aware training (training.quant_aware): shared {"tick", "seed"}
+    # state when a mode is enabled via set_quant_aware(), else None (exact
+    # weights; the default -- eval/validate and old checkpoints unaffected).
+    _qa_state = None
+    quant_aware = "none"
+    quant_aware_scale = 1.0
     # When True (via the adapters_disabled() context manager) the forward runs
     # as the PURE frozen base model: per-linear LoRA + pissa offsets off, the
     # trainable/LoRA embedding and LM head ignored. Used for the reference-model
@@ -920,6 +942,15 @@ class NativeLlamaQLoRA(nn.Module):
         same document (flash-varlen via cu_seqlens on CUDA fp16/bf16; the
         block-diagonal eager/SDPA mask otherwise). ``position_ids`` must then be
         per-document resets (built by ``pack_examples`` / ``collate``)."""
+        # Quant-aware noise tick: advance once per grad-enabled training
+        # forward so each micro-batch draws fresh noise while the (up to 3)
+        # weight reconstructions within its forward + backward all see the
+        # same draw. No-grad forwards (eval, the DPO/KTO reference / KL
+        # passes) do not advance it -- see quant_aware's determinism contract.
+        qa_state = getattr(self, "_qa_state", None)
+        if (qa_state is not None and self.training and torch.is_grad_enabled()
+                and not self._adapters_off):
+            qa_state["tick"] += 1
         bsz, t = input_ids.shape
         # Under a layer-autosplit load each block lives on its own device; the
         # hidden state is migrated across boundaries below (mirroring exllamav3's
@@ -1259,6 +1290,26 @@ class NativeLlamaQLoRA(nn.Module):
         _apply(self, mode, ref_model_dir=ref_model_dir,
                svd_niter=svd_niter, verbose=verbose, eva_batches=eva_batches)
 
+    def set_quant_aware(self, mode: str, scale: float = 1.0,
+                        ref_model_dir: Optional[str] = None, seed: int = 0,
+                        verbose: bool = True) -> None:
+        """
+        Enable a quantization-aware training mode on the adapted linears:
+        ``"noise"`` (fresh per-micro-batch pseudo-quantization noise on the
+        frozen weight) or ``"ste"`` (the effective adapter delta snapped to a
+        quant-floor grid with a straight-through gradient); ``"none"``
+        disables. σ per layer is measured against ``ref_model_dir`` (the
+        original unquantized HF dir) when given, else estimated from the
+        trellis bitrate. Run configuration, not learned state -- call after
+        construction / resume each run (nothing is persisted). See
+        ``training.quant_aware`` for the design and determinism contract.
+        """
+        _qa.configure_quant_aware(self, mode, scale=scale,
+                                  ref_model_dir=ref_model_dir, seed=seed,
+                                  verbose=verbose)
+        self.quant_aware = mode if mode not in (None, "") else "none"
+        self.quant_aware_scale = float(scale)
+
     def lora_parameters(self) -> list[nn.Parameter]:
         ps: list[nn.Parameter] = []
         for w in self._wrappers:
@@ -1471,6 +1522,10 @@ class NativeLlamaQLoRA(nn.Module):
             # init_lora_r is the rank that actually trained.
             "init_lora": getattr(self, "init_lora", "default"),
             "init_lora_r": init_lora_r,
+            # Provenance only (not consumed at load): the quant-aware training
+            # mode the adapter was trained under (training.quant_aware).
+            "quant_aware": getattr(self, "quant_aware", "none"),
+            "quant_aware_scale": getattr(self, "quant_aware_scale", 1.0),
         }
         with open(os.path.join(directory, "adapter_config.json"), "w", encoding="utf8") as f:
             json.dump(config, f, indent=2)

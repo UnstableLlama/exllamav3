@@ -83,6 +83,13 @@ init_lora: default               # single/split only; default | pissa | qerr | e
 init_svd_niter: 16               # randomized-SVD iterations for init_lora (0 = exact, slow)
 init_ref_model: null             # ORIGINAL unquantized HF model dir (required by init_lora: qerr)
 init_eva_tokens: 65536           # token budget for the eva activation pre-pass (init_lora: eva)
+quant_aware: none                # single/split only; none | noise | ste. Quantization-aware LoRA so
+                                 #   the trained delta survives merge-and-requantize: noise = fresh
+                                 #   per-step pseudo-quant noise on the adapted frozen weights; ste =
+                                 #   the adapter delta snapped to the quant floor (straight-through).
+quant_aware_scale: 1.0           # multiplier on the per-layer quant-error scale
+quant_aware_ref_model: null      # ORIGINAL unquantized HF dir to MEASURE the error scale (exact);
+                                 #   falls back to init_ref_model, else the trellis-bitrate estimate
 compute_dtype: bfloat16
 no_grad_ckpt: false
 attn_impl: auto           # auto, eager, flash
