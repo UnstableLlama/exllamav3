@@ -22,19 +22,14 @@
 > notes below (which remain the detailed context for each item). Newest
 > priority first, per the 2026-07 direction.
 
-1. **Quantization-aware LoRA (QA-LoRA-style).** Some form of
-   quantization-aware adapter training, so the trained delta survives the
-   merge-and-requantize deploy path by construction instead of by luck.
-   Motivation is already on the record: Session 3 arc C (low-rank deltas are
-   attenuated on the quantized base at inference — a signal-to-quant-noise
-   problem that worsens at 2.5–3 bpw), and the qerr init only repairs the
-   error at step 0. Directions to evaluate: QA-LoRA's group-wise
-   quantization-aware operator (Xu et al. 2023, arXiv:2309.14717) adapted to
-   the EXL3 trellis (non-trivial: their scheme targets uniform/group quant);
-   quantization-noise injection on the frozen-weight closure during training
-   (cheap, closure-level); or a differentiable proxy of the requantize step in
-   the loss. Ties directly into the merge-and-requantize story and the
-   low-bitrate flagship.
+1. **Quantization-aware LoRA — BUILT (Session 17), box A/B pending.**
+   `--quant-aware {noise,ste}` implements the two tractable directions from
+   the original item (noise injection on the frozen-weight closure, and a
+   straight-through proxy of the requantize step); QA-LoRA's own group-wise
+   operator was evaluated and ruled out for a trellis base (decision record
+   in the Session 17 notes). What remains is the box work: the same-seed
+   A/B/A2 (off vs noise vs ste) with the eval split ON, judged on held-out
+   loss after a real merge-and-requantize — see the Session 17 box list.
 2. **Near-inference-time training pipeline on KTO/DPO** (the reason Session 16
    built preference training): a workflow where preference signal collected at
    serving time feeds short adapter updates against the exact deployed quant.
@@ -2203,6 +2198,123 @@ trainer notes it).
 4. Then the real question for the pipeline goal: a small RP-preference set +
    held-out eval, DPO vs KTO on the same data, judged per the standing
    eval-prereq rules (same-seed pairs, eval split ON).
+
+### Session 17 — quantization-aware LoRA (`--quant-aware {noise,ste}`) built
+
+> Branch `claude/quantization-aware-lora-etptoj`. Backlog #1. Container-
+> verified (new CPU suite + all existing suites pass); **nothing here is
+> box-verified yet** — the gates and the decision A/B are the next box
+> session. Context: the deploy path is merge-and-requantize (Session 3 arc
+> C), and ordinary QLoRA training is blind to it — it optimizes against one
+> fixed, exactly-known `W_q`, so (a) the adapter can spend capacity
+> compensating the *specific* error realization `ε = W_q − W_orig` it was
+> trained on (wasted the moment a requantize re-rolls it to `ε'`), and (b)
+> nothing stops delta components below the quant-noise floor, which a
+> requantize destroys (the attenuation finding, worse at 2.5–3 bpw).
+
+**Decision record — why not QA-LoRA's own operator.** QA-LoRA (Xu et al.
+2023, arXiv:2309.14717) gets its exact merge by constraining A so the adapter
+delta is constant within each input quantization group; the merged delta is
+then absorbed into the *zero points* of group-wise affine quant, so the
+deployed model is exactly the trained one. The EXL3 trellis has no zero
+points or group scales to absorb anything — the whole weight is re-fit
+through Hadamard rotations + Viterbi search — so the exact-merge construction
+has **no trellis analogue**. What survives is the objective (train the thing
+you will deploy), realized by the two operators below. Related work checked:
+NIPQ (arXiv:2206.00820, noise proxy > STE for QAT stability), RILQ
+(arXiv:2412.01129, adapter-merged 2-bit compensation via activation loss —
+a PTQ-side method), CLoQ/LoftQ/CLoQ-style calibrated inits (we have
+pissa/qerr/eva). Nothing supersedes the noise-proxy approach for an
+immutable trellis base.
+
+**What was built (`exllamav3/training/quant_aware.py`, composed into
+`DiffLinear._weight_closure_qa`; adapted r>0 linears only — non-adapted
+layers stay exact, they contribute variance the adapter can't answer):**
+
+- **`--quant-aware noise`** — pseudo-quantization-noise injection (the
+  NIPQ/QuantNoise idea): each optimizer micro-batch, the frozen weight
+  served to the forward AND its backward recompute is `W_q + δ` with fresh
+  `δ ~ N(0, diag(σ²))`, σ per output channel at the layer's quant-error
+  scale. Fully differentiable (additive constant per step — no STE bias);
+  the adapter can't fit the trained-against `ε` and must put its energy
+  above the noise floor in expectation. This is the closest differentiable
+  proxy of "the merged model will be requantized with an error you cannot
+  know yet".
+- **`--quant-aware ste`** — delta-quantization straight-through (QA-LoRA's
+  intent transplanted): the forward sees `W_q + Q(Δ_eff)` where `Q` snaps
+  the *effective* adapter delta (`s·AB`, or `s·(AB − A0B0)` under pissa —
+  exactly what a merge carries) to a per-channel uniform grid with step
+  `q = √12·σ`; A/B gradients pass straight through while grad_x flows
+  through the snapped weight the forward used. Sub-floor delta components
+  contribute NOTHING to the forward — precisely the deploy behavior — so
+  loss can only improve via components that survive. Deterministic, exactly
+  function-preserving at Δ=0 (default/pissa/eva inits).
+- **σ sources:** `--quant-aware-ref-model <original HF dir>` measures
+  `rms(W_ref − W_q)` per output channel (exact; padded columns get σ=0 and
+  are never perturbed; falls back to `--init-ref-model` when set). Without
+  a reference: the rate-distortion heuristic `σ_col = std(W_q[:,col])·2^-K`
+  with K read from the trellis (`backbone.linear_quant_bits`; ~6% relative
+  at 4 bpw, ~18% at 2.5). `--quant-aware-scale` multiplies either source —
+  calibrate the heuristic against one ref-measured printout, then drop the
+  ref. fp16 (no-K) layers are skipped with a count in the startup line.
+- **Determinism contract (the gradient-correctness crux):** the weight
+  closure is re-invoked by the checkpoint recompute and by
+  `EXL3LoRAFunction.backward`, and all (≤3) reconstructions within one
+  micro-batch MUST see the same weight or gradients silently corrupt. Noise
+  is drawn from a generator seeded by (net-level tick, stable layer id);
+  the tick advances once per **grad-enabled** `net.forward` (eval, DPO/KTO
+  reference/KL passes are no-grad and see clean weights — eval/validate and
+  saves are ALWAYS exact). Consequence documented in the module: at most one
+  grad-enabled forward in flight before its backward — true for the SFT
+  trainer and the preference trainer's single policy forward. STE needs no
+  seeding (deterministic in A/B, constant within a micro-batch).
+- **Wiring:** trainer flags (native single/split only, mirroring the
+  A/B/C + init-lora precedent — NOT the DDP arm, NOT `qlora_train_pref.py`
+  v1), YAML launcher + sample-config keys (`quant_aware`,
+  `quant_aware_scale`, `quant_aware_ref_model`; coverage round-trip
+  reverified), `adapter_config.json` provenance keys, and **run-log schema
+  grew** (`quant_aware`, `quant_aware_scale`; native + BNB field lists kept
+  byte-identical) → the first post-pull run moves `qlora_runs.csv` to
+  `.bak` — expected, not data loss. Nothing is persisted in checkpoints:
+  the mode is run configuration, reapplied by the trainer after any resume.
+- **Tests** (`tests/test_quant_aware.py`, all pass in-container): σ
+  measurement (heuristic K-scaling + skip; ref-measured incl. padding),
+  noise determinism within a tick / freshness across ticks / empirical std
+  match / eval+disable exactness, grad consistency against the exact noisy
+  weight, STE bit-exact preservation at Δ=0, sub-floor deltas ignored,
+  snapping math, σ=0 column guard, straight-through grads, and both modes
+  composing with a pissa residual offset. Existing suites unaffected (the
+  off path is byte-identical: `_weight_closure_qa` returns the plain
+  closure when the mode is off or the module is in eval).
+
+**Cost expectation:** noise adds one `randn_like` + `addcmul` per weight
+reconstruction (≤3/linear/step, riding the closure the dequant profiler
+already times); ste adds one rank-r matmul + elementwise round. Both are
+noise next to the trellis dequant (~19% of step wall at Session 12's
+measurement) — confirm with `--profile-dequant 5` on the first box run.
+
+**Box list for next session (in order):**
+1. **Off-path sanity (cheap):** any short run WITHOUT `--quant-aware`
+   behaves identically to pre-Session-17 (the validate gate needs no rerun —
+   the off path is unchanged — but a 5-step loss-curve eyeball is free).
+2. **Startup sanity with `--quant-aware noise`:** the ` -- quant-aware`
+   line prints plausible relative scales (~6% median at 4 bpw heuristic);
+   with `--quant-aware-ref-model` the measured numbers should be same-order.
+   Loss should descend with a slightly noisier curve; grad norms same order
+   as baseline (a persistent ~1e16 blowup = determinism contract violated —
+   file a bug, that's the checkpoint-recompute mismatch signature).
+3. **The decision A/B/A2** (same-seed malamus triple, eval split ON per the
+   standing prereq): `--quant-aware none` vs `noise` (scale 1.0) vs `ste`.
+   Judge on (a) held-out loss of the adapter as-trained, and (b) — the
+   actual point — held-out loss / gens **after merge-and-requantize** of
+   each arm at the same bpw. The QAT arms may show slightly WORSE (a) —
+   that's the robustness tax — the win condition is (b): the smallest
+   train→deploy degradation. Optionally add `--quant-aware-scale 0.5` if
+   scale-1.0 noise visibly hurts convergence.
+4. **Low-bpw follow-up (where the payoff lives):** repeat 3 on a 2.5–3 bpw
+   base (σ ~3× larger, so both the problem and the expected win grow), and
+   re-test qerr there too (carried Session-14 item; qerr's error-repair
+   directions + noise robustness are natural companions at low bpw).
 
 ---
 

@@ -160,7 +160,8 @@ class StepTimer:
 RUN_LOG_FIELDS = [
     "timestamp", "arm", "status", "model", "arch", "out",
     "dataset", "eval_split", "eval_dataset", "eval2_dataset",
-    "r", "alpha", "use_rslora", "init_lora", "lr", "scheduler", "warmup_steps", "weight_decay",
+    "r", "alpha", "use_rslora", "init_lora", "quant_aware", "quant_aware_scale",
+    "lr", "scheduler", "warmup_steps", "weight_decay",
     "batch", "grad_accum", "world_size", "eff_batch",
     "epochs", "steps_planned", "steps_done", "seq_len",
     "targets", "compute_dtype", "attn_impl", "parallel", "shuffle", "pack", "pack_algo", "ga_loss",
@@ -1023,6 +1024,28 @@ def _run_main():
                     help="Token budget for the --init-lora eva activation "
                          "pre-pass (drawn in order from the training set; "
                          "no gradients). Default 65536.")
+    ap.add_argument("--quant-aware", choices=["none", "noise", "ste"],
+                    default="none",
+                    help="Quantization-aware LoRA training, so the trained "
+                         "delta survives the merge-and-requantize deploy path "
+                         "by construction. noise: fresh per-micro-batch "
+                         "pseudo-quantization noise on the adapted frozen "
+                         "weights (differentiable, the NIPQ proxy for the "
+                         "requantize the merged model will undergo). ste: the "
+                         "effective adapter delta is snapped to a quant-floor "
+                         "grid in the forward with a straight-through "
+                         "gradient (sub-floor delta components contribute "
+                         "nothing, exactly as after a requantize). Training "
+                         "only -- eval/saves always use exact weights.")
+    ap.add_argument("--quant-aware-scale", type=float, default=1.0,
+                    help="Multiplier on the per-layer quantization-error "
+                         "scale used by --quant-aware (default 1.0).")
+    ap.add_argument("--quant-aware-ref-model", default=None,
+                    help="Path to the ORIGINAL (unquantized) HF model dir to "
+                         "MEASURE the per-channel quantization error for "
+                         "--quant-aware (exact). Defaults to --init-ref-model "
+                         "when that is set; otherwise the error scale is "
+                         "estimated from the trellis bitrate (std·2^-K).")
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--weight-decay", type=float, default=0.01,
                     help="AdamW weight decay on the LoRA params (default 0.01).")
@@ -1316,6 +1339,7 @@ def _run_main():
         "eval2_dataset": args.eval2_dataset or "",
         "r": args.r, "alpha": args.alpha,
         "use_rslora": int(bool(args.use_rslora)), "init_lora": args.init_lora,
+        "quant_aware": args.quant_aware, "quant_aware_scale": args.quant_aware_scale,
         "lr": args.lr,
         "scheduler": args.scheduler, "weight_decay": args.weight_decay,
         "batch": args.batch, "grad_accum": args.grad_accum, "world_size": 1,
@@ -1405,6 +1429,14 @@ def _run_main():
                             svd_niter=args.init_svd_niter)
     if args.resume:
         net.load_adapter(args.resume)
+    if args.quant_aware != "none":
+        # Run configuration, not learned state: applied fresh every run
+        # (including resumes -- nothing about it lives in checkpoints).
+        _FAIL_CTX["phase"] = "quant_aware"
+        net.set_quant_aware(args.quant_aware, scale=args.quant_aware_scale,
+                            ref_model_dir=(args.quant_aware_ref_model
+                                           or args.init_ref_model),
+                            seed=args.shuffle_seed)
     ms = [n for n, p in [("embed", net.embed_weight), ("head", net.head_weight)] if p is not None]
     print(f" -- trainable params: {net.num_trainable():,} "
           f"(r={args.r}, alpha={args.alpha}, targets={net.target_modules}"
@@ -1769,6 +1801,7 @@ def _run_main():
             "eval2_dataset": args.eval2_dataset or "",
             "r": args.r, "alpha": args.alpha,
             "use_rslora": int(bool(args.use_rslora)), "init_lora": args.init_lora,
+            "quant_aware": args.quant_aware, "quant_aware_scale": args.quant_aware_scale,
             "lr": args.lr,
             "scheduler": args.scheduler, "warmup_steps": warmup_steps,
             "weight_decay": args.weight_decay, "batch": args.batch,

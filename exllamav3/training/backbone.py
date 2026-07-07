@@ -325,6 +325,17 @@ def frozen_weight_closure(linear, dtype: torch.dtype) -> Callable[[], torch.Tens
     return _timed_reconstruct(lambda: inner.get_weight_tensor().to(dtype))
 
 
+def linear_quant_bits(linear) -> Optional[float]:
+    """
+    Bits-per-weight of a linear's frozen storage, or ``None`` when the layer is
+    not trellis-quantized (an fp16/bf16 inner has no quantization error to be
+    aware of). Reads ``LinearEXL3.K`` (trellis bits per weight); behind the
+    seam so the quant-aware training modes never touch exllamav3 internals.
+    """
+    k = getattr(getattr(linear, "inner", None), "K", None)
+    return float(k) if k is not None else None
+
+
 def frozen_bias(linear, dtype: torch.dtype) -> Optional[torch.Tensor]:
     """The linear's frozen bias cast to ``dtype``, or ``None`` if it has none."""
     get_bias = getattr(linear.inner, "get_bias_tensor", None)
