@@ -1918,6 +1918,127 @@ autosplit (deprioritized), liger GeGLU + 4D per-head norm wiring (promoted by
 the Session-12/13 liger win), audit item A1 (dequant 3×→1×, the biggest
 remaining perf lever at ~19% of wall).
 
+### Session 14 — box verdict: PiSSA WINS; EVA built; pissa VRAM halved; |dB| telemetry
+
+> Box results from the Session-13 list (user-run), then this session's builds
+> (container-verified CPU tests; the eva gate + A/B are the next box items).
+
+**Box results — the three-way same-seed A/B/A2 (Llama-3.2-3B-Instruct 4bpw,
+malamus, r=128, α=128, 1 epoch = 17 steps, bf16, 2-GPU split, liger):**
+
+- **pissa wins, clearly.** Final EMA loss **3.0168** vs default **3.0475** vs
+  qerr **3.1045**; pissa tracks below default from ~step 3 on with the same
+  step-1 loss. The user reports the win **replicated on a larger-model run**.
+  Per the Session-13 decision rule: **pissa (α=r) is now the malamus
+  default**, and EVA was built this session (below).
+- **pissa's function preservation held live on the real model:** step-1 loss
+  3.1698 vs the default arm's 3.1697 (bf16 noise band, exactly as the gate
+  predicts). Captured principal variance at r=128: median 23.5% (init 12.1s).
+- **qerr underperformed BOTH at 4bpw** — and the diagnostics say why: its
+  step-1 loss (3.1630) starts slightly *below* base (it is the rank-128
+  repair of the bf16 model, as designed; captured error variance median
+  20.3%), but its grad norms collapse ~5× (0.45–0.83 vs 2–6 for the others)
+  and stay flat: after the quant-error repair, the remaining gradient is
+  small yet the task loss barely moves — at 4bpw the error-repair directions
+  neither help nor make room for the task. The Session-13 plan already
+  covers this branch: **re-test qerr at low bpw (2.5–3), where E is large,
+  before shelving it**; at 4bpw it is not competitive.
+- **VRAM:** pissa peaked at 5.63/6.20 GB vs 5.26/5.77 for default/qerr —
+  **+~0.4 GB per GPU, exactly the fp32 A0/B0 offsets** (they doubled the fp32
+  adapter footprint). Fixed this session (below).
+- **Caveat for the record:** these runs had eval OFF (`--eval-every 0`,
+  `--val-frac 0`; `--eval2-split test` was set but never sampled). At exactly
+  1 epoch the train-loss comparison is still fair-ish (every batch is unseen
+  when scored, same seed/order across arms), but the decision-grade pissa-vs-
+  eva A/B below should run with the eval split actually on, per the standing
+  checklist.
+- Also noticed in these logs: `|B|` printed as a constant (263.702 / 70.514)
+  for the init arms — the trained delta is invisible under the init
+  component's magnitude. Fixed below.
+
+**Built this session:**
+
+1. **pissa VRAM halved + spike removed** (`DiffLinear.set_init_offset` /
+   `_weight_closure`): the on-device offsets now live in the **compute
+   dtype** (the closure cast them to it on every reconstruction anyway →
+   bit-identical training), the **exact fp32 masters move to CPU**, and the
+   residual is applied with one fused out-of-place `addmm` (no `[in,out]`
+   product temporary; in-place would be unsafe for fp16 inner layers, whose
+   `get_weight_tensor` returns the stored weight itself). The masters are
+   what the sidecar, the converted rank-2r export and `apply_to_native` now
+   read — necessary for correctness, not just exactness: A≈A0 early on, so a
+   bf16-rounded A0 against the fp32 A leaves a spurious delta comparable to
+   the trained one. Expected on the 3B r=128 run: pissa overhead drops from
+   ~+0.4 to ~+0.2 GB/GPU. Sidecar/resume stays bit-exact fp32.
+2. **`|dB|` telemetry** (trainer step line, renamed from `|B|`): logs
+   ‖B − B0‖ with B0 = zero for default/eva (values identical to the old
+   column), the fp32 sidecar masters for pissa (survives resume), or a CPU
+   fp32 snapshot taken at startup for qerr (on a qerr resume this measures
+   movement since the resume). The "is the adapter still growing at the end"
+   read now works for init runs too.
+3. **EVA, fixed-rank (`--init-lora eva`)** per the Session-13 plan, now that
+   an init won on the box:
+   - **Mechanism:** a short no-grad pre-pass streams the training set's
+     activations through the *quantized* forward; each target's input feeds
+     a streaming top-(r+8) SVD sketch (block incremental PCA, a few MB per
+     site — no Gram matrices, no stored activations); A ← top-r
+     right-singular vectors, **B stays 0**, so step 0 is *exactly* the base
+     model in every dtype — no offset, no sidecar, standard save/merge path.
+     q/k/v (and gate/up) provably share their input tensor, so they share
+     one sketch and one A (asserted at runtime via data_ptr). Pad tokens are
+     dropped via the attention mask. Rank redistribution from the paper is
+     intentionally skipped (fixed-rank first, per the decision record).
+   - **Trainer:** `--init-eva-tokens` (default 65536) budgets the pre-pass,
+     drawn in order from the (packed) training blocks after data prep; on
+     `--resume` the eva init is skipped (the checkpoint's A/B already carry
+     it — nothing to reconstruct, unlike pissa). YAML launcher key
+     `init_eva_tokens` added (single/split only, like the rest). Run-log
+     schema UNCHANGED (init_lora already covers it — no CSV roll this time).
+   - **Gate:** `qlora_validate_native.py --init-lora eva` runs the real
+     pre-pass machinery on the gate prompt and demands **exact** function
+     preservation at BOTH tiers (rel < 1e-6; B=0 means any deviation at all
+     is a corrupted init path).
+   - **Tests** (`tests/test_lora_init.py`, all pass in-container): sketch
+     recovers a planted activation subspace streamed in folds (exact +
+     randomized, orthonormality, captured-variance vs exact SVD,
+     rank-starvation raises); apply path shares one sketch across q/k
+     (identical A), keeps o distinct, drops pad rows (a huge pad-only junk
+     direction must NOT appear in A), keeps B at zero with bit-exact forward
+     preservation, and refuses to run without pre-pass data. Plus the new
+     pissa compute-dtype-storage test; existing suites pass unchanged.
+
+**Box list for next session (in order):**
+
+1. **Gates:** `qlora_validate_native.py --model <model> --compute-dtype
+   bfloat16 --init-lora eva` (new), and re-run `--init-lora pissa` (cheap;
+   the offset storage changed — the fp32 tier is untouched by construction,
+   but confirm the bf16 band). Nothing trains on eva until it prints PASS.
+2. **The pissa-vs-eva same-seed A/B on malamus** — `--init-lora pissa` (α=r)
+   vs `--init-lora eva` vs default as the anchor arm, **with the eval split
+   actually on this time** (`--eval2-split test` + `--eval-every`, or
+   `--val-frac`). Watch held-out loss, the now-meaningful `|dB|` ramp, and
+   eva's pre-pass wall/captured-variance print (expect seconds and a
+   *lower* captured fraction than pissa's — activations are less
+   low-rank-concentrated than weights; that is normal and not a bug).
+3. **Confirm the pissa VRAM drop** on the same 3B r=128 config (expect
+   ~5.4/6.0 GB peak instead of 5.63/6.20).
+4. Carried: qerr low-bpw retest (2.5–3 bpw quant of the same model) before
+   shelving it; the standing eval-prereq note applies to any decision-grade
+   run.
+
+**Repo tidy (toward a PR-able boundary):** experiment-specific tooling moved
+to `examples/experiments/` (`make_style_dataset.py`, `score_style_density.py`,
+`train_rocinante_yoda.sh`, + a README defining the product-vs-experiment
+boundary). Live path references updated; historical session records above
+keep the old paths. Inventory vs the upstream fork point (v0.0.43,
+`c5d9c65`): ~13.1k inserted lines total, of which only ~250 touch core
+inference files (the backbone-seam discipline paid off) — the four standalone
+core bugfixes (gemma4 device, xformers ImportError, attn view→reshape,
+transformers nn.Parameter) are upstream-PR-able today independent of any
+training decision; the training subsystem's home (in-tree PR vs separate
+repo) is an open decision pending upstream appetite — see the Session-14
+discussion.
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)

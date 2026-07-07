@@ -23,7 +23,7 @@
 # more layers off cuda:0 (lower its cap) or drop BATCH.
 #
 # Usage:
-#   bash examples/train_rocinante_yoda.sh MODEL_DIR DATA_JSONL [OUT_DIR]
+#   bash examples/experiments/train_rocinante_yoda.sh MODEL_DIR DATA_JSONL [OUT_DIR]
 #
 # Override with env vars:
 #   PARALLEL         split | ddp                      (default split)

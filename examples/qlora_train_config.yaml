@@ -78,10 +78,11 @@ offload_embed_head_optim: false  # single/split only, requires torchao + train_e
 offload_activations: false       # single/split only
 use_liger: false                 # single/split only
 use_rslora: false                # single/split only; scale = alpha/sqrt(r) (rank-sweep stable)
-init_lora: default               # single/split only; default | pissa | qerr (SVD adapter inits;
+init_lora: default               # single/split only; default | pissa | qerr | eva (SVD adapter inits;
                                  #   gate first: qlora_validate_native.py --init-lora <mode>)
 init_svd_niter: 16               # randomized-SVD iterations for init_lora (0 = exact, slow)
 init_ref_model: null             # ORIGINAL unquantized HF model dir (required by init_lora: qerr)
+init_eva_tokens: 65536           # token budget for the eva activation pre-pass (init_lora: eva)
 compute_dtype: bfloat16
 no_grad_ckpt: false
 attn_impl: auto           # auto, eager, flash

@@ -625,7 +625,7 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
     from datasets import load_dataset
 
     # Accept either a Hub dataset id or a local file (e.g. a styled set produced
-    # by examples/make_style_dataset.py). load_dataset() can't sniff a bare local
+    # by examples/experiments/make_style_dataset.py). load_dataset() can't sniff a bare local
     # path, so pick the builder from the extension when the path exists.
     if os.path.exists(dataset_name):
         ext = os.path.splitext(dataset_name)[1].lower()
@@ -984,7 +984,7 @@ def _run_main():
                          "instead of alpha/r. At a FIXED rank this is just an "
                          "alpha rescale (r=64: alpha/8 -> same scale), but it "
                          "keeps the effective scale stable across rank sweeps.")
-    ap.add_argument("--init-lora", choices=["default", "pissa", "qerr"],
+    ap.add_argument("--init-lora", choices=["default", "pissa", "qerr", "eva"],
                     default="default",
                     help="Adapter initialization. default: kaiming A / zero B. "
                          "pissa: top-r principal components of the frozen base "
@@ -993,16 +993,25 @@ def _run_main():
                          "qerr: top-r SVD of the quantization error vs the "
                          "ORIGINAL model (needs --init-ref-model); training "
                          "starts from the closest rank-r repair of the bf16 "
-                         "model. Both need a validated step-0 gate: run "
+                         "model. eva: A = top-r right-singular vectors of each "
+                         "target's input activations, streamed from a short "
+                         "pre-pass of the training data through the quantized "
+                         "forward (B stays 0, so step 0 is exactly the base). "
+                         "All need a validated step-0 gate: run "
                          "qlora_validate_native.py --init-lora first.")
     ap.add_argument("--init-svd-niter", type=int, default=16,
                     help="Randomized-SVD subspace iterations for --init-lora "
                          "(PiSSA's fast-SVD recipe; 0 = exact full SVD, much "
-                         "slower). Default 16.")
+                         "slower). eva caps this at 8 for its incremental "
+                         "sketch updates. Default 16.")
     ap.add_argument("--init-ref-model", default=None,
                     help="Path to the ORIGINAL (unquantized) HF model dir; "
                          "required by --init-lora qerr to form the "
                          "quantization error.")
+    ap.add_argument("--init-eva-tokens", type=int, default=65536,
+                    help="Token budget for the --init-lora eva activation "
+                         "pre-pass (drawn in order from the training set; "
+                         "no gradients). Default 65536.")
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--weight-decay", type=float, default=0.01,
                     help="AdamW weight decay on the LoRA params (default 0.01).")
@@ -1361,10 +1370,11 @@ def _run_main():
     if args.head_vocab_chunk and net._head_slice is None:
         print(" -- note: --head-vocab-chunk set but this head can't slice; using "
               "the single-shot fused head.")
-    if args.init_lora != "default":
+    if args.init_lora in ("pissa", "qerr"):
         # SVD init from the loaded weights. On resume this is recomputed and then
         # OVERWRITTEN by load_adapter below (pissa restores its exact offsets from
         # the checkpoint sidecar) -- a few wasted seconds, kept for simplicity.
+        # (eva runs after the dataset is built -- it needs an activation pre-pass.)
         _FAIL_CTX["phase"] = "init_lora"
         net.apply_init_lora(args.init_lora, ref_model_dir=args.init_ref_model,
                             svd_niter=args.init_svd_niter)
@@ -1502,6 +1512,29 @@ def _run_main():
               f"~{real_tokens / max(1, len(examples)):.0f} real tok/block)")
         assert examples, "no training blocks after packing"
 
+    # eva init runs HERE (not with pissa/qerr above): it streams a no-grad
+    # activation pre-pass over the actual training batches. Skipped on resume --
+    # the checkpoint's A/B already carry the init, and unlike pissa there are no
+    # frozen offsets to reconstruct.
+    if args.init_lora == "eva" and not args.resume:
+        _FAIL_CTX["phase"] = "init_lora"
+
+        def eva_prepass():
+            used, i = 0, 0
+            while used < args.init_eva_tokens and i < len(examples):
+                batch = examples[i:i + args.batch]
+                i += len(batch)
+                input_ids, _, attn, pos_ids, seg_ids = collate(batch, pad_id)
+                used += int(attn.sum())
+                yield dict(input_ids=input_ids, attention_mask=attn,
+                           position_ids=pos_ids, seg_ids=seg_ids)
+
+        net.apply_init_lora("eva", svd_niter=args.init_svd_niter,
+                            eva_batches=eva_prepass())
+    elif args.init_lora == "eva":
+        print(" -- eva init skipped on --resume (the checkpoint's adapters "
+              "already carry it)")
+
     # Finalize step count (from --epochs) and warmup before building the schedule.
     args.steps, warmup_steps = resolve_steps_and_warmup(
         args, len(examples), args.batch * args.grad_accum)
@@ -1571,13 +1604,38 @@ def _run_main():
             for i in range(0, len(order) - args.batch + 1, args.batch):
                 yield [examples[j] for j in order[i:i + args.batch]]
 
+    # |dB| telemetry baseline. With an SVD init the raw ‖B‖ is dominated by the
+    # constant init component (a whole run moves it in the 4th decimal), so the
+    # step line logs the distance from the init instead: B0 is zero for the
+    # default init (‖B-B0‖ == ‖B‖, matching historical logs), the exact fp32
+    # sidecar masters for pissa (survives --resume), or a CPU fp32 snapshot
+    # taken here (qerr; on a qerr --resume this measures movement since the
+    # resume, not since the original init). CPU on purpose -- the snapshot must
+    # not eat VRAM, and the per-step transfer is microseconds per wrapper.
+    b0_refs = []
+    with torch.no_grad():
+        for w in net._wrappers:
+            if w.r <= 0:
+                continue
+            if w.init_b0_master is not None:
+                b0_refs.append((w, w.init_b0_master))
+            elif args.init_lora != "default" and w.lora_b.abs().max().item() > 0:
+                b0_refs.append((w, w.lora_b.detach().float().cpu().clone()))
+            else:
+                b0_refs.append((w, None))
+
     def adapter_b_norm():
         # Per-wrapper sums live on each wrapper's own device (they differ under a
         # layer split), so reduce each to a Python float before summing -- adding
         # tensors across cuda:0/cuda:1 would raise a cross-device error.
         with torch.no_grad():
-            return sum(w.lora_b.float().pow(2).sum().item() for w in net._wrappers
-                       if w.r > 0) ** 0.5
+            tot = 0.0
+            for w, b0 in b0_refs:
+                if b0 is None:
+                    tot += w.lora_b.float().pow(2).sum().item()
+                else:
+                    tot += (w.lora_b.detach().float().cpu() - b0).pow(2).sum().item()
+            return tot ** 0.5
 
     def save(tag):
         # Always leave net in train mode after; saving touches the adapter only.
@@ -1793,7 +1851,7 @@ def _run_main():
             ema = accum_loss if ema is None else 0.9 * ema + 0.1 * accum_loss
             print(f"  step {step:>5}/{args.steps} | loss {accum_loss:6.4f} | "
                   f"ema {ema:6.4f} | grad {gnorm:7.4f} | lr {sched.get_last_lr()[0]:.2e} | "
-                  f"|B| {adapter_b_norm():7.3f} | {tot_tps:,.0f} tok/s | {timer.step_line()}")
+                  f"|dB| {adapter_b_norm():7.3f} | {tot_tps:,.0f} tok/s | {timer.step_line()}")
 
             # Keep the failure record current so a later crash (or kill -9 at
             # least leaves the errors.log short a row, see _FAIL_CTX note)
