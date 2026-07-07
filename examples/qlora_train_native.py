@@ -449,6 +449,37 @@ def extract_single_turn(messages):
     return sys_text, user_text, asst_text
 
 
+def encode_prompt_response(tokenizer, prompt_text, response_text, eot):
+    """Tokenize a (prompt, response) pair for completion-only supervision.
+
+    The prompt and response are encoded SEPARATELY and concatenated by the
+    caller, so the prompt/response mask boundary is exact (masking by prompt
+    string length is vulnerable to tokenizer boundary merges). ``eot`` (the
+    architecture-correct turn-end token) is appended to the response text.
+
+    BOS is normalized to exactly one leading token: with
+    ``encode_special_tokens=True`` the underlying HF tokenizer may auto-prepend
+    ``<|begin_of_text|>`` (Llama-3 has ``add_bos_token=true``) *in addition to*
+    the literal one the chat template embeds, and *again* on the separately
+    encoded response -- so the prompt would start with two BOS and the response
+    with a spurious one. Drop the duplicates; a no-op for tokenizers that don't
+    auto-prepend. Returns ``(prompt_ids, response_ids)`` as python int lists.
+    """
+    prompt_ids = tokenizer.encode(
+        prompt_text, add_bos=False, encode_special_tokens=True
+    )[0].tolist()
+    resp_ids = tokenizer.encode(
+        response_text + eot, add_bos=False, encode_special_tokens=True
+    )[0].tolist()
+    bos = tokenizer.bos_token_id
+    if bos is not None:
+        while len(prompt_ids) >= 2 and prompt_ids[0] == bos and prompt_ids[1] == bos:
+            prompt_ids = prompt_ids[1:]
+        if resp_ids and resp_ids[0] == bos:
+            resp_ids = resp_ids[1:]
+    return prompt_ids, resp_ids
+
+
 def build_optimizer(param_groups, lr, optim="adamw"):
     """Build the optimizer over the trainable param groups.
 
@@ -673,31 +704,11 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
 
         # default_chat_prompt() already includes <|begin_of_text|> and ends with
         # the assistant header, so encode specials and don't add another BOS.
-        # Tokenize the prompt and the response SEPARATELY and concatenate, so the
-        # prompt/response boundary is exact -- masking by the prompt-string length
-        # is vulnerable to tokenizer boundary merges that mis-align the mask.
+        # encode_prompt_response tokenizes the prompt and the response SEPARATELY
+        # (exact mask boundary) and normalizes to exactly one leading BOS.
         prompt_text = build_prompt(user, system=sys_text or None)
-        prompt_ids = tokenizer.encode(
-            prompt_text, add_bos=False, encode_special_tokens=True
-        )[0].tolist()
-        resp_ids = tokenizer.encode(
-            resp + eot, add_bos=False, encode_special_tokens=True
-        )[0].tolist()
-
-        # Normalize BOS. With encode_special_tokens=True the underlying HF
-        # tokenizer adds <|begin_of_text|> itself (Llama-3 has add_bos_token=true),
-        # *in addition to* the literal one default_chat_prompt() embeds and *again*
-        # on the separately-encoded response -- so the prompt would start with two
-        # BOS and the response with a spurious one. Standard Llama-3 (and the BNB
-        # arm, which uses add_special_tokens=False) is exactly one BOS at the very
-        # start and none mid-sequence. Drop the duplicates; no-op for tokenizers
-        # that don't auto-prepend BOS.
-        bos = tokenizer.bos_token_id
-        if bos is not None:
-            while len(prompt_ids) >= 2 and prompt_ids[0] == bos and prompt_ids[1] == bos:
-                prompt_ids = prompt_ids[1:]
-            if resp_ids and resp_ids[0] == bos:
-                resp_ids = resp_ids[1:]
+        prompt_ids, resp_ids = encode_prompt_response(
+            tokenizer, prompt_text, resp, eot)
 
         input_ids = (prompt_ids + resp_ids)[:seq_len]
         labels = [-100] * len(prompt_ids) + list(resp_ids)

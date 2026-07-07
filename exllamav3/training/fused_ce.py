@@ -43,6 +43,13 @@ class FusedLinearCrossEntropy(torch.autograd.Function):
     elementwise, so it composes with both the token and vocab chunking; the
     backward multiplies the CE logit-gradient by the tanh Jacobian
     ``1 - (z_capped / cap)^2`` before the transposed matmul.
+
+    ``reduction``: ``"mean"`` (default) returns the scalar mean over the
+    supervised tokens -- the training loss, exact old behavior. ``"none"``
+    returns the per-token NLL vector ``[N]`` (zeros at ignored positions),
+    still streamed (the ``[tokens, vocab]`` logits are never materialized) --
+    the building block for per-sequence log-probabilities (DPO / KTO). The
+    backward then takes a per-token ``grad_output`` instead of a scalar.
     """
 
     # Dtype scheme (Session 11, audit item A4): the matmul runs in the WEIGHT's
@@ -72,6 +79,7 @@ class FusedLinearCrossEntropy(torch.autograd.Function):
         chunk: int,
         ignore_index: int,
         softcap: float,              # > 0: cap * tanh(logits / cap)
+        reduction: str,              # "mean" (scalar) | "none" (per-token [N])
     ) -> torch.Tensor:
         weight = weight_fn()
         n, d = hidden.shape
@@ -83,6 +91,8 @@ class FusedLinearCrossEntropy(torch.autograd.Function):
         m = int(valid.sum().item())
         denom = max(m, 1)
 
+        per_token = (hidden.new_zeros((n,), dtype=stat_dtype)
+                     if reduction == "none" else None)
         loss_sum = hidden.new_zeros((), dtype=stat_dtype)
         for start in range(0, n, chunk):
             end = min(start + chunk, n)
@@ -98,9 +108,10 @@ class FusedLinearCrossEntropy(torch.autograd.Function):
             safe_lbl = lbl_c.clamp_min(0)
             nll = -logp_c.gather(-1, safe_lbl.unsqueeze(-1)).squeeze(-1)  # [c]
             nll = torch.where(valid_c, nll, torch.zeros_like(nll))
-            loss_sum = loss_sum + nll.sum()
-
-        loss = loss_sum / denom
+            if per_token is not None:
+                per_token[start:end] = nll
+            else:
+                loss_sum = loss_sum + nll.sum()
 
         ctx.save_for_backward(hidden, labels)
         ctx.weight_fn = weight_fn
@@ -108,7 +119,10 @@ class FusedLinearCrossEntropy(torch.autograd.Function):
         ctx.ignore_index = ignore_index
         ctx.denom = denom
         ctx.softcap = cap
-        return loss.to(hidden.dtype)
+        ctx.reduction = reduction
+        if per_token is not None:
+            return per_token.to(hidden.dtype)
+        return (loss_sum / denom).to(hidden.dtype)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
@@ -118,12 +132,13 @@ class FusedLinearCrossEntropy(torch.autograd.Function):
         ignore_index = ctx.ignore_index
         denom = ctx.denom
         cap = ctx.softcap
+        per_token = ctx.reduction == "none"
         n, d = hidden.shape
 
         mm_dtype, stat_dtype = FusedLinearCrossEntropy._mm_dtype(hidden, weight)
         w = weight if weight.dtype == mm_dtype else weight.to(mm_dtype)
         grad_hidden = torch.empty_like(hidden, dtype=stat_dtype)
-        g_scale = grad_output.to(stat_dtype)
+        g_scale = grad_output.to(stat_dtype)     # scalar (mean) or [N] (none)
 
         for start in range(0, n, chunk):
             end = min(start + chunk, n)
@@ -143,7 +158,12 @@ class FusedLinearCrossEntropy(torch.autograd.Function):
             )
             probs_c = torch.where(valid_c.unsqueeze(-1), probs_c,
                                   torch.zeros_like(probs_c))
-            probs_c = probs_c / denom
+            if per_token:
+                # Each token is its own output: scale its logit-grad by its own
+                # incoming grad (no 1/denom -- the caller owns the reduction).
+                probs_c = probs_c * g_scale[start:end].unsqueeze(-1)
+            else:
+                probs_c = probs_c / denom
             if cap:
                 # Chain through the softcap: d(cap*tanh(z/cap))/dz = 1 - tanh^2
                 # = 1 - (z_capped / cap)^2.
@@ -151,10 +171,10 @@ class FusedLinearCrossEntropy(torch.autograd.Function):
             # The grad matmul also runs in the weight's dtype (probs cast down),
             # accumulating into the fp32 grad buffer -- same precision class as
             # every other matmul in a bf16 training step.
-            grad_hidden[start:end] = \
-                (probs_c.to(mm_dtype) @ w.t()).to(stat_dtype) * g_scale
+            gh = (probs_c.to(mm_dtype) @ w.t()).to(stat_dtype)
+            grad_hidden[start:end] = gh if per_token else gh * g_scale
 
-        return grad_hidden.to(hidden.dtype), None, None, None, None, None
+        return grad_hidden.to(hidden.dtype), None, None, None, None, None, None
 
 
 WeightSliceFn = Callable[[int, int], torch.Tensor]   # (n_start, n_features) -> [d, n_features]
@@ -183,11 +203,16 @@ class FusedLinearCrossEntropyVocabChunked(torch.autograd.Function):
     ``[token_chunk, vocab_chunk]`` tile (the cap is elementwise, so the online
     softmax statistics over capped tiles are exact); the backward chains the
     tanh Jacobian ``1 - (z_capped / cap)^2`` into the logit gradient.
+
+    ``reduction``: ``"mean"`` (scalar over supervised tokens, exact old
+    behavior) or ``"none"`` (per-token NLL vector ``[N]``, zeros at ignored
+    positions -- for per-sequence log-probabilities; the backward then takes a
+    per-token ``grad_output``).
     """
 
     @staticmethod
     def forward(ctx, hidden, labels, weight_slice_fn, vocab_size, vocab_chunk,
-                token_chunk, ignore_index, granularity, softcap):
+                token_chunk, ignore_index, granularity, softcap, reduction):
         n, d = hidden.shape
         cap = float(softcap or 0.0)
         compute_dtype = torch.promote_types(hidden.dtype, torch.float32)
@@ -235,7 +260,6 @@ class FusedLinearCrossEntropyVocabChunked(torch.autograd.Function):
 
         lse = run_max + torch.log(run_sum)                              # [N]
         nll = torch.where(valid, lse - tgt_logit, torch.zeros_like(lse))
-        loss = nll.sum() / denom
 
         ctx.save_for_backward(hidden, labels, lse)
         ctx.weight_slice_fn = weight_slice_fn
@@ -245,7 +269,10 @@ class FusedLinearCrossEntropyVocabChunked(torch.autograd.Function):
         ctx.ignore_index = ignore_index
         ctx.denom = denom
         ctx.softcap = cap
-        return loss.to(hidden.dtype)
+        ctx.reduction = reduction
+        if reduction == "none":
+            return nll.to(hidden.dtype)
+        return (nll.sum() / denom).to(hidden.dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -256,11 +283,12 @@ class FusedLinearCrossEntropyVocabChunked(torch.autograd.Function):
         ignore_index = ctx.ignore_index
         denom = ctx.denom
         cap = ctx.softcap
+        per_token = ctx.reduction == "none"
         n, d = hidden.shape
 
         compute_dtype = torch.promote_types(hidden.dtype, torch.float32)
         h_all = None                       # cached in the matmul dtype (see forward)
-        g_scale = grad_output.to(compute_dtype)
+        g_scale = grad_output.to(compute_dtype)  # scalar (mean) or [N] (none)
         grad_hidden = hidden.new_zeros((n, d), dtype=compute_dtype)
         valid = (labels != ignore_index)
 
@@ -290,16 +318,22 @@ class FusedLinearCrossEntropyVocabChunked(torch.autograd.Function):
                                 in_chunk.to(p.dtype).unsqueeze(-1))
                 p = p - onehot
                 p = torch.where(valid[t0:t1].unsqueeze(-1), p, torch.zeros_like(p))
+                if per_token:
+                    # Each token is its own output: scale by its own incoming
+                    # grad here (no 1/denom, no trailing scalar rescale).
+                    p = p * g_scale[t0:t1].unsqueeze(-1)
                 if cap:
                     # Chain through the softcap: d(cap*tanh(z/cap))/dz
                     # = 1 - (z_capped / cap)^2.
                     p = p * (1.0 - (logits / cap) ** 2)
                 # Grad matmul in the weight's dtype, fp32 accumulation buffer.
-                grad_hidden[t0:t1] += (p.to(w_v.dtype) @ w_v.t()).to(compute_dtype) / denom
+                gh = (p.to(w_v.dtype) @ w_v.t()).to(compute_dtype)
+                grad_hidden[t0:t1] += gh if per_token else gh / denom
 
-        grad_hidden *= g_scale
+        if not per_token:
+            grad_hidden *= g_scale
         return (grad_hidden.to(hidden.dtype),
-                None, None, None, None, None, None, None, None)
+                None, None, None, None, None, None, None, None, None)
 
 
 def fused_linear_cross_entropy_vocab_chunked(
@@ -313,6 +347,7 @@ def fused_linear_cross_entropy_vocab_chunked(
     granularity: int = 1,
     shift: bool = True,
     softcap: float = 0.0,
+    reduction: str = "mean",
 ) -> torch.Tensor:
     """Vocab-chunked variant of :func:`fused_linear_cross_entropy`.
 
@@ -322,6 +357,8 @@ def fused_linear_cross_entropy_vocab_chunked(
     :param vocab_chunk:     output-column tile size (rounded down to ``granularity``).
     :param granularity:     required alignment of a slice (e.g. EXL3 ``had_n``=128).
     :param softcap:         final-logit tanh softcap (Gemma); 0 = none.
+    :param reduction:       "mean" (scalar loss) or "none" (per-token NLL, shape
+                            ``[B*(T-1)]`` after the shift; zeros where ignored).
     """
     if shift:
         hidden = hidden[:, :-1, :].contiguous()
@@ -331,7 +368,7 @@ def fused_linear_cross_entropy_vocab_chunked(
     labels_flat = labels.reshape(-1)
     return FusedLinearCrossEntropyVocabChunked.apply(
         hidden_flat, labels_flat, weight_slice_fn, vocab_size, vocab_chunk,
-        token_chunk, ignore_index, granularity, softcap,
+        token_chunk, ignore_index, granularity, softcap, reduction,
     )
 
 
@@ -343,6 +380,7 @@ def fused_linear_cross_entropy(
     ignore_index: int = IGNORE_INDEX,
     shift: bool = True,
     softcap: float = 0.0,
+    reduction: str = "mean",
 ) -> torch.Tensor:
     """
     Convenience wrapper that handles the causal-LM label shift and flattening.
@@ -354,6 +392,8 @@ def fused_linear_cross_entropy(
     :param shift:     if True, predict token ``t+1`` from hidden at ``t``
                       (standard causal shift).
     :param softcap:   final-logit tanh softcap (Gemma); 0 = none.
+    :param reduction: "mean" (scalar loss) or "none" (per-token NLL, shape
+                      ``[B*(T-1)]`` after the shift; zeros where ignored).
     """
     if shift:
         hidden = hidden[:, :-1, :].contiguous()
@@ -362,5 +402,6 @@ def fused_linear_cross_entropy(
     hidden_flat = hidden.reshape(-1, d)
     labels_flat = labels.reshape(-1)
     return FusedLinearCrossEntropy.apply(
-        hidden_flat, labels_flat, weight_fn, chunk, ignore_index, softcap
+        hidden_flat, labels_flat, weight_fn, chunk, ignore_index, softcap,
+        reduction,
     )

@@ -16,6 +16,50 @@
 
 ---
 
+## Backlog — things to do later (consolidated, in priority order)
+
+> The single list of deferred work, gathered from the per-session "still open"
+> notes below (which remain the detailed context for each item). Newest
+> priority first, per the 2026-07 direction.
+
+1. **Quantization-aware LoRA (QA-LoRA-style).** Some form of
+   quantization-aware adapter training, so the trained delta survives the
+   merge-and-requantize deploy path by construction instead of by luck.
+   Motivation is already on the record: Session 3 arc C (low-rank deltas are
+   attenuated on the quantized base at inference — a signal-to-quant-noise
+   problem that worsens at 2.5–3 bpw), and the qerr init only repairs the
+   error at step 0. Directions to evaluate: QA-LoRA's group-wise
+   quantization-aware operator (Xu et al. 2023, arXiv:2309.14717) adapted to
+   the EXL3 trellis (non-trivial: their scheme targets uniform/group quant);
+   quantization-noise injection on the frozen-weight closure during training
+   (cheap, closure-level); or a differentiable proxy of the requantize step in
+   the loss. Ties directly into the merge-and-requantize story and the
+   low-bitrate flagship.
+2. **Near-inference-time training pipeline on KTO/DPO** (the reason Session 16
+   built preference training): a workflow where preference signal collected at
+   serving time feeds short adapter updates against the exact deployed quant.
+   Needs: the Session-16 box gates first, then plumbing (data capture format,
+   scheduled short runs, adapter hot-reload via `LoRA.from_directory`).
+3. **Trainable-head chunked CE** with a head/LoRA-B gradient (Session 10
+   next-work #1's remaining half; supersedes Session 9 #7).
+4. **Audit item A1 — dequant 3×→1× per linear per step** (~13% wall at the
+   measured 19% dequant share; worth doing opportunistically).
+5. **Liger GeGLU + 4D per-head q/k/v norm wiring** (promoted by the measured
+   Session-12 liger win: +8.8% tok/s, −1.1 GB/GPU from RMSNorm alone).
+6. **qerr low-bpw retest** (2.5–3 bpw, where the quantization error is large)
+   before shelving it; it lost to pissa/default at 4 bpw.
+7. **Head-aware balanced autosplit** (Session 10 #2 — deprioritized since the
+   fused softcap head removed the output-card logit spike).
+8. **Mirror newer features into the DDP arm** (A/B/C VRAM levers, `--optim`,
+   SVD inits, preference training — the last also needs a cross-rank
+   all-reduce for KTO's KL estimate) and **wire `qlora_train_pref.py` into the
+   YAML launcher**.
+9. **Query-tiled big-head attention** + drop the pointless GQA
+   `repeat_interleave` in the `sdpa` branch (Session 8 #1/#2; only bites at
+   8k+ context on head_dim-512 layers).
+
+---
+
 ## 0. RESOLVED — QLoRA-on-EXL3 works end-to-end (transformers-free)
 
 > Completed on branch `claude/determined-gauss-suq9gx`. The original question
@@ -2062,6 +2106,103 @@ discussion.
   quickstart + minimal config, feature overview, the PiSSA/EVA/qerr/rsLoRA
   init story (with the pissa-won-its-first-A/B status), project state, and
   links to this handoff; upstream's original README kept intact below it.
+
+### Session 16 — preference training: DPO + KTO on the native path
+
+> Branch `claude/qlora-kto-dpo-6t56y6`. Container-verified (CPU suites all
+> pass, incl. the new `tests/test_preference.py`); **nothing here is
+> box-verified yet** — the smoke list below is the next box session. Context:
+> the user was asked to add KTO and DPO, toward a later near-inference-time
+> training pipeline built on them (now backlog #2).
+
+**Credit / licensing:** loss semantics follow **HuggingFace TRL**'s stable
+trainers — `DPOTrainer` and `KTOTrainer` (KTO was promoted from
+`trl.experimental` to the stable API in
+[huggingface/trl#6175](https://github.com/huggingface/trl/pull/6175), training
+logic unchanged in that move). TRL is **Apache-2.0**, which permits this with
+attribution; this is an **independent reimplementation** against the native
+EXL3 path (TRL's trainers assume HF Transformers models), not copied code —
+credited in `exllamav3/training/preference.py`, here, and the README. Papers:
+DPO (Rafailov et al., arXiv:2305.18290), KTO (Ethayarajh et al.,
+arXiv:2402.01306), IPO (arXiv:2310.12036), SLiC hinge, APO.
+
+**The design in one paragraph.** Preference losses need per-sequence
+completion log-probabilities under the policy AND a frozen reference model.
+Both come from the existing net: (1) the fused CE heads gained a
+`reduction="none"` per-token mode (still streamed — no `[tokens, vocab]`
+logits, both single-shot and vocab-chunked, softcap composes; backward takes a
+per-token grad_output), and `NativeLlamaQLoRA.compute_logps()` row-sums it
+into `(logps[b], counts[b])`; (2) the **reference model is the frozen base via
+`net.adapters_disabled()`** — the PEFT disable-adapter trick, so **no second
+model copy is ever loaded**: each `DiffLinear` gets an `adapter_enabled` gate
+that drops the LoRA term AND the pissa offset together (they cancel at init,
+so what remains is exactly the base `W_q`); the trainable/LoRA embed+head are
+skipped too. For default/pissa/eva inits the reference therefore equals the
+step-0 policy *exactly* (DPO baseline loss = ln 2 ≈ 0.6931 — a built-in
+sanity anchor the trainer prints at step 0); **qerr is the exception** (its
+step 0 is the error-repaired model, the reference is the raw base — the
+trainer notes it).
+
+**What was built:**
+- `exllamav3/training/preference.py` — `dpo_loss` (sigmoid default +
+  `label_smoothing` = cDPO, `hinge`, `ipo` with length normalization; rewards
+  = β·logratio, detached), `kto_loss` (desirable/undesirable weights λ_D/λ_U,
+  batch KL reference point `mean(policy_kl − ref_kl).clamp(min=0)` from
+  mismatched pairs, `apo_zero_unpaired` variant, empty subsets OK),
+  `mismatched_kl_shift` (TRL's +1 rotation).
+- `fused_ce.py` — `reduction` arg on both fused heads + wrappers. NOTE the
+  autograd `Function.apply` arity grew (reduction is a required positional),
+  so any external direct `.apply` callers need the extra `"mean"` arg; the
+  wrapper functions default it.
+- `native_llama.py` — `DiffLinear.adapter_enabled`,
+  `NativeLlamaQLoRA.adapters_disabled()` (reentrant, exception-safe),
+  `compute_logps()` (frozen-head only; per-ROW sums, so **no packing** — a
+  packed block would sum across documents).
+- `examples/qlora_train_pref.py` — the preference trainer, `--method
+  {dpo,kto}`. DPO data = TRL explicit-prompt format
+  (`--prompt-key/--chosen-key/--rejected-key`; conversational message-list
+  values accepted); KTO = `--prompt-key/--completion-key/--label-key` +
+  label-balance report with a λ weight hint (KTO paper's [1, 4/3] band). One
+  DPO micro-batch runs chosen+rejected as ONE 2·batch-row policy forward + one
+  no-grad reference forward; KTO adds two no-grad KL forwards (mismatched
+  pairs, needs `--batch >= 2`, enforced). Example-weighted grad accumulation
+  (per-sequence losses — the SFT token-weighting doesn't apply). Reuses the
+  SFT trainer's machinery by import: chat templates + BOS normalization (the
+  encode path was refactored into a shared `encode_prompt_response` — the SFT
+  builder now calls it, byte-identical), scheduler/warmup/epochs, optimizers
+  (incl. 8-bit), save/save-best/checkpoint-every/resume + trainer_state,
+  run-log CSV (same schema — `arm=exl3-dpo|exl3-kto`, method hyperparams in
+  `notes`; **no CSV roll**), StepTimer/ThroughputMeter, `--inspect`,
+  `--init-lora` incl. an eva pre-pass fed from preference batches,
+  liger/offload/attn-impl/head-vocab-chunk/split. Step line shows
+  `acc`/`margin` (DPO) or `kl`/`rD`/`rU` (KTO); eval reports preference loss +
+  reward metrics, `--save-best` keyed on eval loss.
+- **Not in scope (v1):** DDP arm (KTO's KL needs a cross-rank all-reduce),
+  YAML launcher wiring, sample packing, trainable embed/head, live 🎭 samples.
+  Typical preference LRs are ~10–100× below SFT (default `--lr 5e-6`).
+- `tests/test_preference.py` — reduction-none parity/gradcheck/softcap on both
+  heads, per-row logps vs hand reference, every DPO/KTO variant vs hand
+  formulas (incl. KL clamp, weights, empty subsets, gradient direction),
+  adapter-disable == pure base (incl. with a pissa offset installed), context
+  manager reentrancy/exception safety. All CPU suites pass
+  (fused_ce/native_llama/qlora_grad/lora_init/preference).
+
+**Box list for next session (in order):**
+1. **Forward gate unchanged** (`qlora_validate_native.py` on the target base —
+   nothing about the validated forward changed), then a **DPO smoke**: tiny
+   paired set, `--inspect 3` first, then ~20 steps. Expect step-0 baseline
+   eval/loss ≈ **0.6931** and rising `acc`/`margin`. A cheap paired set:
+   `--dataset trl-lib/ultrafeedback_binarized` (prompt/chosen/rejected,
+   conversational values — the loader handles both).
+2. **KTO smoke**: e.g. `trl-lib/kto-mix-14k` (prompt/completion/label),
+   `--batch 2+`; watch `kl` stay finite and `rD`/`rU` separate.
+3. **Reference-forward correctness probe** (one-off): on a pissa-initialized
+   net, confirm `adapters_disabled()` logps == a default-init net's step-0
+   logps on the same batch (they should match to compute-dtype noise; this
+   pins the offset-drop logic on real weights).
+4. Then the real question for the pipeline goal: a small RP-preference set +
+   held-out eval, DPO vs KTO on the same data, judged per the standing
+   eval-prereq rules (same-seed pairs, eval split ON).
 
 ---
 

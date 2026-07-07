@@ -67,7 +67,7 @@ def test_loss_and_grad_parity():
     loss_ref = _naive(h1, weight, labels)
     loss_ref.backward()
 
-    loss_fused = FusedLinearCrossEntropy.apply(h2, labels, wf, 7, IGNORE_INDEX, 0.0)
+    loss_fused = FusedLinearCrossEntropy.apply(h2, labels, wf, 7, IGNORE_INDEX, 0.0, "mean")
     loss_fused.backward()
 
     assert torch.allclose(loss_ref, loss_fused, atol=1e-10), \
@@ -88,7 +88,7 @@ def test_ignore_index():
     h2 = h1.detach().clone().requires_grad_(True)
 
     loss_ref = _naive(h1, weight, labels); loss_ref.backward()
-    loss_fused = FusedLinearCrossEntropy.apply(h2, labels, wf, 5, IGNORE_INDEX, 0.0)
+    loss_fused = FusedLinearCrossEntropy.apply(h2, labels, wf, 5, IGNORE_INDEX, 0.0, "mean")
     loss_fused.backward()
 
     assert torch.allclose(loss_ref, loss_fused, atol=1e-10), "loss mismatch (ignore_index)"
@@ -110,7 +110,7 @@ def test_chunk_invariance():
     for chunk in (1, 7, 64, 1000):
         h = torch.randn(n, d, dtype=torch.float64, generator=torch.Generator().manual_seed(9),
                         requires_grad=True)
-        loss = FusedLinearCrossEntropy.apply(h, labels, wf, chunk, IGNORE_INDEX, 0.0)
+        loss = FusedLinearCrossEntropy.apply(h, labels, wf, chunk, IGNORE_INDEX, 0.0, "mean")
         loss.backward()
         results.append((loss.detach().clone(), h.grad.clone()))
 
@@ -129,7 +129,7 @@ def test_gradcheck():
     labels = torch.randint(0, v, (n,))
     h = torch.randn(n, d, dtype=torch.float64, requires_grad=True)
     ok = torch.autograd.gradcheck(
-        lambda h_: FusedLinearCrossEntropy.apply(h_, labels, wf, 5, IGNORE_INDEX, 0.0),
+        lambda h_: FusedLinearCrossEntropy.apply(h_, labels, wf, 5, IGNORE_INDEX, 0.0, "mean"),
         (h,), eps=1e-6, atol=1e-6, rtol=1e-4,
     )
     assert ok
@@ -174,7 +174,7 @@ def test_vocab_chunked_parity():
             h2 = h1.detach().clone().requires_grad_(True)
             loss_ref = _naive(h1, weight, labels); loss_ref.backward()
             loss = FusedLinearCrossEntropyVocabChunked.apply(
-                h2, labels, _slice_fn(weight), v, vchunk, tchunk, IGNORE_INDEX, 1, 0.0)
+                h2, labels, _slice_fn(weight), v, vchunk, tchunk, IGNORE_INDEX, 1, 0.0, "mean")
             loss.backward()
             assert torch.allclose(loss_ref, loss, atol=1e-10), \
                 f"loss mismatch (vchunk={vchunk}, tchunk={tchunk})"
@@ -193,10 +193,10 @@ def test_vocab_chunked_matches_single_shot():
 
     h1 = torch.randn(n, d, dtype=torch.float64, requires_grad=True)
     h2 = h1.detach().clone().requires_grad_(True)
-    loss_a = FusedLinearCrossEntropy.apply(h1, labels, lambda: weight, 7, IGNORE_INDEX, 0.0)
+    loss_a = FusedLinearCrossEntropy.apply(h1, labels, lambda: weight, 7, IGNORE_INDEX, 0.0, "mean")
     loss_a.backward()
     loss_b = FusedLinearCrossEntropyVocabChunked.apply(
-        h2, labels, _slice_fn(weight), v, 16, 7, IGNORE_INDEX, 1, 0.0)
+        h2, labels, _slice_fn(weight), v, 16, 7, IGNORE_INDEX, 1, 0.0, "mean")
     loss_b.backward()
     assert torch.allclose(loss_a, loss_b, atol=1e-12), "loss differs from single-shot"
     assert torch.allclose(h1.grad, h2.grad, atol=1e-11), "grad differs from single-shot"
@@ -211,7 +211,7 @@ def test_vocab_chunked_gradcheck():
     h = torch.randn(n, d, dtype=torch.float64, requires_grad=True)
     ok = torch.autograd.gradcheck(
         lambda h_: FusedLinearCrossEntropyVocabChunked.apply(
-            h_, labels, _slice_fn(weight), v, 8, 5, IGNORE_INDEX, 1, 0.0),
+            h_, labels, _slice_fn(weight), v, 8, 5, IGNORE_INDEX, 1, 0.0, "mean"),
         (h,), eps=1e-6, atol=1e-6, rtol=1e-4,
     )
     assert ok
@@ -244,7 +244,7 @@ def test_low_precision_weight_parity():
     rel = lambda a, b: abs(a - b) / max(abs(b), 1e-9)
 
     loss = FusedLinearCrossEntropy.apply(hidden, labels, lambda: weight_bf, 16,
-                                         IGNORE_INDEX, 0.0)
+                                         IGNORE_INDEX, 0.0, "mean")
     loss.backward()
     g_fused, hidden.grad = hidden.grad, None
     assert rel(loss.item(), ref.item()) < 2e-3, (loss.item(), ref.item())
@@ -252,7 +252,7 @@ def test_low_precision_weight_parity():
     assert cos > 0.999, f"grad cosine {cos}"
 
     loss_vc = FusedLinearCrossEntropyVocabChunked.apply(
-        hidden, labels, _slice_fn(weight_bf), v, 128, 16, IGNORE_INDEX, 1, 0.0)
+        hidden, labels, _slice_fn(weight_bf), v, 128, 16, IGNORE_INDEX, 1, 0.0, "mean")
     loss_vc.backward()
     g_vc, hidden.grad = hidden.grad, None
     assert rel(loss_vc.item(), ref.item()) < 2e-3, (loss_vc.item(), ref.item())
@@ -291,7 +291,7 @@ def test_softcap_parity():
         loss_ref = _naive_softcap(h1, weight, labels, cap); loss_ref.backward()
 
         loss = FusedLinearCrossEntropy.apply(h2, labels, lambda: weight, chunk,
-                                             IGNORE_INDEX, cap)
+                                             IGNORE_INDEX, cap, "mean")
         loss.backward()
         assert torch.allclose(loss_ref, loss, atol=1e-10), \
             f"softcap loss mismatch (chunk={chunk})"
@@ -299,7 +299,7 @@ def test_softcap_parity():
             f"softcap grad mismatch (chunk={chunk})"
 
         loss_vc = FusedLinearCrossEntropyVocabChunked.apply(
-            h3, labels, _slice_fn(weight), v, 16, chunk, IGNORE_INDEX, 1, cap)
+            h3, labels, _slice_fn(weight), v, 16, chunk, IGNORE_INDEX, 1, cap, "mean")
         loss_vc.backward()
         assert torch.allclose(loss_ref, loss_vc, atol=1e-10), \
             f"softcap vocab-chunked loss mismatch (chunk={chunk})"
@@ -316,13 +316,13 @@ def test_softcap_gradcheck():
     h = torch.randn(n, d, dtype=torch.float64, requires_grad=True)
     ok = torch.autograd.gradcheck(
         lambda h_: FusedLinearCrossEntropy.apply(h_, labels, lambda: weight, 5,
-                                                 IGNORE_INDEX, cap),
+                                                 IGNORE_INDEX, cap, "mean"),
         (h,), eps=1e-6, atol=1e-6, rtol=1e-4,
     )
     assert ok
     ok = torch.autograd.gradcheck(
         lambda h_: FusedLinearCrossEntropyVocabChunked.apply(
-            h_, labels, _slice_fn(weight), v, 8, 5, IGNORE_INDEX, 1, cap),
+            h_, labels, _slice_fn(weight), v, 8, 5, IGNORE_INDEX, 1, cap, "mean"),
         (h,), eps=1e-6, atol=1e-6, rtol=1e-4,
     )
     assert ok
