@@ -99,15 +99,26 @@ resume: null
 reset_optimizer: false
 
 # Evaluation / run log
-eval_split: null
-eval_dataset: null
-eval2_dataset: null
+#
+# PRIMARY eval (what --save-best and the printed "val" loss track). The usual
+# setup for a dataset with its own held-out split is just:
+#   eval_split: test
+#   eval_every: 50
+# eval2_* is an optional SECOND monitor with the same options (e.g. wikitext
+# LM loss watched alongside your task eval); it never drives save_best.
+eval_split: null          # split of eval_dataset (or dataset) used as held-out eval
+eval_dataset: null        # defaults to `dataset`
+eval_config: null         # HF dataset config for the primary eval set
+eval_text_key: null       # set (e.g. text) for a plain-text LM eval instead of SFT
+eval_max_samples: 0       # cap source rows (0 = all)
+eval_max_blocks: 0        # cap packed LM blocks when eval_text_key is set (0 = all)
+eval2_dataset: null       # enable the second monitor by naming a dataset here
 eval2_split: test
-eval2_config: null
-eval2_text_key: null
+eval2_config: null        # e.g. wikitext-2-raw-v1 for the wikitext dataset
+eval2_text_key: null      # e.g. text -> LM loss over packed seq_len blocks
 eval2_max_samples: 0
-eval2_max_blocks: 0
-val_frac: 0.0
-eval_every: 0
-save_best: false
+eval2_max_blocks: 0       # size eval2 to roughly match the primary eval set
+val_frac: 0.0             # no eval_split? carve this fraction off train instead
+eval_every: 0             # report held-out loss every N steps (0 = only at the end)
+save_best: false          # save only when the PRIMARY held-out loss improves
 run_log: qlora_runs.csv

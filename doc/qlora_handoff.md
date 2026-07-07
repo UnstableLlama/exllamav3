@@ -2015,8 +2015,12 @@ malamus, r=128, α=128, 1 epoch = 17 steps, bf16, 2-GPU split, liger):**
    but confirm the bf16 band). Nothing trains on eva until it prints PASS.
 2. **The pissa-vs-eva same-seed A/B on malamus** — `--init-lora pissa` (α=r)
    vs `--init-lora eva` vs default as the anchor arm, **with the eval split
-   actually on this time** (`--eval2-split test` + `--eval-every`, or
-   `--val-frac`). Watch held-out loss, the now-meaningful `|dB|` ramp, and
+   actually on this time**: **`--eval-split test` + `--eval-every N`** (or
+   `--val-frac`). NOTE the earlier session notes said `--eval2-split test` —
+   that was wrong-by-omission: `--eval2-*` is the *second* monitor and inert
+   without `--eval2-dataset`, which is exactly why the Session-14 runs came
+   out eval-less. The PRIMARY eval (the one `--save-best` tracks) is the
+   `--eval-*` family. Watch held-out loss, the now-meaningful `|dB|` ramp, and
    eva's pre-pass wall/captured-variance print (expect seconds and a
    *lower* captured fraction than pissa's — activations are less
    low-rank-concentrated than weights; that is normal and not a bug).
@@ -2038,6 +2042,26 @@ transformers nn.Parameter) are upstream-PR-able today independent of any
 training decision; the training subsystem's home (in-tree PR vs separate
 repo) is an open decision pending upstream appetite — see the Session-14
 discussion.
+
+### Session 15 — eval1/eval2 option parity, YAML polish, fork README
+
+- **Primary-eval parity with eval2** (both backends + launcher + sample
+  YAML): `--eval-config`, `--eval-text-key` (plain-text LM mode for the
+  PRIMARY eval — `--save-best` then tracks that LM loss), `--eval-max-samples`,
+  `--eval-max-blocks`. Run-log schema unchanged (none of these are logged
+  fields — no CSV roll).
+- **Root cause of the Session-14 eval-less runs identified and corrected in
+  the box list:** earlier notes said `--eval2-split test`, but `--eval2-*` is
+  the *second* monitor and inert without `--eval2-dataset`. The primary eval
+  is the `--eval-*` family: use **`--eval-split test` + `--eval-every N`**.
+- **Sample YAML** (`qlora_train_config.yaml`): eval section rewritten with a
+  worked "usual setup" comment; verified programmatically that the file
+  covers EVERY launcher-accepted key (flatten → validate → build_backend_argv
+  round-trip, zero missing/unknown).
+- **README.md** now opens with the fork spiel: why-EXL3-for-QLoRA, YAML
+  quickstart + minimal config, feature overview, the PiSSA/EVA/qerr/rsLoRA
+  init story (with the pissa-won-its-first-A/B status), project state, and
+  links to this handoff; upstream's original README kept intact below it.
 
 ---
 
