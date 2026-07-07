@@ -54,6 +54,7 @@ optim: paged_adamw8bit
 ### What's in the box
 
 - **Single-GPU, multi-GPU layer-split (`parallel: split`), and DDP (`parallel: ddp`)** training of LoRA adapters over a frozen EXL3 base — plus optional embedding/LM-head training (full or low-rank).
+- **Preference optimization: DPO and KTO** (`examples/qlora_train_pref.py --method dpo|kto`) with the frozen quantized base as the reference model (adapter-disable trick — no second model copy). Loss semantics follow [HuggingFace TRL](https://github.com/huggingface/trl)'s stable `DPOTrainer`/`KTOTrainer` (with credit — see below), so β/loss-variant hyperparameters transfer directly; variants: sigmoid/cDPO, hinge (SLiC), IPO, KTO, APO-zero-unpaired.
 - **Memory levers** for long context on consumer cards: gradient checkpointing, activation offload to CPU RAM, fused/chunked cross-entropy (chunked over the vocab too, for 256k-vocab models), 8-bit and paged optimizers, Liger kernels (RMSNorm/RoPE/SwiGLU).
 - **A real eval harness**: held-out loss from your dataset's own split (`eval_split`) or a carved fraction (`val_frac`), an optional second monitor set (`eval2_*`, e.g. wikitext LM loss watched next to your task loss), `save_best` checkpointing, periodic live sample generations, and a per-run CSV log of hyperparameters/losses/VRAM/throughput.
 - **Correctness gates, not vibes**: `qlora_validate_native.py` checks the differentiable forward against the native inference forward, the Liger backward against plain torch, packing isolation, and each adapter init's step-0 math — before you spend GPU-days. A CPU test suite covers the gradient path end-to-end.
@@ -69,6 +70,10 @@ Short SFT runs spend a large fraction of their steps just growing the adapter of
 - **`use_rslora`** — rank-stabilized scaling (`alpha/sqrt(r)`) for rank sweeps.
 
 Each init has a hard step-0 gate in `qlora_validate_native.py --init-lora <mode>`.
+
+### Credits
+
+The DPO/KTO preference-training implementation follows the loss semantics of **[HuggingFace TRL](https://github.com/huggingface/trl)**'s stable `DPOTrainer` and `KTOTrainer` (KTO stabilized in [trl#6175](https://github.com/huggingface/trl/pull/6175)). TRL is Apache-2.0 licensed, Copyright The HuggingFace Team; this fork reimplements the formulations independently against the EXL3 native training path rather than reusing TRL code. Underlying methods: DPO ([Rafailov et al. 2023](https://arxiv.org/abs/2305.18290)), KTO ([Ethayarajh et al. 2024](https://arxiv.org/abs/2402.01306)), IPO, SLiC.
 
 ### Project status
 

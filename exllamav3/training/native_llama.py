@@ -139,7 +139,19 @@ class DiffLinear(nn.Module):
     weight in the backward pass instead of stashing it (activation-memory win).
 
     Shapes: ``a`` is ``[in, r]``, ``b`` is ``[r, out]`` (``y = x @ W + s·x@a@b``).
+
+    ``adapter_enabled`` (default True) gates the whole trainable surface at
+    call time: when False the forward is the PURE frozen base projection --
+    no LoRA term AND no PiSSA offset (the offset exists only to cancel the
+    pissa-initialized adapter; dropping them together reproduces the exact
+    base weight ``W_q``). This is how a preference-training reference model
+    (DPO/KTO) is realized without a second model copy -- see
+    ``NativeLlamaQLoRA.adapters_disabled``.
     """
+
+    # Class default so headless instances (tests build nets via __new__) and
+    # pre-toggle checkpoints behave as before.
+    adapter_enabled = True
 
     def __init__(
         self,
@@ -231,6 +243,15 @@ class DiffLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         xc = x.to(self.compute_dtype)
+        if not self.adapter_enabled:
+            # Reference view: pure frozen base -- no LoRA term, no pissa offset
+            # (backbone.frozen_weight_closure directly, bypassing the residual).
+            return EXL3LoRAFunction.apply(
+                xc, None, None,
+                backbone.frozen_bias(self.linear, self.compute_dtype),
+                1.0,
+                backbone.frozen_weight_closure(self.linear, self.compute_dtype),
+            )
         return EXL3LoRAFunction.apply(
             xc, self.lora_a, self.lora_b,
             backbone.frozen_bias(self.linear, self.compute_dtype),
@@ -277,6 +298,12 @@ class NativeLlamaQLoRA(nn.Module):
     use_liger = False
     offload_activations = False
     init_lora = "default"
+    # When True (via the adapters_disabled() context manager) the forward runs
+    # as the PURE frozen base model: per-linear LoRA + pissa offsets off, the
+    # trainable/LoRA embedding and LM head ignored. Used for the reference-model
+    # logprobs in preference training (DPO/KTO) -- the PEFT "disable adapter"
+    # trick, so no second model copy is ever loaded.
+    _adapters_off = False
 
     def __init__(
         self,
@@ -899,7 +926,7 @@ class NativeLlamaQLoRA(nn.Module):
         # forward_ls). Start on the first block's device. The embedding is loaded
         # on CPU (prefer_cpu); backbone.embed_tokens runs the lookup there.
         first_device = self._block_devices[0]
-        if self.embed_weight is not None:
+        if self.embed_weight is not None and not self._adapters_off:
             # Trainable input embedding: lookup against the fp32 master weight,
             # then the same multiplier/normalize the frozen path applies.
             ew = self.embed_weight
@@ -914,7 +941,7 @@ class NativeLlamaQLoRA(nn.Module):
         # base embed scaling; the from-zero B absorbs any constant factor, so this is
         # as expressive as adding before the scale. requires_grad carries back to a/b
         # (so the grad-checkpoint detach below leaves the path intact).
-        if self.embed_lora_a is not None:
+        if self.embed_lora_a is not None and not self._adapters_off:
             ea = self.embed_lora_a.to(self.compute_dtype)
             eb = self.embed_lora_b.to(self.compute_dtype)
             delta = F.embedding(input_ids.to(ea.device), ea) @ eb       # [b, t, hid]
@@ -1065,8 +1092,9 @@ class NativeLlamaQLoRA(nn.Module):
         # (train_head OR lora_head) -- the fused heads are frozen-head only (no
         # weight/LoRA gradient). Memory scales with the supervised token count.
         # A frozen softcapped head (Gemma) stays on the fused paths below, which
-        # apply the tanh cap in-tile.
-        if self.train_head or self.lora_head:
+        # apply the tanh cap in-tile. Under adapters_disabled() the trainable/
+        # LoRA head is part of the adapter, so the frozen fused path is used.
+        if (self.train_head or self.lora_head) and not self._adapters_off:
             d = hidden.shape[-1]
             hs = hidden[:, :-1, :].reshape(-1, d)                 # shift
             lbl = labels[:, 1:].reshape(-1).to(hs.device)
@@ -1130,6 +1158,85 @@ class NativeLlamaQLoRA(nn.Module):
             chunk=chunk, ignore_index=ignore_index, shift=True,
             softcap=self.final_softcap,
         )
+
+    # --- preference training (DPO / KTO) ------------------------------------
+
+    @contextlib.contextmanager
+    def adapters_disabled(self):
+        """Run the forward as the PURE frozen base model (the reference model
+        for DPO/KTO), the PEFT disable-adapter trick -- no second model copy:
+
+          * every per-linear LoRA term is skipped AND any pissa offset with it
+            (they cancel at init, so dropping both is exactly the base ``W_q``);
+          * the trainable / LoRA embedding and LM head are ignored.
+
+        For ``init_lora`` default/eva/pissa the reference equals the step-0
+        policy exactly. For ``qerr`` the step-0 policy is the error-repaired
+        model while the reference is the raw quantized base, so rewards start
+        slightly nonzero -- the trainer prints a note.
+
+        Restores the previous state on exit (exception-safe); reentrant."""
+        prev_net = self._adapters_off
+        prev = [w.adapter_enabled for w in self._wrappers]
+        self._adapters_off = True
+        for w in self._wrappers:
+            w.adapter_enabled = False
+        try:
+            yield self
+        finally:
+            self._adapters_off = prev_net
+            for w, p in zip(self._wrappers, prev):
+                w.adapter_enabled = p
+
+    def compute_logps(
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        chunk: int = DEFAULT_CHUNK,
+        ignore_index: int = IGNORE_INDEX,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-sequence summed completion log-probabilities (DPO / KTO).
+
+        Returns ``(logps, counts)``: ``logps[b]`` = sum over the supervised
+        (shifted-label != ignore_index) positions of ``log p(label | prefix)``,
+        fp32, differentiable; ``counts[b]`` = the number of supervised tokens
+        (for length-normalized variants like IPO). Streams through the fused
+        heads with ``reduction="none"``, so the ``[tokens, vocab]`` logits are
+        never materialized -- same memory story as :meth:`compute_loss`.
+
+        Matches TRL's convention (sum over completion tokens, prompt masked).
+        One sequence per batch ROW: sample packing is not supported here (a
+        packed block would sum across its documents), so no ``seg_ids``.
+        The trainable/LoRA head paths are not wired (preference training runs
+        frozen-head); use plain LoRA targets.
+        """
+        assert not ((self.train_head or self.lora_head)
+                    and not self._adapters_off), \
+            "compute_logps supports the frozen LM head only (no --train-head/--lora-head)"
+        hidden = self.forward(input_ids, attention_mask)
+        hidden = backbone.to_device(hidden, self._head_device)
+        labels = labels.to(hidden.device)
+        if self.head_vocab_chunk > 0 and self._head_slice is not None:
+            slice_fn, vocab_size, granularity = self._head_slice
+            nll = fused_linear_cross_entropy_vocab_chunked(
+                hidden, slice_fn, labels, vocab_size,
+                vocab_chunk=self.head_vocab_chunk, token_chunk=chunk,
+                ignore_index=ignore_index, granularity=granularity, shift=True,
+                softcap=self.final_softcap, reduction="none",
+            )
+        else:
+            nll = fused_linear_cross_entropy(
+                hidden, self.lm_head_weight_fn(), labels,
+                chunk=chunk, ignore_index=ignore_index, shift=True,
+                softcap=self.final_softcap, reduction="none",
+            )
+        b, t = labels.shape
+        # Ignored positions carry an exact 0 in the per-token NLL, so the row
+        # sum is the completion logprob with the prompt contributing nothing.
+        logps = -nll.view(b, t - 1).float().sum(dim=-1)
+        counts = (labels[:, 1:] != ignore_index).sum(dim=-1)
+        return logps, counts
 
     # --- adapter parameters / IO ------------------------------------------
 

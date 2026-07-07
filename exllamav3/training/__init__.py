@@ -35,6 +35,11 @@ from .native_llama import (
     DiffLinear,
     DEFAULT_TARGET_MODULES,
 )
+from .preference import (
+    dpo_loss,
+    kto_loss,
+    mismatched_kl_shift,
+)
 
 __all__ = [
     "EXL3LoRAFunction",
@@ -47,4 +52,7 @@ __all__ = [
     "NativeLlamaQLoRA",
     "DiffLinear",
     "DEFAULT_TARGET_MODULES",
+    "dpo_loss",
+    "kto_loss",
+    "mismatched_kl_shift",
 ]
