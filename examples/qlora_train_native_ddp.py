@@ -221,6 +221,20 @@ def _run_main():
                          "--val-frac. Built identically on every rank.")
     ap.add_argument("--eval-dataset", default=None,
                     help="Dataset id/path for --eval-split (defaults to --dataset).")
+    ap.add_argument("--eval-config", default=None,
+                    help="HF dataset config for the primary eval set (parity "
+                         "with --eval2-config).")
+    ap.add_argument("--eval-text-key", default=None,
+                    help="If set, treat the PRIMARY eval set as PLAIN TEXT and "
+                         "compute a language-modeling loss over packed --seq-len "
+                         "blocks, exactly like --eval2-text-key. --save-best then "
+                         "tracks that LM loss.")
+    ap.add_argument("--eval-max-samples", type=int, default=0,
+                    help="Cap source rows for the primary eval set (0 = all; "
+                         "parity with --eval2-max-samples).")
+    ap.add_argument("--eval-max-blocks", type=int, default=0,
+                    help="Cap packed LM blocks for --eval-text-key (0 = all; "
+                         "parity with --eval2-max-blocks).")
     ap.add_argument("--eval2-dataset", default=None,
                     help="A SECOND held-out eval set, reported alongside the "
                          "primary one each --eval-every and at the end (e.g. your "
@@ -379,16 +393,28 @@ def _run_main():
     # train BEFORE sharding so those rows never leak into any training shard.
     val_examples = []
     if args.eval_split:
-        val_examples = build_sft_examples(
-            model, tokenizer, args.eval_dataset or args.dataset, 0, args.seq_len,
-            instruction_key=args.instruction_key, context_key=args.context_key,
-            response_key=args.response_key, split=args.eval_split,
-            clean_text=clean_text,
-            min_response_words=args.min_response_words,
-            uppercase_response=args.uppercase_response,
-            messages_key=args.messages_key,
-            prompt_format=args.prompt_format,
-        )
+        if args.eval_text_key:
+            # Plain-text LM eval (parity with --eval2-text-key); what
+            # --save-best tracks. Built identically on every rank.
+            val_examples = build_lm_examples(
+                tokenizer, args.eval_dataset or args.dataset, args.eval_split,
+                args.seq_len, text_key=args.eval_text_key,
+                max_samples=args.eval_max_samples,
+                config_name=args.eval_config,
+                max_blocks=args.eval_max_blocks)
+        else:
+            val_examples = build_sft_examples(
+                model, tokenizer, args.eval_dataset or args.dataset,
+                args.eval_max_samples, args.seq_len,
+                instruction_key=args.instruction_key, context_key=args.context_key,
+                response_key=args.response_key, split=args.eval_split,
+                clean_text=clean_text,
+                min_response_words=args.min_response_words,
+                uppercase_response=args.uppercase_response,
+                messages_key=args.messages_key,
+                prompt_format=args.prompt_format,
+                config_name=args.eval_config,
+            )
     elif args.val_frac > 0:
         n_val = max(1, int(len(examples) * args.val_frac))
         val_examples, examples = examples[:n_val], examples[n_val:]

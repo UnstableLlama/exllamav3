@@ -49,7 +49,9 @@ COMMON_KEYS = {
     "train_head", "compute_dtype", "no_grad_ckpt", "attn_impl", "ce_chunk",
     "head_vocab_chunk", "max_grad_norm", "save_every", "checkpoint_every",
     "keep_checkpoints", "resume", "reset_optimizer", "eval_split",
-    "eval_dataset", "eval2_dataset", "eval2_split", "eval2_config",
+    "eval_dataset", "eval_config", "eval_text_key", "eval_max_samples",
+    "eval_max_blocks",
+    "eval2_dataset", "eval2_split", "eval2_config",
     "eval2_text_key", "eval2_max_samples", "eval2_max_blocks", "val_frac",
     "eval_every", "save_best", "run_log",
 }
