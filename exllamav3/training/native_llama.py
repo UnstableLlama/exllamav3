@@ -1608,7 +1608,7 @@ class NativeLlamaQLoRA(nn.Module):
         """
         Write the trained adapters in PEFT format, keyed by the native module
         path so they load with both PEFT and exllamav3's ``LoRA.from_directory``
-        (and hence ``examples/qlora_infer_native.py``).
+        (and hence ``training/qlora_infer_native.py``).
 
         Internal tensors are ``a=[in, r]`` / ``b=[r, out]``; PEFT stores
         ``lora_A=[r, in]`` / ``lora_B=[out, r]``, so we transpose on save and

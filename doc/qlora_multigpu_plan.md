@@ -92,7 +92,7 @@ The training loop talks to one object, three implementations, so no scattered
 
 ### Shared-loop extraction
 Move `build_sft_examples`, masking, `collate`, `evaluate`, `save`, and the step
-loop into `examples/qlora_sft_common.py`, imported by the entry script — kills the
+loop into `training/qlora_sft_common.py`, imported by the entry script — kills the
 byte-for-byte duplication between the single and DDP scripts (a third copy would
 be worse). DDP-specific bits live behind the `ParallelContext`.
 
@@ -110,7 +110,7 @@ be worse). DDP-specific bits live behind the `ParallelContext`.
    (`--parallel single|split` + `--reserve/--use-per-device`, per-card VRAM
    report) and **validated on 2×3090** — a 20-step 1B split run trained cleanly
    (loss 2.72→1.58, memory split cuda:0 0.89 / cuda:1 4.42 GB). The shared-loop
-   extraction into `examples/qlora_sft_common.py` + `ParallelContext` (the dedup,
+   extraction into `training/qlora_sft_common.py` + `ParallelContext` (the dedup,
    steps 2–3) is **not started** — touches both working scripts, no functional
    gain; do it carefully in CPU-suite-checkable pieces if/when wanted.
 4. Wrapper dispatch + flip `train_rocinante_yoda.sh` default to `--parallel split`.

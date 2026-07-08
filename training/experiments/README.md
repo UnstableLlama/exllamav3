@@ -5,7 +5,7 @@ sessions (see `doc/qlora_handoff.md`). They are kept for reproducibility of
 past results but are NOT part of the reusable training path, and would not be
 included in any upstream PR of the training work.
 
-The reusable surface lives one level up in `examples/`:
+The reusable surface lives one level up in `training/`:
 
 - `qlora_train_native.py` / `qlora_train_native_ddp.py` -- the trainers
 - `qlora_train.py` + `qlora_train_config.yaml` -- the YAML launcher
@@ -25,5 +25,7 @@ In this directory:
   script (Session 3/4); paths and budgets are specific to that box/run, but
   the split-vs-ddp notes in its header are still a good worked example.
 
-Moved here from `examples/` in the Session-14 tidy; historical references in
-`doc/qlora_handoff.md` keep the old paths.
+Moved here from `examples/` in the Session-14 tidy, then to
+`training/experiments/` in the Session-19 repo cleanup, which moved all
+training tooling out of `examples/` (restoring that directory to its upstream
+state). Path references in the docs were rewritten to the new locations.

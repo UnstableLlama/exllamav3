@@ -27,10 +27,10 @@ monotonic with the thing we care about and trivial to audit.
 Usage
 -----
     # just report the distribution:
-    python examples/score_style_density.py --in /mnt/two/data/yoda_alpaca.jsonl
+    python training/experiments/score_style_density.py --in /mnt/two/data/yoda_alpaca.jsonl
 
     # write the rows at/above a chosen threshold:
-    python examples/score_style_density.py --in /mnt/two/data/yoda_alpaca.jsonl \
+    python training/experiments/score_style_density.py --in /mnt/two/data/yoda_alpaca.jsonl \
         --out /mnt/two/data/yoda_dense.jsonl --min-score 0.5
 """
 

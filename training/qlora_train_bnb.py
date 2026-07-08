@@ -1,7 +1,7 @@
 """
 BNB-NF4 QLoRA baseline arm — the comparison point for QLoRA-on-EXL3.
 
-Trains the SAME model / data / LoRA config as examples/qlora_train_native.py and
+Trains the SAME model / data / LoRA config as training/qlora_train_native.py and
 qlora_train_native_ddp.py (the EXL3 arms); the ONLY difference is the frozen
 base-weight format (bitsandbytes NF4 here vs the EXL3 trellis there). Everything
 else is matched so the comparison isolates the quantization format:
@@ -20,7 +20,7 @@ datasets) so it cannot disturb the pinned torch/EXL3 extension in qlora-venv.
 Point --model at the bf16/fp16 HF safetensors (bnb quantizes to NF4 on load).
 
 Single GPU:
-    ~/exl3/bnb-venv/bin/python examples/qlora_train_bnb.py \
+    ~/exl3/bnb-venv/bin/python training/qlora_train_bnb.py \
         --model /path/to/Llama-3.2-3B-Instruct-bf16 \
         --out /mnt/two/adapters/yoda_bnb --dataset /mnt/two/data/yoda_refined.jsonl \
         --r 64 --alpha 64 --batch 16 --grad-accum 2 --steps 500 --val-frac 0.05 \
@@ -28,7 +28,7 @@ Single GPU:
 
 Multi-GPU (DDP; --batch is PER-GPU, effective = batch * nproc * grad-accum):
     ~/exl3/bnb-venv/bin/torchrun --standalone --nproc_per_node=2 \
-        examples/qlora_train_bnb.py --model ... --out ... --dataset ... \
+        training/qlora_train_bnb.py --model ... --out ... --dataset ... \
         --r 64 --alpha 64 --batch 16 --steps 500 --val-frac 0.05 --eval-every 25
 """
 
@@ -877,7 +877,7 @@ def _run_main():
             for r in recs:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
         print(f"\nGenerations written to {args.gen_out} "
-              f"(score with examples/experiments/score_style_density.py)")
+              f"(score with training/experiments/score_style_density.py)")
 
     if ddp:
         dist.barrier()

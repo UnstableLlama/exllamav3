@@ -18,7 +18,7 @@ trivial and fully equivalent.
 
 Launch with torchrun (one process per GPU):
 
-    torchrun --standalone --nproc_per_node=4 examples/qlora_train_native_ddp.py \
+    torchrun --standalone --nproc_per_node=4 training/qlora_train_native_ddp.py \
         --model /path/to/exl3_model \
         --out   out/exl3_qlora_adapter \
         --dataset TeeZee/dolly-15k-pirate-speech \
