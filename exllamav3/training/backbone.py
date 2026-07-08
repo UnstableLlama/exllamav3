@@ -68,10 +68,14 @@ def _assert_moe_supported(key: str, mlp) -> None:
     (top-k over the router logits, softmax over the selected k -- identical
     to HF's softmax-all + renormalize with ``norm_topk_prob=True``, which the
     Qwen3/3.5-MoE configs assert) with optional per-expert scale, plus the
-    optional shared expert behind a sigmoid shared gate (Qwen3.5-MoE).
-    Everything else -- sigmoid/grouped routers (ds3/dots), expert-parallel
-    TP splits, the Gemma4-style extra norms and residual-channel switch --
-    is rejected loudly here.
+    optional shared expert behind a sigmoid shared gate (Qwen3.5-MoE), plus
+    the Gemma4 MoE layout: ``alt_residual_channel`` (routing and the routed
+    experts read the RAW post-attention residual through their own pre-norms
+    while the shared expert reads the block's normed input) and the four
+    extra RMSNorms (router pre / routed pre / routed post / shared post --
+    each must be an ``RMSNorm``; ``norm_spec`` rejects anything else at
+    construction). Everything else -- sigmoid/grouped routers (ds3/dots) and
+    expert-parallel TP splits -- is rejected loudly here.
     """
     from ..modules import GatedMLP
     assert mlp.router_type == "std", \
@@ -83,11 +87,6 @@ def _assert_moe_supported(key: str, mlp) -> None:
         f"{mlp.num_experts} experts local) is not supported for training"
     assert len(mlp.gates) == len(mlp.ups) == len(mlp.downs) == mlp.num_experts, \
         f"{key}: expected one gate/up/down linear per expert"
-    assert not mlp.alt_residual_channel, \
-        f"{key}: alt_residual_channel MoE (Gemma4 layout) is not supported"
-    assert mlp.router_pre_norm is None and mlp.routed_pre_norm is None \
-        and mlp.routed_post_norm is None and mlp.shared_experts_post_norm is None, \
-        f"{key}: MoE with extra router/routed/shared norms is not supported"
     assert mlp.routed_scaling_factor in (None, 1.0), \
         f"{key}: routed_scaling_factor is a ds3-router feature, unsupported here"
     assert mlp.n_group is None and mlp.topk_group is None, \
@@ -123,8 +122,9 @@ def assert_block_supported(block):
     attention, split in_proj_qkv/z/b/a projection layout) and gated softmax
     attention (interleaved output gate), and BlockSparseMLP mixtures of
     experts with the "std" softmax top-k router incl. the optional shared
-    expert + sigmoid shared gate (Qwen3-MoE, Qwen3.5-MoE). What it still
-    cannot do is rejected here: fused-qkvz GatedDeltaNet (the Qwen3-Next
+    expert + sigmoid shared gate (Qwen3-MoE, Qwen3.5-MoE) and the Gemma4 MoE
+    layout (alt residual channel + router/routed/shared extra norms). What it
+    still cannot do is rejected here: fused-qkvz GatedDeltaNet (the Qwen3-Next
     layout), ds3/dots-router MoE, headwise attention gating (g_proj), mRoPE,
     partial rotary, and non-NeoX RoPE.
     """
@@ -203,6 +203,11 @@ def _mlp_metadata(block) -> dict:
         "per_expert_scale": mlp.per_expert_scale,
         "shared_activation": (mlp.shared_experts.activation_fn
                               if mlp.shared_experts is not None else None),
+        # Gemma4 layout: routing and the routed experts read the RAW
+        # post-attention residual (params["residual"] in the inference
+        # forward) through their own pre-norms, NOT the block's normed MLP
+        # input (which feeds only the shared expert).
+        "alt_residual_channel": bool(mlp.alt_residual_channel),
     })
     return meta
 
@@ -417,6 +422,20 @@ def moe_shared_gate_linear(block):
     BlockSparseMLP block (Qwen3.5-MoE), or ``None``. The inference kernel adds
     ``shared_out * sigmoid(shared_gate(x))`` to the routed output."""
     return block.mlp.shared_gate
+
+
+def moe_extra_norms(block):
+    """The optional Gemma4-layout norms of a BlockSparseMLP block, as the
+    ``(router_pre, routed_pre, routed_post, shared_post)`` module tuple
+    (each ``RMSNorm`` or ``None``). In the inference forward: ``router_pre``
+    normalizes the routing input (Gemma4 also scales it by
+    ``hidden_size**-0.5`` via the module's ``constant_scale``), ``routed_pre``
+    normalizes the routed experts' input, ``routed_post`` the routed output
+    sum, and ``shared_post`` the shared expert's output -- all read from the
+    module so ``norm_spec`` reproduces their exact epsilon/scale/bias."""
+    m = block.mlp
+    return (m.router_pre_norm, m.routed_pre_norm,
+            m.routed_post_norm, m.shared_experts_post_norm)
 
 
 def rms_norm_eps(norm) -> float:

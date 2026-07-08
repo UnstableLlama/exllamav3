@@ -518,10 +518,19 @@ def _run_main():
         # after accumulation, before clipping. NB: with --train-embeddings/-head
         # the embed/head grads (vocab x hidden) are reduced here too -- much
         # larger than the usual few-MB LoRA grads.
+        #
+        # Zero-fill missing grads first: with routed-expert adapters
+        # (expert_* targets on a MoE model) an expert can receive tokens on
+        # one rank but not another, leaving p.grad None on some ranks only --
+        # the old per-rank `if grad is not None: all_reduce` would then pair
+        # MISMATCHED collectives across ranks (hang / silent corruption).
+        # Zero is the correct value for "no tokens routed here this step",
+        # and every rank running every all_reduce keeps them in lockstep.
         for p in net.trainable_parameters():
-            if p.grad is not None:
-                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-                p.grad /= world_size
+            if p.grad is None:
+                p.grad = torch.zeros_like(p)
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+            p.grad /= world_size
 
     def save(tag):
         # Single writer; every rank holds identical adapters after the all-reduce.

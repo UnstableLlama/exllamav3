@@ -35,7 +35,10 @@ differentiable gated delta rule -- see ``training.gdn``; the fla
 fp32 reference elsewhere) and gated full-attention layers (interleaved output
 gate), and BlockSparseMLP mixtures of experts with the std softmax top-k
 router (Qwen3-MoE, Qwen3.5-MoE incl. the shared expert + sigmoid shared
-gate) -- see ``_moe_out``. It reduces bit-identically to the original Llama
+gate, and the Gemma4 MoE layout: routing + routed experts fed from the raw
+post-attention residual through their own pre-norms, routed/shared post
+norms, per-expert scale) -- see ``_moe_out``. It reduces bit-identically to
+the original Llama
 path when those features are absent. Still rejected loudly
 (``assert_block_supported``): fused-qkvz GatedDeltaNet (Qwen3-Next layout),
 ds3/dots-router MoE, headwise attention gating (g_proj), mRoPE, partial
@@ -542,6 +545,14 @@ class NativeLlamaQLoRA(nn.Module):
                 entry.router = wrap(backbone.moe_router_linear(blk), "router_gate", ())
                 sh_gate = backbone.moe_shared_gate_linear(blk)
                 entry.shared_gate = wrap(sh_gate, "shared_gate", ()) if sh_gate is not None else None
+                # Gemma4-layout extra norms (None on Qwen-family MoE): router
+                # pre-norm (constant_scale = hidden**-0.5 read from the
+                # module), routed pre/post norms, shared-expert post norm.
+                rp, ep, po, sp = backbone.moe_extra_norms(blk)
+                entry.router_pre_spec = backbone.norm_spec(rp)
+                entry.routed_pre_spec = backbone.norm_spec(ep)
+                entry.routed_post_spec = backbone.norm_spec(po)
+                entry.shared_post_spec = backbone.norm_spec(sp)
             # Norm specs (plain dicts read from the modules; see backbone.norm_spec),
             # so the block forward reproduces each arch's exact RMSNorm without
             # reaching into module internals. None means "no such norm here".
@@ -790,13 +801,17 @@ class NativeLlamaQLoRA(nn.Module):
                     # norm explodes ~1e16). A fresh dX buffer costs one [tokens, hidden]
                     # allocation per norm and fixes it.
                     return ops[0].apply(x, w, spec["eps"], spec["bias"], "gemma", False)
-        xf = x.float()
+        # fp32 internals for fidelity on half/bf16/fp32 inputs; fp64 inputs
+        # stay fp64 -- that path exists only for the fp64 gradchecks (e.g. the
+        # Gemma4 MoE norms), where a .float() round-trip would corrupt the
+        # double-precision Jacobian. No real training run uses fp64.
+        xf = x if x.dtype == torch.float64 else x.float()
         var = xf.pow(2).mean(dim=-1, keepdim=True) + spec["eps"]
         xn = xf * torch.rsqrt(var) * spec["scale"]
         w = spec["weight"]
         if w is None:
             return xn.to(x.dtype)
-        w = w.float()
+        w = w.to(xf.dtype)
         b = spec["bias"]
         out = xn * (w + b) if b != 0.0 else xn * w
         return out.to(x.dtype)
@@ -1017,9 +1032,12 @@ class NativeLlamaQLoRA(nn.Module):
         else:
             hidden = hidden + attn_out
 
-        # --- gated MLP (SwiGLU / GeGLU) ---
+        # --- gated MLP (SwiGLU / GeGLU) / MoE ---
+        # `hidden` here is the post-attention residual stream -- exactly what
+        # the inference TransformerBlock stashes as params["residual"] for the
+        # Gemma4 MoE's alt residual channel.
         normed2 = self._norm(hidden, entry.mlp_norm_spec)
-        mlp_out = self._mlp_out(meta, entry, normed2)
+        mlp_out = self._mlp_out(meta, entry, normed2, residual=hidden)
         if entry.mlp_post_spec is not None:
             hidden = hidden + self._norm(mlp_out, entry.mlp_post_spec)
         else:
@@ -1035,12 +1053,14 @@ class NativeLlamaQLoRA(nn.Module):
             hidden = (hidden * ls).to(hidden.dtype)
         return hidden
 
-    def _mlp_out(self, meta, entry, normed2):
+    def _mlp_out(self, meta, entry, normed2, residual=None):
         # MLP half of a block, shared by the softmax-attention and
         # GatedDeltaNet block forwards: dense gated MLP, or the block-sparse
-        # mixture of experts (meta["mlp_kind"] == "moe").
+        # mixture of experts (meta["mlp_kind"] == "moe"). ``residual`` is the
+        # RAW post-attention residual stream, needed only by the Gemma4 MoE
+        # layout (alt_residual_channel routes from it); dense MLPs ignore it.
         if meta.get("mlp_kind", "dense") == "moe":
-            return self._moe_out(meta, entry, normed2)
+            return self._moe_out(meta, entry, normed2, residual)
         return self._gated_mlp(entry.gates, entry.ups, entry.downs,
                                meta["activation"], normed2)
 
@@ -1072,9 +1092,10 @@ class NativeLlamaQLoRA(nn.Module):
             mlp_out = d if mlp_out is None else mlp_out + d
         return mlp_out
 
-    def _moe_out(self, meta, entry, normed2):
+    def _moe_out(self, meta, entry, normed2, residual=None):
         """Block-sparse mixture of experts (BlockSparseMLP, std softmax top-k
-        router -- Qwen3-MoE / Qwen3.5-MoE) over the already-normed input.
+        router -- Qwen3-MoE / Qwen3.5-MoE / Gemma4 MoE) over the
+        already-normed input.
 
         Routing reproduces the inference kernel (``ext.routing_std``): logits
         from the frozen router gate, top-k over the logits, softmax over the
@@ -1098,7 +1119,20 @@ class NativeLlamaQLoRA(nn.Module):
         adds ``sigmoid(shared_gate(x)) * shared_mlp(x)``, exactly the
         inference ``add_sigmoid_gate`` kernel. Per-token math throughout, so
         sample packing needs no special case (Qwen3.5-MoE still rejects
-        packing at the net level, for its GDN layers)."""
+        packing at the net level, for its GDN layers).
+
+        Gemma4 layout (``meta["alt_residual_channel"]``, mirroring
+        ``BlockSparseMLP.forward``'s ``params["residual"]`` read): routing and
+        the routed experts consume the RAW post-attention ``residual`` stream
+        through their own pre-norms (``router_pre`` -- an RMSNorm additionally
+        scaled by ``hidden**-0.5`` via its ``constant_scale`` -- and
+        ``routed_pre``), while the shared expert consumes ``normed2`` (the
+        block's ``pre_feedforward_layernorm`` output) as usual. The routed sum
+        then passes ``routed_post`` and the shared output ``shared_post``
+        before the two are added; the block's outer ``mlp_post_norm`` sandwich
+        and ``layer_scalar`` apply on top in ``_block_forward``. All four
+        norms are optional per the module (``None`` on Qwen-family MoE, which
+        reduces this to the plain path)."""
         bsz, t, d = normed2.shape
         y = normed2.reshape(-1, d)
         nt = y.shape[0]
@@ -1109,7 +1143,21 @@ class NativeLlamaQLoRA(nn.Module):
         # the fp64 gradcheck path.
         acc = torch.float64 if y.dtype == torch.float64 else torch.float32
 
-        logits = entry.router(y).to(acc)                        # [nt, E]
+        # Routing / routed-expert input channel: the raw residual (Gemma4) or
+        # the normed block input (everything else). getattr defaults keep
+        # pre-Gemma4 entries (and the CPU test namespaces) working unchanged.
+        if meta.get("alt_residual_channel"):
+            assert residual is not None, \
+                "alt_residual_channel MoE needs the block's residual stream"
+            yr = residual.reshape(-1, d)
+        else:
+            yr = y
+        router_pre = getattr(entry, "router_pre_spec", None)
+        routed_pre = getattr(entry, "routed_pre_spec", None)
+        z = self._norm(yr, router_pre) if router_pre is not None else yr
+        ye = self._norm(yr, routed_pre) if routed_pre is not None else yr
+
+        logits = entry.router(z).to(acc)                        # [nt, E]
         top_logits, top_idx = torch.topk(logits, top_k, dim=-1)
         weights = torch.softmax(top_logits, dim=-1)             # [nt, k] >=fp32
         pes = meta.get("per_expert_scale")
@@ -1141,16 +1189,27 @@ class NativeLlamaQLoRA(nn.Module):
                 continue                                        # no tokens routed here
             toks = tok_sorted[start:end]
             w = w_sorted[start:end].unsqueeze(1)                # [c, 1] >=fp32
-            xe = y.index_select(0, toks)                        # [c, d]
+            xe = ye.index_select(0, toks)                       # [c, d]
             h = act(entry.expert_gates[e](xe)) * entry.expert_ups[e](xe)
             de = entry.expert_downs[e](h)                       # [c, d] compute dtype
             out.index_add_(0, toks, de.to(acc) * w)
             start = end
 
+        # Gemma4: the routed output sum is normed before the shared expert is
+        # added (post_feedforward_layernorm_2 in the checkpoint).
+        routed_post = getattr(entry, "routed_post_spec", None)
+        if routed_post is not None:
+            out = self._norm(out, routed_post)
+
         # Shared expert (always active), gated by sigmoid(shared_gate(x)).
+        # Gemma4 has no shared gate but norms the shared output
+        # (post_feedforward_layernorm_1) before adding it to the routed sum.
         if len(entry.gates):
             sh = self._gated_mlp(entry.gates, entry.ups, entry.downs,
                                  meta.get("shared_activation") or meta["activation"], y)
+            shared_post = getattr(entry, "shared_post_spec", None)
+            if shared_post is not None:
+                sh = self._norm(sh, shared_post)
             if entry.shared_gate is not None:
                 g = torch.sigmoid(entry.shared_gate(y).to(acc))  # [nt, 1]
                 out = out + g * sh.to(acc)
@@ -1225,7 +1284,7 @@ class NativeLlamaQLoRA(nn.Module):
             hidden = hidden + attn_out
 
         normed2 = self._norm(hidden, entry.mlp_norm_spec)
-        mlp_out = self._mlp_out(meta, entry, normed2)
+        mlp_out = self._mlp_out(meta, entry, normed2, residual=hidden)
         if entry.mlp_post_spec is not None:
             hidden = hidden + self._norm(mlp_out, entry.mlp_post_spec)
         else:
@@ -1893,7 +1952,11 @@ class NativeLlamaQLoRA(nn.Module):
                 f"mixed routed-expert ranks {sorted(expert_ranks)} can't be " \
                 f"described by one rank_pattern"
             er = next(iter(odd_expert_ranks))
-            pat = r".*\.mlp\.experts\..*"
+            # Match routed-expert modules on any arch: Qwen keys them under
+            # ...mlp.experts.<i>..., Gemma4 under ...layers.<n>.experts.<i>...
+            # (no .mlp segment). The \d+ segment keeps Qwen's shared_expert
+            # (and any other "expert"-named sibling) out of the pattern.
+            pat = r".*\.experts\.\d+\..*"
             rank_pattern = {pat: 2 * er if has_offset else er}
             if has_offset:
                 # The pissa conversion folds the scale into B (loader scale must
