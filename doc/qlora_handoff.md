@@ -30,17 +30,22 @@
 > notes below (which remain the detailed context for each item). Newest
 > priority first, per the 2026-07 direction.
 
-0. **Qwen3.5 training — BUILT (Sessions 18 + 20), box gates pending.** The
-   native forward now covers the full Qwen3.5 family: the hybrid GDN +
-   gated-attention layers (Session 18: fla `chunk_gated_delta_rule` on CUDA
-   bf16/fp16, sequential fp32 reference elsewhere) AND the Qwen3.5-MoE /
-   Qwen3-MoE BlockSparseMLP (Session 20: std top-k router, shared expert +
-   sigmoid shared gate, opt-in routed-expert targets `expert_*_proj` with
-   `--expert-r`, router frozen, no aux loss). What remains is the box work:
-   fp32 + bf16 validate gates on real Qwen3.5(-MoE) EXL3 quants, then first
-   training runs — see the Session 18 and Session 20 box lists. Still not
-   covered: Qwen3-Next (fused qkvz layout), sample packing on GDN models
-   (rejected loudly; train unpacked — plain Qwen3-MoE packs fine).
+0. **MoE training (Qwen3.5 family + Gemma4 MoE) — BUILT (Sessions 18 + 20 +
+   21), box gates pending.** The native forward now covers the full Qwen3.5
+   family — the hybrid GDN + gated-attention layers (Session 18: fla
+   `chunk_gated_delta_rule` on CUDA bf16/fp16, sequential fp32 reference
+   elsewhere) and the Qwen3.5-MoE / Qwen3-MoE BlockSparseMLP (Session 20:
+   std top-k router, shared expert + sigmoid shared gate, opt-in
+   routed-expert targets `expert_*_proj` with `--expert-r`, router frozen,
+   no aux loss) — AND the Gemma4 MoE layout (Session 21: alt residual
+   channel — routing + routed experts fed from the raw post-attention
+   residual through their own pre-norms — routed/shared post-norms,
+   per-expert scale, GeGLU, no shared gate). What remains is the box work:
+   fp32 + bf16 validate gates on real Qwen3.5(-MoE) and Gemma4-MoE EXL3
+   quants, then first training runs — see the Session 18 / 20 / 21 box
+   lists. Still not covered: Qwen3-Next (fused qkvz layout), sample packing
+   on GDN models (rejected loudly; train unpacked — plain Qwen3-MoE and
+   Gemma4 MoE pack fine).
 1. **Quantization-aware LoRA — BUILT (Session 17), box A/B pending.**
    `--quant-aware {noise,ste}` implements the two tractable directions from
    the original item (noise injection on the frozen-weight closure, and a
@@ -2584,6 +2589,119 @@ a **shared expert** (dense GatedMLP, always active) added as
    `rank_pattern` when `--expert-r` ≠ `--r`.
 4. **A real SFT + eval-split run**, judged per the standing eval-prereq
    rules; A/B attention+shared vs +experts on held-out loss.
+
+### Session 21 — Gemma4 MoE: alt residual channel + extra norms in the differentiable MoE
+
+> Branch `claude/gemma-4-moe-training-t0kfee`. Container-verified (all CPU
+> suites incl. the new Gemma4 tests in `tests/test_moe.py` pass);
+> **nothing here is box-verified yet** — the box list below chains after the
+> Session-20 Qwen-MoE gates. This session started as "implement Gemma4 MoE
+> from scratch", then #136 (Session 20, built in a parallel session) merged
+> mid-way with the generic BlockSparseMLP machinery — so the work became a
+> review of #136 plus the Gemma4-specific delta on top of it.
+
+**What Gemma4 MoE adds over the Qwen MoE layout (the spec, from
+`architecture/gemma4.py` + `modules/block_sparse_mlp.py` +
+`modules/transformer.py`):**
+- **`alt_residual_channel`** — the routing input and the routed experts read
+  the **RAW post-attention residual** (`params["residual"]`, stashed by
+  `TransformerBlock.forward` before `pre_feedforward_layernorm`), NOT the
+  block's normed MLP input. Only the **shared expert** (the dense GatedMLP
+  that would be the whole MLP on a dense Gemma4) reads the normed input.
+- **Four extra RMSNorms**: `router.scale` (a weighted RMSNorm on the routing
+  input with `constant_scale = hidden_size**-0.5`, weight key without the
+  `.weight` suffix), `pre_feedforward_layernorm_2` (routed experts' input),
+  `post_feedforward_layernorm_2` (routed output sum), and
+  `post_feedforward_layernorm_1` (shared expert output) — all applied INSIDE
+  the MoE, before the block's outer `post_feedforward_layernorm` sandwich +
+  `layer_scalar` (already supported since Session 6).
+- **No shared gate** (the Qwen3.5-MoE sigmoid gate is absent); GeGLU
+  activation; `router.per_expert_scale` (bf16, post-softmax — already
+  supported); router key `router.proj` (leaf `proj`, so no target-name
+  collision).
+- **Attention half needs nothing new**: per-layer head dims (global layers
+  head_dim 512 → the big-head SDPA-math branch, Session 8), per-layer kv
+  heads (`num_global_kv_heads`), `attention_k_eq_v` → `use_k_as_v` — checked
+  this session that inference applies `v_norm` to the k-as-v copy taken from
+  the RAW K projection (attn.py `project_qkv`), which is exactly what
+  `_block_forward` already does. MTP tensors in the checkpoint are not
+  loaded (`component="text"`; Session 7 note).
+
+**What was changed:**
+- `training/backbone.py`: `_assert_moe_supported` accepts
+  `alt_residual_channel` and the four extra norms (still rejects ds3/dots
+  routers, TP splits, `routed_scaling_factor`, `e_score_correction_bias`);
+  `_mlp_metadata` gains `alt_residual_channel`; new seam accessor
+  `moe_extra_norms(block)` → the four norm modules.
+- `training/native_llama.py`: `_moe_out` gains the `residual` channel —
+  routing input `z = router_pre(residual)`, expert input
+  `ye = routed_pre(residual)` (both fall back to the normed input when the
+  specs/flag are absent, so the Qwen path is untouched), routed sum through
+  `routed_post`, shared output through `shared_post` before the add.
+  `_block_forward`/`_gdn_forward` pass the post-attention residual into
+  `_mlp_out` (exactly what inference stashes as `params["residual"]`).
+  Construction reads the four norm specs via the seam. Fixed the #136
+  `rank_pattern` export regex: `.*\.mlp\.experts\..*` → `.*\.experts\.\d+\..*`
+  (Gemma4 expert keys have no `.mlp.` segment — `...layers.N.experts.K.*`;
+  the `\d+` keeps Qwen's `shared_expert` out).
+- `_norm` now keeps fp64 inputs in fp64 (was `x.float()`, silently rounding
+  the fp64 gradcheck path to fp32 — the Gemma4 MoE gradcheck goes through
+  norms, which is how this surfaced; half/bf16/fp32 behavior is unchanged,
+  and no real run uses fp64).
+- `lora_init._apply_eva`: routed-expert adapters that streamed too few
+  routed tokens in the pre-pass (rank starvation / no sketch at all) now
+  keep their default init with a counted note instead of hard-failing —
+  non-expert targets still fail hard (there it means the pre-pass budget is
+  wrong). Relevant only for `--init-lora eva` + `expert_*` targets.
+- `qlora_train_native_ddp.py` `allreduce_grads`: **zero-fill `None` grads
+  before the all-reduce** — with routed-expert adapters an expert can get
+  tokens on one rank but not another, and the old per-rank
+  `if grad is not None` skipped collectives asymmetrically (hang / silent
+  corruption). Latent since #136 added `--expert-r` to the DDP arm; zero is
+  the correct "no tokens routed here" gradient.
+- `tests/test_moe.py`: Gemma4-layout builder + independent reference
+  (HF-style softmax-all/renormalize routing formulation, transcribed norms),
+  forward match with DISTINCT tensors on the two input channels (a
+  wrong-channel bug cannot pass), fp64 gradcheck w.r.t. BOTH channels,
+  backward-reaches-adapters through both channels, and a full
+  `_block_forward` wiring test (attention → sandwich → MoE fed the raw
+  residual → outer post norm → layer_scalar vs an independent full-block
+  reference). Docs: README status line, training/README MoE section, YAML
+  targets comment.
+
+**Review of #136 (recorded):** design confirmed against the inference module
+and kernels (`routing_std_topk_kernel`: top-k over logits then softmax over
+the selected k, `per_expert_scale` after — the training forward reproduces
+it, and its equality with HF's `norm_topk_prob=True` formulation is what
+`test_moe_matches_hf_reference` proves). Found one real bug (the
+`rank_pattern` regex above, Gemma4-only) and one latent DDP hazard (the
+`None`-grad all-reduce skip above); both fixed this session. Target
+semantics (routed experts opt-in via `expert_*_proj`, router + shared gate
+always frozen, no aux loss) match unsloth/axolotl/PEFT practice per the
+Session-20 research and carry over to Gemma4 unchanged — on Gemma4 the
+default `--targets` train attention + the shared expert, which is the
+always-active dense path.
+
+**Box list for next session (in order; needs a Gemma4-MoE EXL3 quant):**
+1. **Forward gates**: `qlora_validate_native.py --model $GEMMA4_MOE` (fp32
+   eager; expect high argmax agreement — the Session-20 routing-tie caveat
+   applies, plus Gemma4's bf16 big-head SDPA borderline-token noise from
+   Session 9 in the bf16 pass), then `--compute-dtype bfloat16`, then
+   `--check-backward`. `describe_attn` should print `…×sdpa` for the global
+   layers AND the `[moe: N layers x E experts, top-k]` summary.
+2. **Training smoke** (default targets → attention + shared expert;
+   `--sample-every 0`, `--prompt-format gemma4-nothink` on an instruct
+   base): short run, watch loss / grad norms / `|dB|`, record
+   `--profile-dequant 5` (expect the MoE dequant-share caveat from
+   Session 20 to bite harder here — every routed expert hit per step
+   dequantizes 3 trellis weights per layer).
+3. **Expert-adapter smoke**: add `--targets ... expert_gate_proj
+   expert_up_proj expert_down_proj --expert-r <small>`; verify the
+   trainable-param print, a save → `--resume` round-trip, and that
+   `adapter_config.json` carries the corrected `rank_pattern`
+   (`.*\.experts\.\d+\..*`).
+4. **A real SFT + eval-split run** per the standing eval-prereq rules;
+   A/B attention+shared vs +experts on held-out loss.
 
 ---
 

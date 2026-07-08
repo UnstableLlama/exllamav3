@@ -20,7 +20,15 @@ mocked as frozen random weights, and the checks are:
   * backprop reaches expert + shared-expert LoRA adapters while the frozen
     base weights and the router (r=0, no params) stay untouched, and an
     expert that receives no tokens contributes no gradient;
-  * ``_mlp_out`` dispatches on ``meta["mlp_kind"]`` (dense stays dense).
+  * ``_mlp_out`` dispatches on ``meta["mlp_kind"]`` (dense stays dense);
+  * the Gemma4 MoE layout (``alt_residual_channel``): routing + routed
+    experts read the RAW post-attention residual through their own pre-norms
+    (router pre-norm carrying the ``hidden**-0.5`` constant scale) while the
+    shared expert reads the block's normed input; routed/shared post-norms;
+    GeGLU; per-expert scale -- against an independent reference, unit-level,
+    fp64-gradchecked (w.r.t. BOTH input channels), and wired through a full
+    ``_block_forward`` (sandwich post-norms + layer_scalar) so a
+    wrong-channel regression cannot hide behind the unit test.
 
 Run:  python tests/test_moe.py
 """
@@ -102,9 +110,19 @@ def _headless_net():
 # expert behind a sigmoid shared gate), mirroring what NativeLlamaQLoRA.__init__
 # builds for a BlockSparseMLP block.
 # ----------------------------------------------------------------------------
+def _norm_w(dim, dtype):
+    return nn.Parameter(1.0 + 0.05 * torch.randn(dim, dtype=dtype),
+                        requires_grad=False)
+
+
+def _spec(weight, eps=1e-5, bias=0.0, scale=1.0):
+    # Mirror of backbone.norm_spec.
+    return {"weight": weight, "eps": eps, "bias": bias, "scale": scale}
+
+
 def _build_moe(d, inter, num_experts, top_k, shared_inter=0, shared_gate=True,
                per_expert_scale=None, r=0, expert_r=None, dtype=torch.float32,
-               router_scale=0.5):
+               router_scale=0.5, activation="silu", gemma4=False):
     expert_r = r if expert_r is None else expert_r
     lins = {"router": MockLinear(d, num_experts, "blk.mlp.gate",
                                  scale=router_scale, dtype=dtype)}
@@ -138,13 +156,30 @@ def _build_moe(d, inter, num_experts, top_k, shared_inter=0, shared_gate=True,
         entry.gates, entry.ups, entry.downs = [], [], []
         entry.shared_gate = None
 
+    if gemma4:
+        # Gemma4 layout: routing + routed experts fed from the RAW residual
+        # via their own pre-norms (the router pre-norm carries the
+        # hidden**-0.5 constant scale of the checkpoint's `router.scale`
+        # norm), routed/shared post-norms, no shared gate (callers pass
+        # shared_gate=False).
+        lins["n_rp"] = _norm_w(d, dtype)
+        lins["n_ep"] = _norm_w(d, dtype)
+        lins["n_po"] = _norm_w(d, dtype)
+        entry.router_pre_spec = _spec(lins["n_rp"], scale=d ** -0.5)
+        entry.routed_pre_spec = _spec(lins["n_ep"])
+        entry.routed_post_spec = _spec(lins["n_po"])
+        if shared_inter:
+            lins["n_sp"] = _norm_w(d, dtype)
+            entry.shared_post_spec = _spec(lins["n_sp"])
+
     meta = {
         "mlp_kind": "moe",
         "num_experts": num_experts,
         "num_experts_per_tok": top_k,
         "per_expert_scale": per_expert_scale,
-        "activation": "silu",
-        "shared_activation": "silu" if shared_inter else None,
+        "activation": activation,
+        "shared_activation": activation if shared_inter else None,
+        "alt_residual_channel": bool(gemma4),
     }
     return entry, meta, lins
 
@@ -185,6 +220,57 @@ def _ref_moe(meta, lins, x):
             sh = sh * torch.sigmoid((y @ lins["shg"].frozen_weight).float())
         out = out + sh
     return out.view(b, t, d).to(x.dtype)
+
+
+def _ref_rmsnorm(x, w, eps=1e-5, scale=1.0):
+    var = x.float().pow(2).mean(-1, keepdim=True) + eps
+    xn = x.float() * torch.rsqrt(var) * scale
+    return xn if w is None else xn * w.float()
+
+
+def _ref_moe_gemma4(meta, lins, x_normed, residual):
+    """Independent reference for the Gemma4 MoE layout, transcribed from the
+    inference module (``BlockSparseMLP.forward`` with alt_residual_channel):
+    routing input = rmsnorm(residual) * d**-0.5 (the `router.scale` norm);
+    HF-style softmax-all + top-k + renormalize (+ per-expert scale); routed
+    experts on rmsnorm(residual) (pre_feedforward_layernorm_2) with GeGLU;
+    routed sum normed by post_feedforward_layernorm_2; shared expert on the
+    NORMED block input, its output normed by post_feedforward_layernorm_1;
+    sum. Shares no code with _moe_out."""
+    b, t, d = x_normed.shape
+    y = x_normed.reshape(-1, d)
+    yr = residual.reshape(-1, d)
+    E, k = meta["num_experts"], meta["num_experts_per_tok"]
+    actfn = F.silu if meta["activation"] == "silu" \
+        else (lambda z: F.gelu(z, approximate="tanh"))
+
+    z = _ref_rmsnorm(yr, lins["n_rp"], scale=d ** -0.5)
+    logits = z.to(yr.dtype) @ lins["router"].frozen_weight
+    probs = torch.softmax(logits.float(), dim=-1)
+    topw, topi = torch.topk(probs, k, dim=-1)
+    topw = topw / topw.sum(dim=-1, keepdim=True)
+    if meta.get("per_expert_scale") is not None:
+        topw = topw * meta["per_expert_scale"].float()[topi]
+
+    ye = _ref_rmsnorm(yr, lins["n_ep"]).to(yr.dtype)
+    out = torch.zeros(y.shape[0], d, dtype=torch.float32)
+    expert_mask = F.one_hot(topi, num_classes=E)                 # [nt, k, E]
+    for e in range(E):
+        tok, kth = torch.where(expert_mask[..., e] > 0)
+        if tok.numel() == 0:
+            continue
+        xe = ye[tok]
+        h = actfn(xe @ lins[f"g{e}"].frozen_weight) * (xe @ lins[f"u{e}"].frozen_weight)
+        de = (h @ lins[f"d{e}"].frozen_weight).float()
+        out[tok] += de * topw[tok, kth].unsqueeze(-1)
+    out = _ref_rmsnorm(out, lins["n_po"])
+
+    if "sg" in lins:
+        sh = actfn(y @ lins["sg"].frozen_weight) * (y @ lins["su"].frozen_weight)
+        sh = (sh @ lins["sd"].frozen_weight).float()
+        sh = _ref_rmsnorm(sh, lins["n_sp"])
+        out = out + sh
+    return out.view(b, t, d).to(x_normed.dtype)
 
 
 # ----------------------------------------------------------------------------
@@ -323,6 +409,181 @@ def test_moe_unrouted_expert_gets_no_grad():
 
 
 # ----------------------------------------------------------------------------
+# Gemma4 MoE layout: alt residual channel + extra norms + GeGLU.
+# ----------------------------------------------------------------------------
+def test_moe_gemma4_matches_reference():
+    torch.manual_seed(6)
+    d, inter, E, k = 16, 8, 6, 2
+    pes = (1.0 + 0.2 * torch.randn(E)).to(torch.bfloat16)
+    entry, meta, lins = _build_moe(d, inter, E, k, shared_inter=12,
+                                   shared_gate=False, per_expert_scale=pes,
+                                   activation="gelu", gemma4=True)
+    net = _headless_net()
+
+    # DISTINCT tensors for the two input channels: the normed block input
+    # (shared expert) vs the raw post-attention residual (routing + routed
+    # experts). Feeding the same tensor would let a wrong-channel bug pass.
+    x_normed = torch.randn(2, 7, d)
+    residual = torch.randn(2, 7, d) * 3.0
+    out = net._mlp_out(meta, entry, x_normed, residual)
+    ref = _ref_moe_gemma4(meta, lins, x_normed, residual)
+    err = (out - ref).abs().max().item()
+    assert err < 1e-5, f"Gemma4 MoE forward mismatch vs reference: max|Δ|={err}"
+
+    # Channel sanity: routing/experts must actually depend on the residual --
+    # a different residual with the same normed input must change the output.
+    out2 = net._mlp_out(meta, entry, x_normed, torch.randn(2, 7, d) * 3.0)
+    assert (out - out2).abs().max().item() > 1e-3, \
+        "Gemma4 MoE output ignores the residual channel"
+    print(f"[moe] Gemma4 layout (alt residual + 4 norms + GeGLU + scale) "
+          f"matches reference (max|Δ|={err:.2e}) PASSED")
+
+
+def test_moe_gemma4_gradcheck():
+    torch.manual_seed(7)
+    d, inter, E, k = 6, 4, 4, 2
+    entry, meta, lins = _build_moe(d, inter, E, k, shared_inter=4,
+                                   shared_gate=False, activation="gelu",
+                                   gemma4=True, dtype=torch.float64)
+    net = _headless_net()
+    net.compute_dtype = torch.float64
+
+    xn = torch.randn(1, 5, d, dtype=torch.float64, requires_grad=True)
+    rs = torch.randn(1, 5, d, dtype=torch.float64, requires_grad=True)
+
+    def fn(a, b):
+        return net._mlp_out(meta, entry, a, b)
+
+    # Gradient w.r.t. BOTH channels: the shared expert path (normed input) and
+    # the routing + routed-expert path (residual). topk is piecewise-constant;
+    # random fp64 logits sit nowhere near a routing tie.
+    assert torch.autograd.gradcheck(fn, (xn, rs), eps=1e-6, atol=1e-4)
+    print("[moe] Gemma4 fp64 gradcheck through both input channels PASSED")
+
+
+def test_moe_gemma4_backward_reaches_adapters():
+    torch.manual_seed(8)
+    d, inter, E, k = 12, 6, 2, 2                    # k == E: all experts hit
+    entry, meta, lins = _build_moe(d, inter, E, k, shared_inter=8,
+                                   shared_gate=False, activation="gelu",
+                                   gemma4=True, r=4, expert_r=2)
+    net = _headless_net()
+
+    frozen_before = {k_: l.frozen_weight.clone() for k_, l in lins.items()
+                     if hasattr(l, "frozen_weight")}
+    adapted = ([entry.expert_gates[e] for e in range(E)]
+               + [entry.expert_ups[e] for e in range(E)]
+               + [entry.expert_downs[e] for e in range(E)]
+               + [entry.gates[0], entry.ups[0], entry.downs[0]])
+    for dl in adapted:
+        with torch.no_grad():
+            dl.lora_b.add_(torch.randn_like(dl.lora_b) * 0.02)
+
+    x_normed = torch.randn(2, 5, d, requires_grad=True)
+    residual = torch.randn(2, 5, d, requires_grad=True)
+    out = net._mlp_out(meta, entry, x_normed, residual)
+    out.square().mean().backward()
+
+    for dl in adapted:
+        assert dl.lora_a.grad is not None and dl.lora_a.grad.abs().sum() > 0, \
+            f"no gradient reached lora_a of {dl.key}"
+    assert entry.router.lora_a is None, "router must stay frozen (r=0)"
+    assert x_normed.grad is not None and x_normed.grad.abs().sum() > 0, \
+        "no gradient into the normed input (shared-expert channel)"
+    assert residual.grad is not None and residual.grad.abs().sum() > 0, \
+        "no gradient into the residual (routing/routed-expert channel)"
+    for k_, l in lins.items():
+        if hasattr(l, "frozen_weight"):
+            assert torch.equal(l.frozen_weight, frozen_before[k_]), \
+                f"frozen base weight of {k_} changed"
+    print("[moe] Gemma4 backward reaches expert + shared adapters through both "
+          "channels; base/router frozen PASSED")
+
+
+def test_moe_gemma4_block_wiring():
+    # Full _block_forward: the MoE must receive the RAW post-attention
+    # residual (what inference stashes as params["residual"]) -- not the
+    # mlp-normed input -- composed with Gemma's sandwich post-norms and the
+    # per-layer scalar. An independent full-block reference catches any
+    # wrong-channel plumbing that the unit test (which passes residual
+    # explicitly) cannot.
+    torch.manual_seed(9)
+    d, nq, nkv, hd = 16, 4, 2, 8
+    inter, E, k = 8, 4, 2
+    dtype = torch.float32
+
+    entry, meta, lins = _build_moe(d, inter, E, k, shared_inter=12,
+                                   shared_gate=False, activation="gelu",
+                                   gemma4=True)
+    # Attention half (plain GQA; the Gemma attention features have their own
+    # tests in test_native_llama).
+    lins["q"] = MockLinear(d, nq * hd, "blk.self_attn.q_proj", dtype=dtype)
+    lins["k"] = MockLinear(d, nkv * hd, "blk.self_attn.k_proj", dtype=dtype)
+    lins["v"] = MockLinear(d, nkv * hd, "blk.self_attn.v_proj", dtype=dtype)
+    lins["o"] = MockLinear(nq * hd, d, "blk.self_attn.o_proj", dtype=dtype)
+    entry.q_proj = DiffLinear(lins["q"], r=0, compute_dtype=dtype)
+    entry.k_proj = DiffLinear(lins["k"], r=0, compute_dtype=dtype)
+    entry.v_proj = DiffLinear(lins["v"], r=0, compute_dtype=dtype)
+    entry.o_proj = DiffLinear(lins["o"], r=0, compute_dtype=dtype)
+    entry.q_norm_spec = entry.k_norm_spec = entry.v_norm_spec = None
+    lins["n_attn"] = _norm_w(d, dtype)
+    lins["n_mlp"] = _norm_w(d, dtype)
+    lins["n_attn_post"] = _norm_w(d, dtype)
+    lins["n_mlp_post"] = _norm_w(d, dtype)
+    entry.attn_norm_spec = _spec(lins["n_attn"])
+    entry.mlp_norm_spec = _spec(lins["n_mlp"])
+    entry.attn_post_spec = _spec(lins["n_attn_post"])
+    entry.mlp_post_spec = _spec(lins["n_mlp_post"])
+
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, hd, 2, dtype=dtype) / hd))
+    meta.update({
+        "kind": "attn", "num_q_heads": nq, "num_kv_heads": nkv, "head_dim": hd,
+        "sm_scale": hd ** -0.5, "inv_freq": inv_freq, "attn_factor": 1.0,
+        "sliding_window": -1, "softcap": 0.0, "use_k_as_v": False,
+        "layer_scalar": 0.9,
+    })
+
+    net = _headless_net()
+    b, t = 2, 6
+    hidden = torch.randn(b, t, d, dtype=dtype)
+    positions = torch.arange(t).unsqueeze(0).expand(b, t)
+    attn_bias = net._attn_bias(None, t, hidden.device, torch.float32)
+    out = net._block_forward(meta, entry, hidden, positions, attn_bias)
+
+    # Independent reference block.
+    def rope(x):
+        freqs = positions.float().unsqueeze(-1) * inv_freq.float().view(1, 1, -1)
+        emb = torch.cat((freqs, freqs), -1)
+        cos, sin = emb.cos().unsqueeze(2), emb.sin().unsqueeze(2)
+        half = x.shape[-1] // 2
+        rot = torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+        return x * cos + rot * sin
+
+    normed = _ref_rmsnorm(hidden, lins["n_attn"])
+    q = rope((normed @ lins["q"].frozen_weight).view(b, t, nq, hd)).transpose(1, 2)
+    kk = rope((normed @ lins["k"].frozen_weight).view(b, t, nkv, hd)).transpose(1, 2)
+    vv = (normed @ lins["v"].frozen_weight).view(b, t, nkv, hd).transpose(1, 2)
+    rep = nq // nkv
+    kk = kk.repeat_interleave(rep, 1)
+    vv = vv.repeat_interleave(rep, 1)
+    scores = (q @ kk.transpose(-1, -2)) * meta["sm_scale"]
+    mask = torch.triu(torch.full((t, t), float("-inf")), 1)
+    ctx = torch.softmax(scores + mask, -1) @ vv
+    attn_out = ctx.transpose(1, 2).reshape(b, t, nq * hd) @ lins["o"].frozen_weight
+    resid = hidden + _ref_rmsnorm(attn_out, lins["n_attn_post"])
+
+    x_normed = _ref_rmsnorm(resid, lins["n_mlp"]).to(dtype)
+    moe_out = _ref_moe_gemma4(meta, lins, x_normed, resid.to(dtype))
+    ref = resid + _ref_rmsnorm(moe_out, lins["n_mlp_post"])
+    ref = ref * meta["layer_scalar"]
+
+    err = (out - ref).abs().max().item()
+    assert err < 1e-4, f"Gemma4 MoE block wiring mismatch vs reference: max|Δ|={err}"
+    print(f"[moe] Gemma4 MoE block: raw-residual routing channel + sandwich + "
+          f"layer_scalar match full-block reference (max|Δ|={err:.2e}) PASSED")
+
+
+# ----------------------------------------------------------------------------
 # Dense dispatch unchanged.
 # ----------------------------------------------------------------------------
 def test_dense_dispatch_unchanged():
@@ -355,5 +616,9 @@ if __name__ == "__main__":
         test_moe_gradcheck,
         test_moe_backward_reaches_adapters,
         test_moe_unrouted_expert_gets_no_grad,
+        test_moe_gemma4_matches_reference,
+        test_moe_gemma4_gradcheck,
+        test_moe_gemma4_backward_reaches_adapters,
+        test_moe_gemma4_block_wiring,
         test_dense_dispatch_unchanged,
     ], label="moe")

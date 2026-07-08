@@ -244,8 +244,22 @@ def _apply_eva(net, batches, svd_niter: int, verbose: bool) -> None:
         net.train(was_training)
 
     var_fracs: list[float] = []
+    starved_experts = 0
     for w in wrappers:
-        a, captured, total = sketches[_eva_site(w.key)].top(w.r)
+        try:
+            a, captured, total = sketches[_eva_site(w.key)].top(w.r)
+        except (KeyError, RuntimeError):
+            # Routed MoE experts see only their routed share of the pre-pass
+            # tokens; a rarely-hit expert can stream fewer rows than the rank
+            # needs (RuntimeError), or none at all (KeyError -- no sketch).
+            # That is data sparsity, not a config error: keep the default
+            # kaiming/zeros init for that adapter and report the count. For
+            # any NON-expert target the old hard failure stands -- there it
+            # really means the pre-pass budget is too small.
+            if ".experts." in w.key:
+                starved_experts += 1
+                continue
+            raise
         w.lora_a.copy_(a.to(w.lora_a.device, w.lora_a.dtype))
         w.lora_b.zero_()
         var_fracs.append(captured / max(total, 1e-30))
@@ -253,11 +267,16 @@ def _apply_eva(net, batches, svd_niter: int, verbose: bool) -> None:
     net.init_lora = "eva"
     if verbose:
         vf = sorted(var_fracs)
-        print(f" -- init-lora eva: {len(wrappers)} adapters initialized from "
+        stats = (f" (rank-{net.r} captured activation variance: "
+                 f"median {vf[len(vf) // 2] * 100:.1f}%, "
+                 f"min {vf[0] * 100:.1f}%, max {vf[-1] * 100:.1f}%)"
+                 if vf else "")
+        extra = (f"; {starved_experts} routed-expert adapters kept default "
+                 f"init (too few routed tokens in the pre-pass -- raise "
+                 f"--init-eva-tokens to cover them)" if starved_experts else "")
+        print(f" -- init-lora eva: {len(var_fracs)} adapters initialized from "
               f"{len(sketches)} activation sites / {tokens:,} tokens in "
-              f"{time.time() - t0:.1f}s (rank-{net.r} captured activation "
-              f"variance: median {vf[len(vf) // 2] * 100:.1f}%, "
-              f"min {vf[0] * 100:.1f}%, max {vf[-1] * 100:.1f}%)")
+              f"{time.time() - t0:.1f}s{stats}{extra}")
 
 
 class RefWeights:

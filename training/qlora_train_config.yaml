@@ -70,8 +70,8 @@ inspect: 0                # single/split only
 
 # Trainable modules / memory levers
 targets: null             # null = default projections; [] = no per-linear LoRA (embed/head only).
-                          # MoE models (Qwen3-MoE / Qwen3.5-MoE): plain gate/up/down_proj adapt the
-                          # dense/shared-expert paths only; add expert_gate_proj expert_up_proj
+                          # MoE models (Qwen3-MoE / Qwen3.5-MoE / Gemma4 MoE): plain gate/up/down_proj
+                          # adapt the dense/shared-expert paths only; add expert_gate_proj expert_up_proj
                           # expert_down_proj to also adapt the routed experts (router always frozen).
 expert_r: null            # LoRA rank for routed-expert adapters (null = same as r). On a
                           # many-expert model use a small value (PEFT's recipe: ~r/num_experts, min 1).
