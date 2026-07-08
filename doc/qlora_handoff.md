@@ -22,6 +22,15 @@
 > notes below (which remain the detailed context for each item). Newest
 > priority first, per the 2026-07 direction.
 
+0. **Gated DeltaNet (Qwen3.5/3.6) training — BUILT (Session 18), box gates
+   pending.** The native forward now covers the Qwen3.5/3.6 hybrid: a
+   differentiable GatedDeltaNet block (fla `chunk_gated_delta_rule` on CUDA
+   bf16/fp16, sequential fp32 reference elsewhere) + the interleaved
+   attention output gate on the full-attn layers. What remains is the box
+   work: the fp32 + bf16 validate gates on a real Qwen3.5 EXL3 quant, then a
+   first training run — see the Session 18 box list. Not covered: Qwen3.5-MoE
+   (BlockSparseMLP still rejected), Qwen3-Next (fused qkvz layout), sample
+   packing on GDN models (rejected loudly; train unpacked).
 1. **Quantization-aware LoRA — BUILT (Session 17), box A/B pending.**
    `--quant-aware {noise,ste}` implements the two tractable directions from
    the original item (noise injection on the frozen-weight closure, and a
@@ -2315,6 +2324,119 @@ measurement) — confirm with `--profile-dequant 5` on the first box run.
    base (σ ~3× larger, so both the problem and the expected win grow), and
    re-test qerr there too (carried Session-14 item; qerr's error-repair
    directions + noise robustness are natural companions at low bpw).
+
+### Session 18 — Qwen3.5/3.6: prompt formats + differentiable Gated DeltaNet
+
+> Branch `claude/exl3-qlora-prompt-formats-k3gskk`. Container-verified (new
+> `tests/test_gdn.py` + all existing CPU suites pass); **nothing here is
+> box-verified yet** — the gates below are the next box session. Two arcs:
+> (A) the llama3/qwen3.5 prompt formats, (B) the big one — training the
+> Qwen3.5/3.6 hybrid linear-attention models on the native path (the standing
+> "open research frontier" from Sessions 5/6).
+
+**A. Prompt formats (`--prompt-format`, all three native arms + YAML):**
+- **`llama3`** — explicit Llama-3 header format (identical to `auto` on the
+  llama arch; trains the pattern onto any base, metharme-style, on non-Llama
+  tokenizers). `<|eot_id|>` ends the turn; the model's own BOS is used.
+- **`qwen3.5`** — plain ChatML (identical to `auto` on qwen3/3.5 archs). Use
+  when responses carry their own `<think>` spans (reasoning SFT). No BOS
+  (Qwen defines none); `<|im_end|>` ends the turn.
+- **`qwen3.5-nothink`** — ChatML with the reasoning block pre-closed empty:
+  the assistant turn opens with `<think>\n\n</think>\n\n` inside the *masked*
+  prompt, so the model trains to answer directly. Byte-matches what
+  `PromptFormat_qwen35` (examples/chat_templates.py) prefills at inference
+  with thinking off — train and serve see the same context (the
+  `gemma4-nothink` of the Qwen family).
+- Builders verified against `llama.py`/`qwen3_5.py` `default_chat_prompt` and
+  `PromptFormat_qwen35` (byte-identical). Wired into `qlora_train_native.py`,
+  the DDP arm, `qlora_train_pref.py`, and the sample YAML comment. The BNB
+  arm still hardcodes the Llama-3 template (unchanged).
+
+**B. Differentiable Gated DeltaNet — the Qwen3.5/3.6 unlock.**
+
+*The triage that held since Session 5:* Qwen3.5/3.6 build ~3/4 of layers as
+`GatedDeltaNet` (causal depthwise conv + SiLU over packed q/k/v, gated delta
+rule with L2 q/k-norm and per-v-head exponential decay, gated RMSNorm output)
+and the remaining 1/4 as softmax attention with an **interleaved output gate**
+(q_proj emits `[q | gate]` per head; attn output × `sigmoid(gate)` before
+o_proj). Both were rejected by `assert_block_supported`. Both are now built:
+
+- **`exllamav3/training/gdn.py`** (new; pure torch, CPU-loadable like
+  `fused_ce`): `gdn_delta_rule_reference` (sequential fp32 scan, transcribed
+  from the inference module's own validated reference
+  `torch_recurrent_gated_delta_rule`, made autograd-safe; GQA q/k expansion
+  `j -> j // G` matching the split in_proj_qkv layout), `gdn_causal_conv1d_silu`
+  (fresh zero conv state == left-pad k−1 zeros; exactly the inference conv on
+  a whole sequence), `gdn_gated_rmsnorm` (`rmsnorm(x)·(w+bias)·silu(z)`,
+  fp32 internals), `gdn_beta_g` (`beta = sigmoid(b)·beta_scale`,
+  `g = −exp(a_log)·softplus(a + dt_bias)` — verified against gdn.cu).
+- **Delta-rule fast path = fla's `chunk_gated_delta_rule`** — the SAME
+  autograd-capable Triton kernel exllamav3's own inference prefill dispatches
+  to, called with identical kwargs (`use_qk_l2norm_in_kernel=True`, no
+  initial state), so train numerics match serve numerics by construction.
+  Engaged on CUDA fp16/bf16 when fla imports and `--attn-impl != eager`;
+  everything else runs the sequential reference (correct but O(t) sequential
+  — fine for the fp32 validate gate, not for long training runs). Startup
+  prints which path is live (`describe_attn` → `[gdn: fla chunked kernel]`
+  vs `[gdn: torch reference -- SLOW]`), and `__init__` warns if fla is
+  missing on a GDN model.
+- **`backbone.py`**: `is_gated_delta_net`, `gdn_projections`,
+  `gdn_norm_spec`; `block_metadata` now returns `kind: "attn"|"gdn"` (+
+  `interleaved_gate` on attn, + the GDN dims/decay/conv tensors);
+  `assert_block_supported` accepts GDN blocks with the **split** projection
+  layout (in_proj_qkv/z/b/a — Qwen3.5/3.6) and interleaved-gate attention,
+  still rejects: fused qkvz/ba (Qwen3-Next layout), MoE (`BlockSparseMLP` →
+  Qwen3.5-MoE unsupported), headwise g_proj gating, mRoPE.
+- **`native_llama.py`**: `_gdn_forward` (norm → split projections → conv+silu
+  → delta rule → gated norm → o_proj residual → shared `_mlp_out` MLP half;
+  no RoPE, no attention bias — the recurrence is causal by construction;
+  right-padding safe), `_gdn_delta_rule` dispatch, interleaved-gate handling
+  in `_block_forward` (chunk `[q | gate]` exactly like inference
+  `project_qkv`, gate applied to the flattened ctx in all three attn modes),
+  grad-checkpointed like every other block. **Target-name aliases**
+  (`_GDN_TARGET_ALIASES`): the familiar llama-style target list adapts the
+  analogous GDN projections — q/k/v_proj → `in_proj_qkv`, v_proj →
+  `in_proj_z` too, o_proj → `out_proj`; the tiny per-head b/a projections
+  only when named explicitly (`in_proj_b`/`in_proj_a`). So the default
+  `--targets` trains qkv/z/out on GDN layers + everything on the full-attn
+  and MLP paths, and pissa/eva/qerr/quant-aware all compose (they iterate
+  `net._wrappers` generically).
+- **Sample packing is NOT supported on GDN models** (the recurrence + conv
+  would carry state across packed document boundaries): `net.forward` raises
+  on `seg_ids`, both trainers abort `--pack` with a clear message, and the
+  validate script skips `--check-packing`. fla's cu_seqlens varlen mode is
+  the future fix if packing ever matters here (GDN blocks have no O(t²) term,
+  so packing is a throughput win only).
+- **Tests** (`tests/test_gdn.py`, all pass in-container): delta-rule
+  reference vs a verbatim transcription of the inference reference (incl.
+  GQA grouping), fp64 gradcheck of the rule, conv+silu vs the inference conv
+  from zero state, full GDN block forward vs an independent plain-torch
+  composition, backward reaches qkv/z/out adapters with base + b/a frozen,
+  and the interleaved-gate attn block vs reference. Existing suites
+  (native_llama/fused_ce/qlora_grad/lora_init/preference/quant_aware) pass
+  unchanged.
+
+**Box list for next session (in order):**
+1. **Forward gates on a real Qwen3.5 dense EXL3 quant** (e.g. a
+   Qwen3.5-instruct 4bpw): `qlora_validate_native.py --model $QWEN35`
+   (fp32 eager — exercises the sequential reference against exllamav3's own
+   forward; expect high argmax agreement), then `--compute-dtype bfloat16`
+   (exercises fla chunked + flash attn on the gated full-attn layers;
+   `describe_attn` should print `N×gdn … [gdn: fla chunked kernel]`), then
+   `--check-backward` (grads through both block kinds). Nothing trains until
+   these print PASS. Env: fla (`flash-linear-attention`) must import in the
+   qlora-venv — the inference prefill path already uses it, but confirm the
+   version pin survives (the Session-2 env note about its torch drag).
+2. **Training smoke**: `--inspect 3` first (with `--prompt-format
+   qwen3.5-nothink` on an instruct base), then a short unpacked run
+   (`--sample-every 0` for the first run; live sampling exercises the
+   recurrent-cache generator path, which is orthogonal to training). Expect
+   first loss ~2–4, healthy grad norms, `|dB|` climbing. Watch tok/s — the
+   GDN layers' fla backward is new territory; record `--profile-dequant 5`.
+3. **A real SFT + eval-split run** on the target dataset, judged per the
+   standing eval-prereq rules.
+4. Later / optional: fla cu_seqlens packing for GDN models, fused-qkvz
+   support (Qwen3-Next), MoE (Qwen3.5-MoE) — each a separate project.
 
 ---
 

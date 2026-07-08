@@ -25,14 +25,20 @@ through the gradchecked :class:`EXL3LoRAFunction`. The LM head is handled by the
 streaming :func:`fused_linear_cross_entropy`, so the ``[tokens, vocab]`` logit
 tensor is never materialized during training.
 
-Scope: pre-norm softmax-attention decoders. Every norm / activation / scale is
-read from the loaded modules (see ``backbone.norm_spec``), so one block forward
-covers Llama/Mistral/Qwen2 (plain), Qwen3 (q/k-norm), and Gemma3/4 (q/k/v-norm +
-sandwich post-norms + GeGLU + alternating sliding/full window + per-layer head
-dims + logit softcapping). It reduces bit-identically to the original Llama path
-when those features are absent. Still rejected loudly (``assert_block_supported``):
-linear/recurrent attention (GatedDeltaNet -> Qwen3.5/3.6), MoE, attention output
-gating, mRoPE, partial rotary and non-NeoX RoPE.
+Scope: pre-norm decoders. Every norm / activation / scale is read from the
+loaded modules (see ``backbone.norm_spec``), so one block forward covers
+Llama/Mistral/Qwen2 (plain), Qwen3 (q/k-norm), Gemma3/4 (q/k/v-norm + sandwich
+post-norms + GeGLU + alternating sliding/full window + per-layer head dims +
+logit softcapping), and the Qwen3.5/3.6 hybrid: GatedDeltaNet layers (a
+differentiable gated delta rule -- see ``training.gdn``; the fla
+``chunk_gated_delta_rule`` Triton kernel on CUDA fp16/bf16, the sequential
+fp32 reference elsewhere) and gated full-attention layers (interleaved output
+gate). It reduces bit-identically to the original Llama path when those
+features are absent. Still rejected loudly (``assert_block_supported``):
+fused-qkvz GatedDeltaNet (Qwen3-Next layout), MoE, headwise attention gating
+(g_proj), mRoPE, partial rotary and non-NeoX RoPE. Sample packing is not
+supported on GatedDeltaNet models (the recurrence would carry state across
+packed document boundaries); train them unpacked.
 """
 
 from __future__ import annotations
@@ -50,6 +56,10 @@ from .qlora_linear import EXL3LoRAFunction
 from .fused_ce import (
     fused_linear_cross_entropy, fused_linear_cross_entropy_vocab_chunked,
     DEFAULT_CHUNK, DEFAULT_VOCAB_CHUNK, IGNORE_INDEX,
+)
+from .gdn import (
+    gdn_delta_rule_reference, gdn_causal_conv1d_silu, gdn_gated_rmsnorm,
+    gdn_beta_g,
 )
 
 
@@ -97,6 +107,29 @@ def _liger_ops():
     return _LIGER
 
 
+# fla's chunked gated delta rule (flash-linear-attention). The autograd-capable
+# Triton kernel behind Qwen3.5/3.6's GatedDeltaNet layers -- the SAME kernel
+# exllamav3's own inference prefill dispatches to (modules/gated_delta_net_fn/
+# gated_delta_rule.py), so training and serving share numerics. Imported
+# lazily/cached (Triton CUDA; must not import at module load on a CPU box).
+# When unavailable, GDN layers fall back to the sequential fp32 reference in
+# training.gdn -- correct but slow and memory-heavy at long sequence lengths.
+_FLA_CHUNK_FN = None
+_FLA_TRIED = False
+
+
+def _fla_chunk_fn():
+    global _FLA_CHUNK_FN, _FLA_TRIED
+    if not _FLA_TRIED:
+        _FLA_TRIED = True
+        try:
+            from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+            _FLA_CHUNK_FN = chunk_gated_delta_rule
+        except Exception:
+            _FLA_CHUNK_FN = None
+    return _FLA_CHUNK_FN
+
+
 # Big-head (head_dim > 256) layers -- the Gemma global layers -- have no
 # memory-efficient kernel in the training forward: FA2 caps at head_dim 256,
 # exllamav3's bighead kernel is inference-only, and at head_dim > 256 torch SDPA
@@ -116,6 +149,21 @@ DEFAULT_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
 _ROLE_BY_LEAF = {
     "q_proj": "q", "k_proj": "k", "v_proj": "v", "o_proj": "o",
     "gate_proj": "gate", "up_proj": "up", "down_proj": "down",
+}
+
+# GatedDeltaNet leaf -> the target names that select it. Lets the familiar
+# Llama-style target list (q_proj/k_proj/v_proj/o_proj) adapt the analogous
+# GDN projections on Qwen3.5/3.6 hybrid layers without per-arch target lists:
+# the fused in_proj_qkv plays the q/k/v role, out_proj plays o, and the output
+# gate in_proj_z rides with v_proj (it is a value-shaped projection; PEFT
+# "all-linear" recipes adapt it too). The tiny scalar-per-head b/a projections
+# are only adapted when named explicitly.
+_GDN_TARGET_ALIASES = {
+    "in_proj_qkv": ("in_proj_qkv", "qkv_proj", "q_proj", "k_proj", "v_proj"),
+    "in_proj_z": ("in_proj_z", "z_proj", "v_proj"),
+    "in_proj_b": ("in_proj_b", "b_proj"),
+    "in_proj_a": ("in_proj_a", "a_proj"),
+    "out_proj": ("out_proj", "o_proj"),
 }
 
 
@@ -390,12 +438,19 @@ class NativeLlamaQLoRA(nn.Module):
         self._block_meta = []
         self._block_devices = []   # per-block device (differs under layer-autosplit)
         wrappers: list[DiffLinear] = []
+        satisfied_targets: set[str] = set()   # requested names that matched a linear
+        self.has_gdn = False
 
-        def wrap(linear, leaf):
-            is_target = leaf in targets
+        def wrap(linear, leaf, aliases=None):
+            # `aliases` (GDN layers) lets several requested target names select
+            # one physical linear (see _GDN_TARGET_ALIASES); plain layers match
+            # on their own leaf name only.
+            names = aliases if aliases is not None else (leaf,)
+            hit = targets.intersection(names)
+            satisfied_targets.update(hit)
             w = DiffLinear(
                 linear,
-                r=r if is_target else 0,
+                r=r if hit else 0,
                 alpha=alpha,
                 use_rslora=use_rslora,
                 compute_dtype=compute_dtype,
@@ -405,11 +460,10 @@ class NativeLlamaQLoRA(nn.Module):
 
         for blk in blocks:
             backbone.assert_block_supported(blk)
-            q_proj, k_proj, v_proj, o_proj = backbone.attn_projections(blk)
+            meta = backbone.block_metadata(blk)
             gate_lins, up_lins, down_lins = backbone.mlp_projections(blk)
             attn_norm, mlp_norm = backbone.block_norms(blk)
             attn_post, mlp_post = backbone.block_post_norms(blk)        # Gemma sandwich
-            q_norm, k_norm, v_norm = backbone.attn_qkv_norms(blk)       # Qwen3 / Gemma
 
             # MLP may be sliced across intermediate dim for very wide models;
             # wrap every slice and sum the down-projections (mirrors GatedMLP).
@@ -425,24 +479,50 @@ class NativeLlamaQLoRA(nn.Module):
             entry.mlp_norm_spec = backbone.norm_spec(mlp_norm)
             entry.attn_post_spec = backbone.norm_spec(attn_post)
             entry.mlp_post_spec = backbone.norm_spec(mlp_post)
-            entry.q_norm_spec = backbone.norm_spec(q_norm)
-            entry.k_norm_spec = backbone.norm_spec(k_norm)
-            entry.v_norm_spec = backbone.norm_spec(v_norm)
-            entry.q_proj = wrap(q_proj, "q_proj")
-            entry.k_proj = wrap(k_proj, "k_proj")
-            # Some Gemma layers reuse K as V (no v_proj); the block forward then
-            # takes V from the raw K projection.
-            entry.v_proj = wrap(v_proj, "v_proj") if v_proj is not None else None
-            entry.o_proj = wrap(o_proj, "o_proj")
+            if meta["kind"] == "gdn":
+                # GatedDeltaNet layer (Qwen3.5/3.6 linear attention). The five
+                # split projections are all native Linears, so LoRA / pissa /
+                # quant-aware compose exactly as on softmax layers.
+                self.has_gdn = True
+                qkv_l, z_l, b_l, a_l, o_l = backbone.gdn_projections(blk)
+                entry.gdn_norm_spec = backbone.gdn_norm_spec(blk)
+                entry.qkv_proj = wrap(qkv_l, "in_proj_qkv",
+                                      _GDN_TARGET_ALIASES["in_proj_qkv"])
+                entry.z_proj = wrap(z_l, "in_proj_z",
+                                    _GDN_TARGET_ALIASES["in_proj_z"])
+                entry.b_proj = wrap(b_l, "in_proj_b",
+                                    _GDN_TARGET_ALIASES["in_proj_b"])
+                entry.a_proj = wrap(a_l, "in_proj_a",
+                                    _GDN_TARGET_ALIASES["in_proj_a"])
+                entry.o_proj = wrap(o_l, "out_proj",
+                                    _GDN_TARGET_ALIASES["out_proj"])
+            else:
+                q_proj, k_proj, v_proj, o_proj = backbone.attn_projections(blk)
+                q_norm, k_norm, v_norm = backbone.attn_qkv_norms(blk)   # Qwen3 / Gemma
+                entry.q_norm_spec = backbone.norm_spec(q_norm)
+                entry.k_norm_spec = backbone.norm_spec(k_norm)
+                entry.v_norm_spec = backbone.norm_spec(v_norm)
+                entry.q_proj = wrap(q_proj, "q_proj")
+                entry.k_proj = wrap(k_proj, "k_proj")
+                # Some Gemma layers reuse K as V (no v_proj); the block forward then
+                # takes V from the raw K projection.
+                entry.v_proj = wrap(v_proj, "v_proj") if v_proj is not None else None
+                entry.o_proj = wrap(o_proj, "o_proj")
             entry.gates = nn.ModuleList(gates)
             entry.ups = nn.ModuleList(ups)
             entry.downs = nn.ModuleList(downs)
             self.blocks.append(entry)
 
-            self._block_meta.append(backbone.block_metadata(blk))
+            self._block_meta.append(meta)
             self._block_devices.append(backbone.block_device(blk))
 
         self._wrappers = wrappers
+        if self.has_gdn and _fla_chunk_fn() is None:
+            print(" -- note: GatedDeltaNet layers present but the fla package "
+                  "(flash-linear-attention) is not importable; the delta rule "
+                  "will run the sequential torch reference -- correct but slow "
+                  "and memory-heavy at long seq-len. pip install "
+                  "flash-linear-attention for the chunked Triton kernel.")
         self.final_norm_spec = backbone.norm_spec(self.final_norm)
         # Final-logit tanh softcapping (Gemma2; 0 = none). Applied by logits(),
         # by the materialized supervised-position loss, and by both fused-CE
@@ -477,9 +557,9 @@ class NativeLlamaQLoRA(nn.Module):
                   "only, so compute_loss uses the materialized supervised-position "
                   "head loss. Watch head memory on a big-vocab base.")
 
-        # Sanity: every requested target name actually matched something.
-        matched = {w.key.split(".")[-1] for w in wrappers if w.r > 0}
-        missing = targets - matched
+        # Sanity: every requested target name actually matched something
+        # (directly by leaf name, or via a GDN alias -- see _GDN_TARGET_ALIASES).
+        missing = targets - satisfied_targets
         if missing:
             raise ValueError(
                 f"target_modules {sorted(missing)} matched no linear in the model "
@@ -686,7 +766,17 @@ class NativeLlamaQLoRA(nn.Module):
         # (that is what doubled the activation footprint). Per-head norm and RoPE
         # below keep their internals in fp32 but return in this dtype.
         normed = self._norm(hidden, entry.attn_norm_spec)
-        q = entry.q_proj(normed).view(bsz, t, nq, hd)
+        if meta.get("interleaved_gate"):
+            # Qwen3.5 gated attention: q_proj emits [q | gate] interleaved per
+            # head ([..., nq, 2*hd]); the gate multiplies the attention output
+            # (sigmoid) before o_proj. Split exactly as the inference
+            # project_qkv does (chunk on the per-head 2*hd slice).
+            qg = entry.q_proj(normed).view(bsz, t, nq, 2 * hd)
+            q, out_gate = torch.chunk(qg, 2, dim=-1)             # [b,t,nq,hd] each
+            out_gate = out_gate.reshape(bsz, t, nq * hd)
+        else:
+            q = entry.q_proj(normed).view(bsz, t, nq, hd)
+            out_gate = None
         k = entry.k_proj(normed).view(bsz, t, nkv, hd)
         # use_k_as_v: V is the raw K projection (taken before k-norm/RoPE).
         v = k if entry.v_proj is None else entry.v_proj(normed).view(bsz, t, nkv, hd)
@@ -815,6 +905,11 @@ class NativeLlamaQLoRA(nn.Module):
             probs = torch.softmax(scores, dim=-1)
             ctx = torch.matmul(probs, v)                        # [b,nq,t,hd]
             ctx = ctx.transpose(1, 2).reshape(bsz, t, nq * hd)  # fp32 reference result
+        # Interleaved output gate (Qwen3.5 full-attn layers): o *= sigmoid(gate),
+        # applied to the flattened context exactly as the inference mul_sigmoid_
+        # does, before o_proj. sigmoid in fp32 for fidelity, back to ctx dtype.
+        if out_gate is not None:
+            ctx = ctx * torch.sigmoid(out_gate.float()).to(ctx.dtype)
         # o_proj re-casts its input to compute_dtype and outputs in it, so attn_out is
         # bf16 in a training run regardless of ctx's dtype -- no fp32 upcast of the
         # residual stream here (that is what the old `.float()` was costing).
@@ -828,6 +923,26 @@ class NativeLlamaQLoRA(nn.Module):
 
         # --- gated MLP (SwiGLU / GeGLU) ---
         normed2 = self._norm(hidden, entry.mlp_norm_spec)
+        mlp_out = self._mlp_out(meta, entry, normed2)
+        if entry.mlp_post_spec is not None:
+            hidden = hidden + self._norm(mlp_out, entry.mlp_post_spec)
+        else:
+            hidden = hidden + mlp_out
+
+        # Gemma's learned per-layer scalar on the whole residual stream (block end).
+        # None for plain archs -> no-op. Compounds over layers, so omitting it on
+        # Gemma produces garbage even though each block is individually close.
+        ls = meta.get("layer_scalar")
+        if ls is not None:
+            # Cast the result back to hidden's dtype: a fp32 layer_scalar tensor would
+            # otherwise promote the whole bf16 residual to fp32 at every block end.
+            hidden = (hidden * ls).to(hidden.dtype)
+        return hidden
+
+    def _mlp_out(self, meta, entry, normed2):
+        # Gated MLP (SwiGLU / GeGLU) over the already-normed input; shared by the
+        # softmax-attention and GatedDeltaNet block forwards. The MLP may be
+        # sliced across the intermediate dim (very wide models) -- sum the downs.
         is_silu = meta["activation"] == "silu"
         act = F.silu if is_silu else (lambda z: F.gelu(z, approximate="tanh"))
         # Liger fused SiLU*mul (CUDA, silu only -- GeGLU stays torch): fuses the
@@ -849,18 +964,82 @@ class NativeLlamaQLoRA(nn.Module):
                 a = act(gate(normed2)) * up(normed2)
             d = down(a)                                          # compute_dtype (no fp32 upcast)
             mlp_out = d if mlp_out is None else mlp_out + d
+        return mlp_out
+
+    # --- GatedDeltaNet (linear attention) block forward --------------------
+
+    def _gdn_delta_rule(self, q, k, v, g, beta):
+        """Dispatch the gated delta rule: fla's chunked Triton kernel (the same
+        one exllamav3's inference prefill uses -- autograd-capable, O(t) memory)
+        on CUDA fp16/bf16, else the sequential fp32 reference (CPU / fp32
+        validate / gradcheck). q/k arrive RAW; both paths L2-normalize per head
+        internally. Shapes: q/k [b,t,nk,dk], v [b,t,nv,dv], g/beta [b,t,nv];
+        returns [b,t,nv,dv]."""
+        fla_fn = _fla_chunk_fn()
+        use_fla = (fla_fn is not None and q.is_cuda and self.attn_impl != "eager"
+                   and self.compute_dtype in (torch.float16, torch.bfloat16))
+        if use_fla:
+            cd = self.compute_dtype
+            core, _ = fla_fn(
+                q.to(cd), k.to(cd), v.to(cd),
+                g=g.float(), beta=beta.to(cd),
+                initial_state=None, output_final_state=False,
+                use_qk_l2norm_in_kernel=True,
+            )
+            return core
+        return gdn_delta_rule_reference(q, k, v, g, beta)
+
+    def _gdn_forward(self, meta, entry, hidden):
+        """One GatedDeltaNet decoder block (Qwen3.5/3.6 linear-attention layer):
+        pre-norm -> split q/k/v + z + b/a projections -> causal depthwise conv +
+        SiLU -> gated delta rule -> gated RMSNorm * silu(z) -> o_proj residual,
+        then the standard gated-MLP half. Stateless (sequences start at position
+        0), so the inference path's zero conv/recurrent state is reproduced
+        exactly; no RoPE, no attention mask (the recurrence is causal by
+        construction). Right-padding is safe: pad positions produce garbage that
+        never feeds back into real positions and is masked from the loss."""
+        bsz, t, _ = hidden.shape
+        nk, nv = meta["num_k_heads"], meta["num_v_heads"]
+        dk, dv = meta["k_head_dim"], meta["v_head_dim"]
+        k_dim, v_dim = nk * dk, nv * dv
+
+        normed = self._norm(hidden, entry.attn_norm_spec)
+        qkv = entry.qkv_proj(normed)                       # [b, t, 2*k_dim + v_dim]
+        z = entry.z_proj(normed).view(bsz, t, nv, dv)      # output gate
+        beta, g = gdn_beta_g(
+            entry.b_proj(normed), entry.a_proj(normed),
+            meta["a_log"], meta["dt_bias"], meta["beta_scale"],
+        )                                                  # [b, t, nv] fp32 each
+
+        # Causal depthwise conv + SiLU over the packed q|k|v channels, in the
+        # activation dtype (fp32 on the validate path, compute dtype in training;
+        # the inference kernel runs bf16).
+        x = qkv.transpose(1, 2)                            # [b, dim, t]
+        x = gdn_causal_conv1d_silu(x, meta["conv1d_weight"], meta["conv1d_bias"])
+        x = x.transpose(1, 2)                              # [b, t, dim]
+
+        q, k, v = torch.split(x, [k_dim, k_dim, v_dim], dim=-1)
+        q = q.view(bsz, t, nk, dk)
+        k = k.view(bsz, t, nk, dk)
+        v = v.view(bsz, t, nv, dv)
+
+        core = self._gdn_delta_rule(q, k, v, g, beta)      # [b, t, nv, dv]
+        core = gdn_gated_rmsnorm(core, entry.gdn_norm_spec, z)
+        attn_out = entry.o_proj(core.reshape(bsz, t, v_dim))
+        if entry.attn_post_spec is not None:
+            hidden = hidden + self._norm(attn_out, entry.attn_post_spec)
+        else:
+            hidden = hidden + attn_out
+
+        normed2 = self._norm(hidden, entry.mlp_norm_spec)
+        mlp_out = self._mlp_out(meta, entry, normed2)
         if entry.mlp_post_spec is not None:
             hidden = hidden + self._norm(mlp_out, entry.mlp_post_spec)
         else:
             hidden = hidden + mlp_out
 
-        # Gemma's learned per-layer scalar on the whole residual stream (block end).
-        # None for plain archs -> no-op. Compounds over layers, so omitting it on
-        # Gemma produces garbage even though each block is individually close.
         ls = meta.get("layer_scalar")
         if ls is not None:
-            # Cast the result back to hidden's dtype: a fp32 layer_scalar tensor would
-            # otherwise promote the whole bf16 residual to fp32 at every block end.
             hidden = (hidden * ls).to(hidden.dtype)
         return hidden
 
@@ -921,12 +1100,23 @@ class NativeLlamaQLoRA(nn.Module):
         is_cuda = "cuda" in str(dev)
         mem_eff = (self._flash_ok and is_cuda
                    and self.compute_dtype in (torch.float16, torch.bfloat16))
-        counts = Counter(self._attn_mode_for(m, mem_eff) for m in self._block_meta)
-        plan = ", ".join(f"{counts[k]}×{k}" for k in ("flash", "sdpa", "eager") if counts[k])
+        counts = Counter(
+            "gdn" if m.get("kind", "attn") == "gdn" else self._attn_mode_for(m, mem_eff)
+            for m in self._block_meta)
+        plan = ", ".join(f"{counts[k]}×{k}" for k in ("flash", "sdpa", "eager", "gdn")
+                         if counts[k])
         avail = "available" if _flash_attn_func() is not None else "NOT importable"
         why = "" if mem_eff else "  (eager: needs CUDA + fp16/bf16" + \
             ("" if self._flash_ok else " + flash_attn") + ")"
-        return f"attn: {plan}  [impl={self.attn_impl}, flash_attn {avail}]{why}"
+        line = f"attn: {plan}  [impl={self.attn_impl}, flash_attn {avail}]{why}"
+        if counts["gdn"]:
+            gdn_fast = (is_cuda and self.attn_impl != "eager"
+                        and self.compute_dtype in (torch.float16, torch.bfloat16)
+                        and _fla_chunk_fn() is not None)
+            line += ("  [gdn: fla chunked kernel]" if gdn_fast
+                     else "  [gdn: torch reference -- SLOW, install "
+                          "flash-linear-attention + use bf16/fp16 CUDA]")
+        return line
 
     def forward(
         self,
@@ -951,6 +1141,12 @@ class NativeLlamaQLoRA(nn.Module):
         if (qa_state is not None and self.training and torch.is_grad_enabled()
                 and not self._adapters_off):
             qa_state["tick"] += 1
+        if seg_ids is not None and getattr(self, "has_gdn", False):
+            raise ValueError(
+                "sample packing (seg_ids) is not supported on GatedDeltaNet "
+                "models: the linear-attention recurrence and causal conv would "
+                "carry state across packed document boundaries. Train unpacked "
+                "(drop --pack).")
         bsz, t = input_ids.shape
         # Under a layer-autosplit load each block lives on its own device; the
         # hidden state is migrated across boundaries below (mirroring exllamav3's
@@ -1053,6 +1249,18 @@ class NativeLlamaQLoRA(nn.Module):
                     hidden = backbone.to_device(hidden, dev)
                     position_ids = backbone.to_device(position_ids, dev)
                     cur_device = dev
+                if meta.get("kind", "attn") == "gdn":
+                    # GatedDeltaNet block: no RoPE, no attention bias, no packing
+                    # (packing is rejected above -- the recurrence would carry
+                    # state across packed document boundaries).
+                    if ckpt:
+                        hidden = torch.utils.checkpoint.checkpoint(
+                            self._gdn_forward, meta, entry, hidden,
+                            use_reentrant=False,
+                        )
+                    else:
+                        hidden = self._gdn_forward(meta, entry, hidden)
+                    continue
                 mode = self._attn_mode_for(meta, mem_eff)
                 # eager: seg-aware additive bias. flash + sdpa both isolate documents
                 # via pack_ctx (cu_seqlens for flash-varlen; per-document SDPA loop for

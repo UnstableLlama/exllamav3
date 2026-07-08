@@ -549,7 +549,11 @@ def main():
                                   attn_impl=args.attn_impl)
 
     if args.check_packing:
-        all_ok &= check_packing(net, tokenizer, prompts, args.device)
+        if getattr(net, "has_gdn", False):
+            print("\n -- skipping packing check: sample packing is not supported "
+                  "on GatedDeltaNet models (train unpacked).")
+        else:
+            all_ok &= check_packing(net, tokenizer, prompts, args.device)
 
     print("\n" + "=" * 78)
     print("RESULT:", "PASS -- differentiable forward matches native"

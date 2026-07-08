@@ -46,18 +46,28 @@ def split_decoder(model):
 
 # --- per-block structure ---------------------------------------------------
 
+def is_gated_delta_net(attn) -> bool:
+    """True when a block's ``attn`` slot holds a ``GatedDeltaNet`` (linear /
+    recurrent attention -- Qwen3.5/3.6, Qwen3-Next, OLMo-hybrid) rather than
+    softmax attention."""
+    from ..modules import GatedDeltaNet
+    return isinstance(attn, GatedDeltaNet)
+
+
 def assert_block_supported(block):
     """
     Reject architectures the native forward can't faithfully reproduce, loudly,
     so a mismatch is an explicit error rather than a silently wrong forward.
 
-    The native block forward reproduces a pre-norm softmax-attention decoder and
-    reads every norm / activation / scale from the loaded modules, so it covers
-    Llama/Mistral/Qwen2 (plain), Qwen3 (q/k-norm), and Gemma3/4 (q/k/v-norm +
-    sandwich post-norms + GeGLU + sliding/full window + per-layer head dims).
-    What it still cannot do is rejected here: linear/recurrent attention
-    (GatedDeltaNet -> Qwen3.5/3.6), MoE, attention output gating, mRoPE, partial
-    rotary, and non-NeoX RoPE.
+    The native block forward reproduces a pre-norm decoder and reads every
+    norm / activation / scale from the loaded modules, so it covers
+    Llama/Mistral/Qwen2 (plain), Qwen3 (q/k-norm), Gemma3/4 (q/k/v-norm +
+    sandwich post-norms + GeGLU + sliding/full window + per-layer head dims),
+    and the Qwen3.5/3.6 hybrid layers: GatedDeltaNet (linear/recurrent
+    attention, split in_proj_qkv/z/b/a projection layout) and gated softmax
+    attention (interleaved output gate). What it still cannot do is rejected
+    here: fused-qkvz GatedDeltaNet (the Qwen3-Next layout), MoE, headwise
+    attention gating (g_proj), mRoPE, partial rotary, and non-NeoX RoPE.
     """
     from ..modules import GatedMLP, Attention, SlidingAttention
     key = getattr(block, "key", "?")
@@ -65,22 +75,39 @@ def assert_block_supported(block):
     mlp = getattr(block, "mlp", None)
     assert attn is not None and mlp is not None, \
         f"{key}: block must have both attention and MLP (parallel/no-op blocks unsupported)"
-    # Softmax attention only -- GatedDeltaNet (linear/recurrent attention, used by
-    # Qwen3.5/3.6 for ~3/4 of layers) needs a differentiable recurrent forward we
-    # do not have.
-    assert isinstance(attn, (Attention, SlidingAttention)), \
-        f"{key}: only softmax Attention/SlidingAttention is supported, got " \
-        f"{type(attn).__name__} (linear/recurrent attention is unsupported)"
     assert isinstance(mlp, GatedMLP), \
         f"{key}: only GatedMLP is supported (no MoE), got {type(mlp).__name__}"
     assert mlp.activation_fn in ("silu", "gelu"), \
         f"{key}: only SiLU/GeLU gated MLP is supported, got activation {mlp.activation_fn!r}"
     assert getattr(mlp, "act_limit", 0.0) in (0.0, None), \
         f"{key}: gated-MLP act_limit is not supported"
-    # q/k/v norms ARE supported now (read from the modules); only attention output
-    # gating (interleaved/headwise gate, used by Qwen3.5 full-attn layers) is not.
-    assert getattr(attn, "g_proj", None) is None and not getattr(attn, "interleaved_gate", False), \
-        f"{key}: attention output gating is not supported"
+    if is_gated_delta_net(attn):
+        # Differentiable GatedDeltaNet: supported for the SPLIT projection
+        # layout (Qwen3.5/3.6: in_proj_qkv / in_proj_z / in_proj_b /
+        # in_proj_a). The fused qkvz/ba layout (Qwen3-Next) interleaves heads
+        # inside one tensor and is not wired up.
+        assert attn.num_k_heads > 0, \
+            f"{key}: GatedDeltaNet with no local K heads (TP shard?) unsupported"
+        assert attn.qkvz_proj is None and attn.ba_proj is None, \
+            f"{key}: fused qkvz/ba GatedDeltaNet projections (Qwen3-Next " \
+            f"layout) are not supported; only the split in_proj_qkv/z/b/a " \
+            f"layout (Qwen3.5/3.6) is"
+        for name in ("qkv_proj", "z_proj", "b_proj", "a_proj", "o_proj"):
+            assert getattr(attn, name, None) is not None, \
+                f"{key}: GatedDeltaNet missing {name}"
+        assert attn.norm is not None, f"{key}: GatedDeltaNet missing gated norm"
+        assert attn.a_log is not None and attn.dt_bias is not None, \
+            f"{key}: GatedDeltaNet a_log/dt_bias not loaded (load the model first)"
+        return
+    # Softmax attention path.
+    assert isinstance(attn, (Attention, SlidingAttention)), \
+        f"{key}: only softmax Attention/SlidingAttention or GatedDeltaNet is " \
+        f"supported, got {type(attn).__name__}"
+    # q/k/v norms and the interleaved output gate (Qwen3.5 full-attn layers) ARE
+    # supported (read from the modules); only the separate headwise gate
+    # projection (g_proj) is not.
+    assert getattr(attn, "g_proj", None) is None, \
+        f"{key}: headwise attention gating (g_proj) is not supported"
     assert attn.rope is not None and attn.rope.inv_freq is not None, \
         f"{key}: model loaded without a RoPE table; cannot build positional encoding"
     assert attn.rope.mrope_section is None, f"{key}: mRoPE is not supported"
@@ -94,11 +121,40 @@ def block_metadata(block) -> dict:
     """
     Plain-data description of one decoder block's attention / RoPE / norm config,
     consumed by the differentiable block forward. Tensors are referenced, not
-    copied (``inv_freq`` is the loaded RoPE table itself).
+    copied (``inv_freq`` is the loaded RoPE table itself). ``kind`` is
+    ``"attn"`` (softmax attention) or ``"gdn"`` (GatedDeltaNet); the two kinds
+    carry different keys.
     """
     attn = block.attn
+    if is_gated_delta_net(attn):
+        # Depthwise causal conv weight: one fused [dim, 1, kernel] tensor, or
+        # (older checkpoints) separate q/k/v parts that concatenate along the
+        # channel dim -- exactly the fusion the inference forward performs.
+        w = attn.conv1d_weight
+        if w is None:
+            w = torch.cat([attn.conv1d_q_weight, attn.conv1d_k_weight,
+                           attn.conv1d_v_weight], dim=0)
+        if w.dim() == 3:
+            w = w.squeeze(1)
+        return {
+            "kind": "gdn",
+            "num_k_heads": attn.num_k_heads,
+            "num_v_heads": attn.num_v_heads,
+            "k_head_dim": attn.k_head_dim,
+            "v_head_dim": attn.v_head_dim,
+            "conv_kernel_size": attn.conv_kernel_size,
+            "beta_scale": float(attn.beta_scale),
+            "a_log": attn.a_log,                 # [nv]
+            "dt_bias": attn.dt_bias,             # [nv]
+            "conv1d_weight": w,                  # [2*k_dim + v_dim, kernel]
+            "conv1d_bias": attn.conv1d_bias,     # [2*k_dim + v_dim] or None
+            # gated-MLP activation for the block's MLP half.
+            "activation": block.mlp.activation_fn,
+            "layer_scalar": getattr(block, "layer_scalar_f", None),
+        }
     sw = getattr(attn, "sliding_window", -1)
     return {
+        "kind": "attn",
         "num_q_heads": attn.num_q_heads,
         "num_kv_heads": attn.num_kv_heads,
         "head_dim": attn.head_dim,
@@ -115,6 +171,10 @@ def block_metadata(block) -> dict:
         "activation": block.mlp.activation_fn,
         # Some Gemma layers reuse the K projection as V (no separate v_proj).
         "use_k_as_v": bool(getattr(attn, "use_k_as_v", False)),
+        # Qwen3.5 full-attention layers: q_proj emits [q | gate] interleaved
+        # per head (out_features = 2*nq*hd); the attention output is multiplied
+        # by sigmoid(gate) before o_proj.
+        "interleaved_gate": bool(getattr(attn, "interleaved_gate", False)),
         # Gemma applies a learned per-layer scalar to the whole residual stream at
         # block end (TransformerBlock.forward: x *= layer_scalar_f). None elsewhere.
         "layer_scalar": getattr(block, "layer_scalar_f", None),
@@ -200,6 +260,29 @@ def attn_projections(block):
     """Return the ``(q_proj, k_proj, v_proj, o_proj)`` linears of one block."""
     a = block.attn
     return a.q_proj, a.k_proj, a.v_proj, a.o_proj
+
+
+def gdn_projections(block):
+    """Return the ``(qkv_proj, z_proj, b_proj, a_proj, o_proj)`` linears of a
+    GatedDeltaNet block (split projection layout -- Qwen3.5/3.6)."""
+    a = block.attn
+    return a.qkv_proj, a.z_proj, a.b_proj, a.a_proj, a.o_proj
+
+
+def gdn_norm_spec(block) -> dict:
+    """``norm_spec``-shaped description of a GatedDeltaNet block's gated
+    RMSNorm (applied per value head over ``v_head_dim``, then multiplied by
+    ``silu(z)`` -- see ``training.gdn.gdn_gated_rmsnorm``)."""
+    from ..modules import GatedRMSNorm
+    norm = block.attn.norm
+    assert isinstance(norm, GatedRMSNorm), \
+        f"expected GatedRMSNorm on GatedDeltaNet, got {type(norm).__name__}"
+    return {
+        "weight": norm.weight,
+        "eps": norm.rms_norm_eps,
+        "bias": float(getattr(norm, "constant_bias", 0.0)),
+        "scale": 1.0,
+    }
 
 
 def mlp_projections(block):
