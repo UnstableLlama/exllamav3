@@ -1,12 +1,12 @@
 # EXL3 QLoRA training config. Launch with:
-#   python examples/qlora_train.py --config examples/qlora_train_config.yaml
+#   python training/qlora_train.py --config training/qlora_train_config.yaml
 #
 # One file selects the execution mode:
 #   parallel: single  # one process, one GPU
 #   parallel: split   # one process, native layer-autosplit across visible GPUs
-#   parallel: ddp     # launcher execs torchrun + examples/qlora_train_native_ddp.py
+#   parallel: ddp     # launcher execs torchrun + training/qlora_train_native_ddp.py
 #
-# Keys mirror the CLI flags in examples/qlora_train_native.py. Use snake_case here;
+# Keys mirror the CLI flags in training/qlora_train_native.py. Use snake_case here;
 # the launcher converts to --kebab-case. DDP-only launch settings live under ddp:.
 
 # Required

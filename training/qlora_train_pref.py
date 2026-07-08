@@ -4,7 +4,7 @@ HuggingFace Transformers in the loop.
 
 Trains LoRA adapters on a frozen EXL3 base with a preference objective instead
 of SFT cross-entropy, using the same transformers-free differentiable forward
-as examples/qlora_train_native.py. The REFERENCE model is the frozen base
+as training/qlora_train_native.py. The REFERENCE model is the frozen base
 itself, obtained by running the same net under
 ``NativeLlamaQLoRA.adapters_disabled()`` (the PEFT disable-adapter trick) -- no
 second model copy is ever loaded, so the VRAM story matches SFT plus one extra
@@ -28,7 +28,7 @@ Methods:
                  pairs (TRL's +1-offset rotation), which needs --batch >= 2.
 
 Usage (defaults are illustrative; DPO on a paired dataset):
-    python examples/qlora_train_pref.py --method dpo \
+    python training/qlora_train_pref.py --method dpo \
         --model /path/to/exl3_model --out out/exl3_dpo_adapter \
         --dataset /data/pairs.jsonl --beta 0.1 --lr 5e-6 \
         --scheduler cosine --warmup-ratio 0.1 --epochs 1
@@ -45,7 +45,7 @@ Notes vs the SFT trainer:
     raw quantized base) -- the run prints a note.
 
 Verify the adapter afterwards on the native inference path:
-    python examples/qlora_infer_native.py --model <model> --adapter <out>
+    python training/qlora_infer_native.py --model <model> --adapter <out>
 """
 
 import argparse
@@ -914,7 +914,7 @@ def _run_main():
           f"peak VRAM {peak_str} | {dt:.0f}s for {step} steps | "
           f"step time: {timer.summary()}")
     log_run("completed", dt, val_loss)
-    print("Verify with: python examples/qlora_infer_native.py "
+    print("Verify with: python training/qlora_infer_native.py "
           f"--model {args.model} --adapter {args.out}")
 
 

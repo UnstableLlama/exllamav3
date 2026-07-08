@@ -23,7 +23,7 @@
 # more layers off cuda:0 (lower its cap) or drop BATCH.
 #
 # Usage:
-#   bash examples/experiments/train_rocinante_yoda.sh MODEL_DIR DATA_JSONL [OUT_DIR]
+#   bash training/experiments/train_rocinante_yoda.sh MODEL_DIR DATA_JSONL [OUT_DIR]
 #
 # Override with env vars:
 #   PARALLEL         split | ddp                      (default split)
@@ -89,7 +89,7 @@ fi
 #    forward. set -e aborts the whole run if it exits non-zero.
 if [[ "${SKIP_VALIDATE:-0}" != "1" ]]; then
     echo "== [1/2] validating differentiable forward (gates the run) =="
-    python examples/qlora_validate_native.py --model "$MODEL" "${SPLIT_ARGS[@]}"
+    python training/qlora_validate_native.py --model "$MODEL" "${SPLIT_ARGS[@]}"
 else
     echo "== [1/2] SKIP_VALIDATE=1 -- skipping the forward-correctness gate =="
 fi
@@ -98,7 +98,7 @@ fi
 echo "== [2/2] launching $PARALLEL QLoRA run =="
 if [[ "$PARALLEL" == "ddp" ]]; then
     # torchrun spawns one process per GPU; only rank 0 prints/saves.
-    torchrun --standalone --nproc_per_node="$NGPU" examples/qlora_train_native_ddp.py \
+    torchrun --standalone --nproc_per_node="$NGPU" training/qlora_train_native_ddp.py \
         --model "$MODEL" --out "$OUT" --dataset "$DATA" \
         --lora-r 64 --alpha 64 --lr 1e-4 \
         --batch "$BATCH" --grad-accum "$ACCUM" --seq-len 512 --steps "$STEPS" \
@@ -107,7 +107,7 @@ if [[ "$PARALLEL" == "ddp" ]]; then
 else
     # Single process spanning both cards (layer-split). Note: --r here, not
     # --lora-r (the torchrun abbrev collision only affects the ddp launcher).
-    python examples/qlora_train_native.py \
+    python training/qlora_train_native.py \
         --model "$MODEL" --out "$OUT" --dataset "$DATA" "${SPLIT_ARGS[@]}" \
         --r 64 --alpha 64 --lr 1e-4 \
         --batch "$BATCH" --grad-accum "$ACCUM" --seq-len 512 --steps "$STEPS" \
@@ -117,4 +117,4 @@ fi
 
 echo "== done. adapter -> $OUT ; full log -> $LOG =="
 echo "   verify (on bf16 base for a fair read; the 4bpw base attenuates LoRAs):"
-echo "   python examples/qlora_infer_native.py --model $MODEL --adapter $OUT"
+echo "   python training/qlora_infer_native.py --model $MODEL --adapter $OUT"

@@ -15,16 +15,16 @@
 pip install datasets            # optional extras: flash-attn, liger-kernel, bitsandbytes
 
 # 1. prove the differentiable forward is correct for YOUR model (run this first)
-python examples/qlora_validate_native.py --model /path/to/exl3-model --compute-dtype bfloat16
+python training/qlora_validate_native.py --model /path/to/exl3-model --compute-dtype bfloat16
 
 # 2. edit the config, then train
-python examples/qlora_train.py --config examples/qlora_train_config.yaml
+python training/qlora_train.py --config training/qlora_train_config.yaml
 
 # 3. before/after comparison on the native inference path
-python examples/qlora_infer_native.py --model /path/to/exl3-model --adapter out/my_adapter
+python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/my_adapter
 ```
 
-Everything is driven by one YAML file ([`examples/qlora_train_config.yaml`](examples/qlora_train_config.yaml) is the fully-commented reference — its keys mirror the CLI flags of `examples/qlora_train_native.py` one-to-one). A minimal config looks like:
+Everything is driven by one YAML file ([`training/qlora_train_config.yaml`](training/qlora_train_config.yaml) is the fully-commented reference — its keys mirror the CLI flags of `training/qlora_train_native.py` one-to-one). A minimal config looks like:
 
 ```yaml
 model: /models/Llama-3.2-3B-Instruct-exl3-4bpw
@@ -54,7 +54,7 @@ optim: paged_adamw8bit
 ### What's in the box
 
 - **Single-GPU, multi-GPU layer-split (`parallel: split`), and DDP (`parallel: ddp`)** training of LoRA adapters over a frozen EXL3 base — plus optional embedding/LM-head training (full or low-rank).
-- **Preference optimization: DPO and KTO** (`examples/qlora_train_pref.py --method dpo|kto`) with the frozen quantized base as the reference model (adapter-disable trick — no second model copy). Loss semantics follow [HuggingFace TRL](https://github.com/huggingface/trl)'s stable `DPOTrainer`/`KTOTrainer` (with credit — see below), so β/loss-variant hyperparameters transfer directly; variants: sigmoid/cDPO, hinge (SLiC), IPO, KTO, APO-zero-unpaired.
+- **Preference optimization: DPO and KTO** (`training/qlora_train_pref.py --method dpo|kto`) with the frozen quantized base as the reference model (adapter-disable trick — no second model copy). Loss semantics follow [HuggingFace TRL](https://github.com/huggingface/trl)'s stable `DPOTrainer`/`KTOTrainer` (with credit — see below), so β/loss-variant hyperparameters transfer directly; variants: sigmoid/cDPO, hinge (SLiC), IPO, KTO, APO-zero-unpaired.
 - **Memory levers** for long context on consumer cards: gradient checkpointing, activation offload to CPU RAM, fused/chunked cross-entropy (chunked over the vocab too, for 256k-vocab models), 8-bit and paged optimizers, Liger kernels (RMSNorm/RoPE/SwiGLU).
 - **A real eval harness**: held-out loss from your dataset's own split (`eval_split`) or a carved fraction (`val_frac`), an optional second monitor set (`eval2_*`, e.g. wikitext LM loss watched next to your task loss), `save_best` checkpointing, periodic live sample generations, and a per-run CSV log of hyperparameters/losses/VRAM/throughput.
 - **Correctness gates, not vibes**: `qlora_validate_native.py` checks the differentiable forward against the native inference forward, the Liger backward against plain torch, packing isolation, and each adapter init's step-0 math — before you spend GPU-days. A CPU test suite covers the gradient path end-to-end.
@@ -86,7 +86,7 @@ The DPO/KTO preference-training implementation follows the loss semantics of **[
 
 ### Project status
 
-Research fork under active development. The core mechanism is proven end-to-end: validated forward parity on the quantized weights, healthy trainings from 1B to 16B models on 1–2× RTX 3090 (including 8k-context packed runs on a 12B), adapters that load and steer generation on the native inference path. Training-side architecture support currently covers **Llama-family, Gemma 3/4, Qwen3-dense, Qwen3.5/3.6 dense hybrids (differentiable Gated DeltaNet + gated attention; box validation pending), and Mistral(-Nemo) dense models** (no MoE yet; no sample packing on Gated DeltaNet models); unsupported features are rejected loudly rather than silently mistrained. Interfaces may still move between sessions — the full engineering log with per-session results and rationale lives in [`doc/qlora_handoff.md`](doc/qlora_handoff.md), and experiment-specific tooling is quarantined in [`examples/experiments/`](examples/experiments/). Some inference-side fixes made here are candidates for upstreaming.
+Research fork under active development. The core mechanism is proven end-to-end: validated forward parity on the quantized weights, healthy trainings from 1B to 16B models on 1–2× RTX 3090 (including 8k-context packed runs on a 12B), adapters that load and steer generation on the native inference path. Training-side architecture support currently covers **Llama-family, Gemma 3/4, Qwen3-dense, Qwen3.5/3.6 dense hybrids (differentiable Gated DeltaNet + gated attention; box validation pending), and Mistral(-Nemo) dense models** (no MoE yet; no sample packing on Gated DeltaNet models); unsupported features are rejected loudly rather than silently mistrained. Interfaces may still move between sessions — the full engineering log with per-session results and rationale lives in [`doc/qlora_handoff.md`](doc/qlora_handoff.md), and experiment-specific tooling is quarantined in [`training/experiments/`](training/experiments/). Some inference-side fixes made here are candidates for upstreaming.
 
 ---
 

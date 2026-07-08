@@ -15,7 +15,7 @@ embedding weight). So this before/after demo reflects a trained head/embed too,
 not just the per-linear LoRA.
 
 Usage:
-    python examples/qlora_infer_native.py \
+    python training/qlora_infer_native.py \
         --model   /path/to/exl3_model \
         --adapter out/exl3_qlora_adapter
 """
@@ -120,7 +120,7 @@ def main():
             for r in dump:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
         print(f"Adapted generations written to {args.gen_out} "
-              f"(score with examples/experiments/score_style_density.py)")
+              f"(score with training/experiments/score_style_density.py)")
 
 
 if __name__ == "__main__":

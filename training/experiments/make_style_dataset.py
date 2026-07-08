@@ -28,14 +28,14 @@ keep --model (the eventual training target) separate in your head.
 
 Usage
 -----
-    python examples/make_style_dataset.py \
+    python training/experiments/make_style_dataset.py \
         --gen-model /mnt/two/Weights/<a-good-instruct-model>/exl3/ \
         --out       /mnt/two/data/yoda_alpaca.jsonl \
         --max-rows  6000
 
     # then train on it (the trainer accepts a local file path directly; the
     # dataset is already styled, so do NOT pass --uppercase-response):
-    python examples/qlora_train_native.py \
+    python training/qlora_train_native.py \
         --model /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/ \
         --out   /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/yoda \
         --dataset /mnt/two/data/yoda_alpaca.jsonl

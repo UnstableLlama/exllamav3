@@ -13,7 +13,7 @@ Requirements (CUDA box with the exllamav3 extension built):
     pip install datasets            # note: NO transformers / accelerate needed
 
 Usage:
-    python examples/qlora_train_native.py \
+    python training/qlora_train_native.py \
         --model /path/to/exl3_model \
         --out   out/exl3_qlora_adapter
 
@@ -30,8 +30,8 @@ columns whose names are configurable via --instruction-key / --context-key /
 --response-key, so swapping in another instruction set (e.g. Dolly-schema
 TeeZee/dolly-15k-pirate-speech via --instruction-key instruction --context-key
 context --response-key response) needs no code change. Validate first with
-examples/qlora_validate_native.py, then check the trained adapter with
-examples/qlora_infer_native.py -- both are also transformers-free.
+training/qlora_validate_native.py, then check the trained adapter with
+training/qlora_infer_native.py -- both are also transformers-free.
 
 The adapter is saved in PEFT format, loadable by exllamav3.model.lora.LoRA
 (and by PEFT).
@@ -698,7 +698,7 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
     from datasets import load_dataset
 
     # Accept either a Hub dataset id or a local file (e.g. a styled set produced
-    # by examples/experiments/make_style_dataset.py). load_dataset() can't sniff a bare local
+    # by training/experiments/make_style_dataset.py). load_dataset() can't sniff a bare local
     # path, so pick the builder from the extension when the path exists.
     if os.path.exists(dataset_name):
         ext = os.path.splitext(dataset_name)[1].lower()
@@ -1015,7 +1015,7 @@ def _run_main():
     if os.environ.get("RANK") is not None or os.environ.get("WORLD_SIZE") is not None:
         raise SystemExit(
             "qlora_train_native.py is single-process (--parallel single|split). "
-            "For multi-GPU DDP under torchrun use examples/qlora_train_native_ddp.py "
+            "For multi-GPU DDP under torchrun use training/qlora_train_native_ddp.py "
             "(note: --lora-r not --r; no --parallel / --sample-every)."
         )
     ap = argparse.ArgumentParser()
@@ -2093,7 +2093,7 @@ def _run_main():
           f"peak VRAM {peak_str} | {dt:.0f}s for {step} steps | "
           f"step time: {timer.summary()}")
     log_run("completed", dt, val_loss, final_eval2)
-    print("Verify with: python examples/qlora_infer_native.py "
+    print("Verify with: python training/qlora_infer_native.py "
           f"--model {args.model} --adapter {args.out}")
 
 

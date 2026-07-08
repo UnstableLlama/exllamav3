@@ -6,13 +6,21 @@
 > model to talk like a pirate).
 
 > **Maintenance note (2026-06):** the superseded HF-Trainer training path
-> (`exllamav3/training/hf_qlora.py`, `examples/qlora_train.py`,
-> `examples/qlora_infer.py`, and `tests/test_qlora_train_loop.py`) has been
-> **removed**. The transformers-free native path (§0/§0b) is the only supported
-> route. Sections §3–§6 below describe the removed code and the abandoned
-> transformers-5.x investigation; they are kept for historical context only.
-> All exllamav3-internal reach-through used by the native forward now lives in
-> the single seam `exllamav3/training/backbone.py`.
+> (`exllamav3/training/hf_qlora.py`, the old HF-Trainer `examples/qlora_train.py`
+> — NOT today's YAML launcher of the same name — `examples/qlora_infer.py`, and
+> `tests/test_qlora_train_loop.py`) has been **removed**. The transformers-free
+> native path (§0/§0b) is the only supported route. Sections §3–§6 below
+> describe the removed code and the abandoned transformers-5.x investigation;
+> they are kept for historical context only. All exllamav3-internal
+> reach-through used by the native forward now lives in the single seam
+> `exllamav3/training/backbone.py`.
+
+> **Maintenance note (2026-07, Session 19):** all training scripts moved out of
+> `examples/` into a top-level `training/` directory (`examples/` is now
+> byte-identical to upstream; experiment tooling is `training/experiments/`).
+> Path references throughout this document were rewritten to the new locations;
+> per-session prose still describes the layout as it was at the time. See
+> `training/README.md` for the current map.
 
 ---
 
@@ -73,7 +81,7 @@
 
 **What was run and confirmed (Llama-3.2-1B-Instruct, EXL3 4bpw, single GPU):**
 
-1. **Forward validated against native.** `examples/qlora_validate_native.py`
+1. **Forward validated against native.** `training/qlora_validate_native.py`
    PASSED: the differentiable forward's logits match exllamav3's own (correct)
    inference forward — top-1 next-token identical on every prompt, **100%
    per-position argmax agreement**, last-token logits `cos ≈ 0.999999`,
@@ -82,14 +90,14 @@
    backbone that produced garbage under transformers 5.x is correct here on the
    same quantized weights.
 
-2. **Training works.** `examples/qlora_train_native.py` (plain PyTorch loop, only
+2. **Training works.** `training/qlora_train_native.py` (plain PyTorch loop, only
    `pip install datasets`) trained adapters on `TeeZee/dolly-15k-pirate-speech`.
    Healthy diagnostics throughout: first loss ~2–3 (NOT ~11 random), grad norm
    20–50 (gradients reaching adapters), `|B|` climbing monotonically 0→13, EMA
    loss falling 2.78→~2.35 then plateauing at the data's irreducible-loss floor.
 
 3. **Adapter saves + reloads natively + steers generation.**
-   `examples/qlora_infer_native.py` loads the PEFT adapter via the native
+   `training/qlora_infer_native.py` loads the PEFT adapter via the native
    `LoRA.from_directory` loader (224 tensors = 32 layers × 7 targets) and the
    output measurably changes vs base. Cranking `--lora-scaling` proved the
    learned direction is exactly the dataset's pirate transform: at ~5× effective
@@ -137,11 +145,11 @@ This is now the recommended path.
     adapter mid-train). Unsupported features (q/k-norm, sliding window,
     softcapping, MoE, gating, partial/mRoPE, non-NeoX) are rejected loudly.
   - `DiffLinear` — differentiable frozen-base + optional-LoRA linear.
-- `examples/qlora_validate_native.py` — **the correctness gate.** Compares the
+- `training/qlora_validate_native.py` — **the correctness gate.** Compares the
   differentiable forward's logits against the native (correct) forward,
   per-prompt: top-1 token agreement, per-position argmax agreement, last-token
   `max|Δ|` / cosine. Run this FIRST.
-- `examples/qlora_train_native.py` — plain PyTorch training loop (no HF Trainer /
+- `training/qlora_train_native.py` — plain PyTorch training loop (no HF Trainer /
   transformers / accelerate; just `pip install datasets`). Pirate SFT,
   completion-only masking via the native Llama-3 chat template, fused-CE,
   gradient checkpointing, live native samples.
@@ -153,17 +161,17 @@ This is now the recommended path.
 **Workflow (on the GPU box, any transformers version or none):**
 ```
 # 1. PROVE the forward is correct (no training):
-python examples/qlora_validate_native.py --model /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/
+python training/qlora_validate_native.py --model /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/
 #    Expect: PASS, "The capital of France is" -> ' Paris', high argmax agreement.
 
 # 2. TRAIN (transformers-free):
-python examples/qlora_train_native.py \
+python training/qlora_train_native.py \
     --model /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/ \
     --out   /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/pirate2
 #    Expect: first loss ~2-4 and dropping; live samples turn piratey.
 
 # 3. VERIFY on the native inference path (already worked before):
-python examples/qlora_infer_native.py \
+python training/qlora_infer_native.py \
     --model /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/ \
     --adapter /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/pirate2
 ```
@@ -222,7 +230,7 @@ small model.
 
 ### Tooling added this session (on the branch / merged to master)
 
-`examples/qlora_train_native.py` (+ DDP variant):
+`training/qlora_train_native.py` (+ DDP variant):
 - **Dataset-agnostic loader** — `--instruction-key/--context-key/--response-key`,
   `--dataset-split`. Defaults are Alpaca (`instruction`/`input`/`output`, dataset
   `superdrew100/UwU_Alpaca_data`). Pirate (Dolly schema):
@@ -238,12 +246,12 @@ small model.
   (inverse of `save_adapter`). NOTE optimizer state is NOT restored (cold AdamW
   re-warmup; harmless for LoRA); `--r`/`--targets` must match the checkpoint.
 
-`examples/qlora_infer_native.py`:
+`training/qlora_infer_native.py`:
 - **Sampling controls** — `--temperature/--min-p/--top-p/--top-k/--seed`. Library
   default is temp 0.8 + min_p 0.08, which truncates the low-prob tail and hides
   sparse-marker styles; `--temperature 0` = greedy. `--lora-scaling` unchanged.
 
-`examples/qlora_train_native_ddp.py` (NEW): multi-GPU via DDP (see §0d).
+`training/qlora_train_native_ddp.py` (NEW): multi-GPU via DDP (see §0d).
 
 ### Multi-GPU (DDP) — confirmed working on hardware (2× RTX 3090)
 
@@ -253,7 +261,7 @@ matter** — only the tiny LoRA grads are all-reduced, so the slow lane isn't a
 bottleneck. That's exactly why DDP (not FSDP) fits QLoRA-on-EXL3.
 
 ```
-torchrun --standalone --nproc_per_node=2 examples/qlora_train_native_ddp.py \
+torchrun --standalone --nproc_per_node=2 training/qlora_train_native_ddp.py \
     --model /mnt/two/Weights/<model>/4/ --out /mnt/two/Weights/<model>/4/run \
     --dataset ... --lora-r 128 --alpha 128 --batch 16 --steps 600 --save-every 100
 ```
@@ -319,7 +327,7 @@ Picked **Yoda-speak** as the dense style (syntactic clause inversion over COMMON
 tokens — unlike pirate/UwU). Off-the-shelf search was dry (only `dvgodoy/
 yoda_sentences`, 720 translation pairs), so we **generate**.
 
-- `examples/make_style_dataset.py` — rewrites ONLY the response of a normal
+- `training/experiments/make_style_dataset.py` — rewrites ONLY the response of a normal
   instruction set (default `yahma/alpaca-cleaned`) into a target style via a LOCAL
   exllamav3 model; Alpaca-schema JSONL. Styles: `yoda`/`archaic`/`pirate`/
   `corporate`; `--refine-from` does a stricter second pass over an existing set.
@@ -327,7 +335,7 @@ yoda_sentences`, 720 translation pairs), so we **generate**.
   16B-v1` 4bpw). Gotchas fixed live: create out-dir up front; stop at EOT (RP
   finetunes role-play a whole convo past the answer); drop `min_new_tokens` (it
   triggered a sampler cuda/cpu mask bug); reject prompt-echo/refusal rows.
-- `examples/score_style_density.py` — Yoda-ness metric = clause-final inversion
+- `training/experiments/score_style_density.py` — Yoda-ness metric = clause-final inversion
   rate (sentences ending in aux/pronoun/contraction, plus a front-loaded
   "displaced subject" signal). **Known blind spot: noun-subject fronting ("Ended
   the war did") and main-verb endings — needs POS to catch — so the score is a
@@ -353,7 +361,7 @@ Goal: same model / data / LoRA / optimizer, only the frozen-weight format differ
 Axolotl** (it can't train EXL3 at all; mixing frameworks confounds; its dep tree
 threatens the pinned torch/EXL3 `.so`). Instead a minimal matched loop:
 
-- `examples/qlora_train_bnb.py` (NEW) — transformers 4-bit NF4 + PEFT LoRA in a
+- `training/qlora_train_bnb.py` (NEW) — transformers 4-bit NF4 + PEFT LoRA in a
   hand loop mirroring `qlora_train_native.py` byte-for-byte (same Llama-3 chat
   prompt, completion-only masking, `datasets` shuffle(seed=0)+select, val split,
   LoRA targets/r/alpha, AdamW/lr/clip, bf16). Optional DDP (manual LoRA-grad
@@ -432,7 +440,7 @@ ratio at inference**; the adapter was good all along (loss + bf16 gens prove it)
 > no system prompts). All code changes; the runs happen on the GPU box (2×3090).
 > Everything below is **run-confirmed** unless noted.
 
-**At a glance — what's new this session (all in `examples/qlora_train_native.py` +
+**At a glance — what's new this session (all in `training/qlora_train_native.py` +
 the DDP variant; the BNB arm mirrors everything except `--prompt-format`,
 `--inspect`, and `--train-embeddings/--train-head`):**
 
@@ -513,14 +521,14 @@ normalization) pass; the rest needs the GPU box (no torch/CUDA in the container)
 ~10% warmup, wd 0.01, eff-batch 16, completions-only, all linear targets, 2 epochs):**
 ```
 # 0. Verify tokenization first (single-GPU, exits after printing):
-python examples/qlora_train_native.py --model /path/to/exl3_model \
+python training/qlora_train_native.py --model /path/to/exl3_model \
     --dataset UnstableLlama/semancy --messages-key messages \
     --no-clean-text --seq-len 2048 --inspect 3
 #    Confirm: PROMPT is the user turn, RESPONSE is the assistant turn, and
 #    "ends with turn-end token? True" (else raise --seq-len).
 
 # 1. Train (2× GPU DDP; --batch 8 × 2 GPUs = eff-batch 16):
-torchrun --standalone --nproc_per_node=2 examples/qlora_train_native_ddp.py \
+torchrun --standalone --nproc_per_node=2 training/qlora_train_native_ddp.py \
     --model /path/to/exl3_model --out /path/to/out/semancy \
     --dataset UnstableLlama/semancy --messages-key messages --no-clean-text \
     --eval-split test --eval-every 10 --save-best \
@@ -538,7 +546,7 @@ torchrun --standalone --nproc_per_node=2 examples/qlora_train_native_ddp.py \
   base at inference. Evaluate on bf16 (or merge-and-requantize) for a fair read;
   the held-out `test` loss is the format-independent signal.
 
-**BNB-NF4 arm matched too.** `examples/qlora_train_bnb.py` got the same flags
+**BNB-NF4 arm matched too.** `training/qlora_train_bnb.py` got the same flags
 (`--messages-key`, `--scheduler`/`--warmup-ratio`/`--warmup-steps`,
 `--weight-decay`, `--epochs`, `--eval-split`/`--eval-dataset`) with the helpers
 *inlined* (it runs in the separate transformers+bitsandbytes+peft venv and can't
@@ -548,7 +556,7 @@ EXL3-vs-NF4 comparison on semancy just needs the same flags on both:
 # EXL3-4bpw arm: the DDP command above.
 # BNB-NF4 arm (point --model at the bf16 HF weights; same eff-batch via --batch):
 ~/exl3/bnb-venv/bin/torchrun --standalone --nproc_per_node=2 \
-    examples/qlora_train_bnb.py --model /path/to/Llama-bf16 --out /path/to/out/semancy_bnb \
+    training/qlora_train_bnb.py --model /path/to/Llama-bf16 --out /path/to/out/semancy_bnb \
     --dataset UnstableLlama/semancy --messages-key messages --no-clean-text \
     --eval-split test --eval-every 10 --save-best \
     --lora-r 16 --alpha 32 --lr 1e-4 --scheduler cosine --warmup-ratio 0.1 \
@@ -637,7 +645,7 @@ red herring; check for the side files instead):
 - `modules_to_save.safetensors` — fully fine-tuned head/embed (HF orientation
   `[vocab,hidden]`).
 
-`LoRA.from_directory` (used by `examples/qlora_infer_native.py`) now **consumes
+`LoRA.from_directory` (used by `training/qlora_infer_native.py`) now **consumes
 both files automatically** so a head/embed adapter actually fires at inference
 (previously they were saved but silently dropped — only the per-linear LoRA in
 `adapter_model.safetensors` was applied). How each is wired:
@@ -782,9 +790,9 @@ irrelevant to training).
 # CPU first (torch only): the differentiable block vs an independent reference.
 python tests/test_native_llama.py
 # Then on the box: logits parity vs exllamav3's own forward on a real Gemma4 dense:
-python examples/qlora_validate_native.py --model /path/to/Gemma4-dense-exl3
+python training/qlora_validate_native.py --model /path/to/Gemma4-dense-exl3
 #   Expect high per-position argmax agreement + tiny last-token max|Δ|.
-# Only then: python examples/qlora_train_native.py --model ... --sample-every 0 ...
+# Only then: python training/qlora_train_native.py --model ... --sample-every 0 ...
 ```
 Open: q/k-norm is folded into exllamav3's RoPE kernel in the native path (we apply
 norm-then-RoPE, mathematically equal) — the validate gate is what confirms it on
@@ -1310,7 +1318,7 @@ embed/head matrices never sits on the GPU — only the bf16 param + transient gr
   `lr=`/composes with the `partial`-bound `bf16_stochastic_round` exactly as assumed,
   and whether it composes with `--parallel split` (params on cuda:0/cuda:1). Smoke:
   ```
-  python examples/qlora_train_native.py --model <exl3> --dataset <small> \
+  python training/qlora_train_native.py --model <exl3> --dataset <small> \
       --train-head --train-embeddings --offload-embed-head-optim \
       --steps 5 --batch 1 --checkpoint-every 3   # then --resume to confirm round-trip
   #  Expect: loss descends, |B| climbs, embed/head Adam state on CPU (nvidia-smi: the
@@ -1736,7 +1744,7 @@ mode was ~14 orders of magnitude out). Skips with a message under fp32 (the
 liger path is inactive there). Container-verified: compile + the metric
 thresholds against synthetic noise/blowup/sign-flip cases. Box gate:
 ```
-python examples/qlora_validate_native.py --model $GEMMA4 \
+python training/qlora_validate_native.py --model $GEMMA4 \
     --compute-dtype bfloat16 --use-liger --parallel split
 ```
 Only after this prints `liger parity: PASS` is `--use-liger` trustworthy for
@@ -2079,7 +2087,7 @@ malamus, r=128, α=128, 1 epoch = 17 steps, bf16, 2-GPU split, liger):**
    run.
 
 **Repo tidy (toward a PR-able boundary):** experiment-specific tooling moved
-to `examples/experiments/` (`make_style_dataset.py`, `score_style_density.py`,
+to `training/experiments/` (`make_style_dataset.py`, `score_style_density.py`,
 `train_rocinante_yoda.sh`, + a README defining the product-vs-experiment
 boundary). Live path references updated; historical session records above
 keep the old paths. Inventory vs the upstream fork point (v0.0.43,
@@ -2162,7 +2170,7 @@ trainer notes it).
   `NativeLlamaQLoRA.adapters_disabled()` (reentrant, exception-safe),
   `compute_logps()` (frozen-head only; per-ROW sums, so **no packing** — a
   packed block would sum across documents).
-- `examples/qlora_train_pref.py` — the preference trainer, `--method
+- `training/qlora_train_pref.py` — the preference trainer, `--method
   {dpo,kto}`. DPO data = TRL explicit-prompt format
   (`--prompt-key/--chosen-key/--rejected-key`; conversational message-list
   values accepted); KTO = `--prompt-key/--completion-key/--label-key` +
@@ -2714,7 +2722,7 @@ CUDA_VISIBLE_DEVICES=0 python examples/qlora_train.py \
 Expect first loss ~2–4 and dropping. Then verify the adapter on the **native**
 path (transformers-independent, always works):
 ```
-CUDA_VISIBLE_DEVICES=0 python examples/qlora_infer_native.py \
+CUDA_VISIBLE_DEVICES=0 python training/qlora_infer_native.py \
   --model /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/ \
   --adapter /mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/pirate2
 ```

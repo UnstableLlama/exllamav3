@@ -8,8 +8,8 @@ DDP, run this script directly (not under torchrun): it will launch torchrun usin
 the ``ddp`` section in the config.
 
 Usage:
-    python examples/qlora_train.py --config examples/qlora_train_config.yaml
-    python examples/qlora_train.py --config config.yaml --dry-run
+    python training/qlora_train.py --config training/qlora_train_config.yaml
+    python training/qlora_train.py --config config.yaml --dry-run
 """
 
 from __future__ import annotations
@@ -22,9 +22,9 @@ from pathlib import Path
 from typing import Any
 
 
-ROOT = Path(__file__).resolve().parents[1]
-SINGLE_BACKEND = ROOT / "examples" / "qlora_train_native.py"
-DDP_BACKEND = ROOT / "examples" / "qlora_train_native_ddp.py"
+SCRIPT_DIR = Path(__file__).resolve().parent
+SINGLE_BACKEND = SCRIPT_DIR / "qlora_train_native.py"
+DDP_BACKEND = SCRIPT_DIR / "qlora_train_native_ddp.py"
 
 
 # Config keys that are launcher-only and must not be forwarded to backend scripts.

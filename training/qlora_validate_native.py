@@ -13,11 +13,11 @@ version -- it reuses exllamav3's loaded weights and RoPE table directly.
 
 Usage:
     # single device
-    python examples/qlora_validate_native.py --model /path/to/exl3_model
+    python training/qlora_validate_native.py --model /path/to/exl3_model
 
     # layer-autosplit across all visible GPUs (smoke-test the device-aware
     # forward); --check-backward also exercises cross-device gradient flow
-    python examples/qlora_validate_native.py --model /path/to/exl3_model \
+    python training/qlora_validate_native.py --model /path/to/exl3_model \
         --parallel split --check-backward
 
 On a small model that fits one card, force a real split boundary by capping the
