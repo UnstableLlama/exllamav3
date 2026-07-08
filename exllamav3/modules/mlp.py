@@ -6,6 +6,7 @@ from torch import nn
 from ..model.config import Config
 from ..util.tensor import to2
 from . import Module, Linear
+from .linear import has_runtime_lora
 from ..ext import exllamav3_ext as ext
 from ..constants import MAX_MLP_INTERMEDIATE
 from ..model.model_tp_alloc import TPAllocation
@@ -629,9 +630,16 @@ class GatedMLP(Module):
             r = [qs] if qs is not None else range(0, self.num_slices)
             d = None
 
+            # The fused paths below bypass Linear.forward, which is what applies
+            # a runtime LoRA -- fall back to the per-linear path while one is
+            # loaded. Checked across ALL slices so every slice takes the same
+            # branch (mixed branches would disagree on the working shape of x).
+            gu_lora = has_runtime_lora(*self.gates, *self.ups)
+            down_lora = has_runtime_lora(*self.downs)
+
             for s in r:
 
-                if self.multi_gu[s] is None or bsz * q_len > 32:
+                if self.multi_gu[s] is None or bsz * q_len > 32 or gu_lora:
                     g = self.gates[s].forward(x, params)
                     u = self.ups[s].forward(x, params)
                     a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
@@ -642,7 +650,7 @@ class GatedMLP(Module):
                     else: d += d_
                     del d_
 
-                elif self.bc is not None and bsz == 1 and q_len == 1:
+                elif self.bc is not None and bsz == 1 and q_len == 1 and not down_lora:
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
                     x = x.view(1, bsz * q_len, dim)
                     self.bc.run_bsz1(x, d.view(x.shape))

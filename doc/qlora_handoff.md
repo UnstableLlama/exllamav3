@@ -45,7 +45,10 @@
    quants, then first training runs — see the Session 18 / 20 / 21 box
    lists. Still not covered: Qwen3-Next (fused qkvz layout), sample packing
    on GDN models (rejected loudly; train unpacked — plain Qwen3-MoE and
-   Gemma4 MoE pack fine).
+   Gemma4 MoE pack fine). Also open (Session 22): runtime LoRA is NOT
+   applied on the fused MoE expert path at inference (the loader now warns);
+   an expert-adapter inference demo needs a per-expert fallback or a
+   post-mgemm LoRA add — merge-path deployment unaffected.
 1. **Quantization-aware LoRA — BUILT (Session 17), box A/B pending.**
    `--quant-aware {noise,ste}` implements the two tractable directions from
    the original item (noise injection on the frozen-weight closure, and a
@@ -54,6 +57,11 @@
    in the Session 17 notes). What remains is the box work: the same-seed
    A/B/A2 (off vs noise vs ste) with the eval split ON, judged on held-out
    loss after a real merge-and-requantize — see the Session 17 box list.
+   **PREREQUISITE (Session 22): verify the fused-decode runtime-LoRA fix
+   first** — generation-based judgments of any adapter on an EXL3 base were
+   invalid before it (the Session-3 "attenuated LoRA on quant" evidence that
+   partly motivated this item was an inference artifact; the first noise-mode
+   box test looked like a no-op because of it).
 2. **Near-inference-time training pipeline on KTO/DPO** (the reason Session 16
    built preference training): a workflow where preference signal collected at
    serving time feeds short adapter updates against the exact deployed quant.
@@ -2702,6 +2710,103 @@ always-active dense path.
    (`.*\.experts\.\d+\..*`).
 4. **A real SFT + eval-split run** per the standing eval-prereq rules;
    A/B attention+shared vs +experts on held-out loss.
+
+### Session 22 — inference bug: fused decode kernels silently dropped runtime LoRA (fix + reframe)
+
+> Branch `claude/qlora-bitrate-update-floor-2yb7q0`. Found while investigating
+> a box report: a `--quant-aware noise` adapter on a 4 bpw base trained fine
+> (loss descended) but "applying the lora to the quant did not noticeably
+> modify its behavior". Root cause is NOT the noise mode — it is an
+> inference-side bug that affects EVERY runtime-applied adapter on an EXL3
+> base. Container-verified (new tripwire tests + py_compile; this container
+> has no torch/GPU); **the before/after and perf checks are box work.**
+
+**The bug.** `Linear.forward` is the only place a runtime LoRA
+(`model/lora.py`, `lora_a_tensors`/`lora_b_tensors`) is applied — and the
+fused decode paths bypass it, reading trellis storage directly:
+
+- `attn.py` `project_qkv`: when `bsz*q_len <= 32`, k/v go through the fused
+  `multi_kv` `exl3_mgemm` (built at load for any EXL3 k/v pair with matching
+  shape/K and no bias — i.e. every Llama-family quant), and q (+gate) through
+  `multi_qg` on gated-attention models. **k/v LoRA never ran at decode; q
+  LoRA also dropped on gated-attn models.** o_proj was unaffected.
+- `sliding_attn.py` `project_qkv`: same two branches (Gemma).
+- `mlp.py` `GatedMLP.forward`: gate/up via `multi_gu` mgemm at
+  `bsz*q_len <= 32` (**gate/up LoRA dropped**; down survived), and on
+  single-slice models the fully-fused `BC_GatedMLP` bsz-1 graph computes the
+  whole MLP (**gate/up AND down dropped**). Plain `MLP` (non-gated) was
+  always per-linear — unaffected.
+- `block_sparse_mlp.py` (MoE routed experts): the quantized dispatch is
+  mgemm/BC at essentially all batch sizes; the per-linear torch path only
+  runs unquantized. **Routed-expert LoRA is effectively never applied at
+  inference.** (Shared experts are a `GatedMLP` — covered by the fix.)
+
+Net effect on a q,k,v,o,gate,up,down adapter on a quantized Llama: decode ran
+only the q + o (sometimes down) components. Worse, the `> 32` threshold is on
+*total tokens in the forward*, so the short demo prompts in
+`qlora_infer_native.py` (~20–25 tokens with template) took the fused path even
+at prefill. The failure is silent: the adapter loads, prints its tensor count,
+generation stays coherent — it's just (mostly) the base model. Training-side
+forwards (`DiffLinear` closures) and any >32-token batched eval apply the full
+adapter, which is why train/eval looked healthy while generations didn't move.
+
+**Reframe of earlier findings (important):** on a bf16 base
+`quant_type != "exl3"`, no `MultiLinear` is ever built, and every projection
+takes the LoRA-aware path. So Session 3's arc-C finding — "only the bf16 base
+produced strong steering; the 4bpw base didn't" — is exactly this bug's
+signature and is confounded, along with any conclusion built on it (the
+"attenuated LoRA on quant" reading that motivated parts of the quant-aware
+arc). The merge-and-requantize concern remains real in theory, but the
+*measured* attenuation evidence must be re-taken after this fix. Yesterday's
+noise-mode test is unjudgeable; the Session 17 A/B/A2 needs the fixed
+inference path.
+
+**The fix.** `has_runtime_lora(*linears)` (`modules/linear.py`) + fall back to
+the per-linear path when any involved Linear carries LoRA tensors:
+
+- `attn.py`/`sliding_attn.py`: both fused branches guard on
+  `has_runtime_lora(q,g)` / `has_runtime_lora(k,v)`.
+- `mlp.py` `GatedMLP.forward`: `gu_lora`/`down_lora` computed ONCE across all
+  slices (uniform branch choice — mixed branches disagree on the working
+  shape of `x`); the `multi_gu` branch guards on `gu_lora`, the BC bsz-1
+  branch additionally yields to the mgemm branch (which calls
+  `downs[s].forward`) on `down_lora`.
+- MoE routed experts: NOT fixed (a per-expert fallback or post-mgemm LoRA add
+  is a bigger change); `LoRA.__init__` now prints a loud warning when target
+  modules match `\.experts\.\d+\.` so an expert adapter can't be silently
+  judged a no-op. Merge-path deployment is unaffected.
+
+**Cost:** zero when no adapter is loaded (an empty-dict truthiness check per
+forward; the fused kernels run exactly as before — the off path is
+behaviorally identical). While an adapter IS loaded, decode takes the same
+per-linear path prefill already uses (2 kernel launches instead of 1 fused
+mgemm per pair, no BC graph) plus the two small LoRA GEMVs per adapted
+projection that correctness requires anyway. Expect a modest decode tok/s hit
+only while adapted — worst on small models where launch overhead dominates;
+`unload()` restores full fused speed. If the hit matters later, the follow-up
+is adding the LoRA contribution on top of the fused kernels instead of
+falling back (keeps mgemm; BC stays disabled under LoRA since gate/up inject
+before the activation).
+
+**Tests** (`tests/test_lora_fused_path.py`; pass in-container): dependency-
+free source tripwires on every guard (the failure mode is silent, so a
+refactor dropping a guard must fail loudly) + torch-gated semantics of
+`has_runtime_lora`. The end-to-end check needs the box.
+
+**Box list for next session (in order):**
+1. **The payoff check (no retraining):** re-run `qlora_infer_native.py` with
+   yesterday's noise-mode adapter, before vs after pulling this fix — if the
+   diagnosis is right, the style appears from the previously "dead" adapter.
+   Also re-try any older 4bpw adapter that under-steered.
+2. **Perf sanity:** decode tok/s with vs without the adapter loaded (expect a
+   modest hit only while loaded), and confirm no change at all with no
+   adapter.
+3. **Then re-run the Session 17 A/B/A2** (none vs noise vs ste) — both the
+   as-trained steering judgment and the merge-and-requantize judgment are
+   clean now.
+4. **Re-examine Session 3 arc C** (bf16 vs 4bpw steering gap) with the fixed
+   path before trusting any remaining "attenuation at 4bpw" claims — the gap
+   should shrink; whatever remains is the real quant effect.
 
 ---
 
