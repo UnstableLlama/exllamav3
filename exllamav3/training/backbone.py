@@ -54,6 +54,62 @@ def is_gated_delta_net(attn) -> bool:
     return isinstance(attn, GatedDeltaNet)
 
 
+def is_block_sparse_mlp(mlp) -> bool:
+    """True when a block's ``mlp`` slot holds a ``BlockSparseMLP`` (mixture of
+    experts -- Qwen3-MoE, Qwen3.5-MoE, Mixtral, ...) rather than a dense
+    ``GatedMLP``."""
+    from ..modules import BlockSparseMLP
+    return isinstance(mlp, BlockSparseMLP)
+
+
+def _assert_moe_supported(key: str, mlp) -> None:
+    """
+    The differentiable MoE forward covers the "std" softmax router
+    (top-k over the router logits, softmax over the selected k -- identical
+    to HF's softmax-all + renormalize with ``norm_topk_prob=True``, which the
+    Qwen3/3.5-MoE configs assert) with optional per-expert scale, plus the
+    optional shared expert behind a sigmoid shared gate (Qwen3.5-MoE).
+    Everything else -- sigmoid/grouped routers (ds3/dots), expert-parallel
+    TP splits, the Gemma4-style extra norms and residual-channel switch --
+    is rejected loudly here.
+    """
+    from ..modules import GatedMLP
+    assert mlp.router_type == "std", \
+        f"{key}: only the 'std' softmax top-k router is supported, got " \
+        f"router_type {mlp.router_type!r} (ds3/dots MoE routing not wired up)"
+    assert mlp.routing_gate is not None, f"{key}: MoE block has no routing gate"
+    assert mlp.num_local_experts == mlp.num_experts, \
+        f"{key}: expert/tensor-parallel MoE split ({mlp.num_local_experts} of " \
+        f"{mlp.num_experts} experts local) is not supported for training"
+    assert len(mlp.gates) == len(mlp.ups) == len(mlp.downs) == mlp.num_experts, \
+        f"{key}: expected one gate/up/down linear per expert"
+    assert not mlp.alt_residual_channel, \
+        f"{key}: alt_residual_channel MoE (Gemma4 layout) is not supported"
+    assert mlp.router_pre_norm is None and mlp.routed_pre_norm is None \
+        and mlp.routed_post_norm is None and mlp.shared_experts_post_norm is None, \
+        f"{key}: MoE with extra router/routed/shared norms is not supported"
+    assert mlp.routed_scaling_factor in (None, 1.0), \
+        f"{key}: routed_scaling_factor is a ds3-router feature, unsupported here"
+    assert mlp.n_group is None and mlp.topk_group is None, \
+        f"{key}: grouped expert routing (n_group/topk_group) is not supported"
+    # e_score_correction_bias is a ds3/dots-router input; the std routing path
+    # ignores it, so a loaded one would silently change nothing -- reject.
+    assert mlp.e_score_correction_bias is None, \
+        f"{key}: e_score_correction_bias is not consumed by the std router"
+    if mlp.shared_experts is not None:
+        assert isinstance(mlp.shared_experts, GatedMLP), \
+            f"{key}: only a GatedMLP shared expert is supported, got " \
+            f"{type(mlp.shared_experts).__name__}"
+        assert mlp.shared_experts.activation_fn in ("silu", "gelu"), \
+            f"{key}: unsupported shared-expert activation " \
+            f"{mlp.shared_experts.activation_fn!r}"
+        assert getattr(mlp.shared_experts, "act_limit", 0.0) in (0.0, None), \
+            f"{key}: shared-expert act_limit is not supported"
+    if mlp.shared_gate is not None:
+        assert mlp.shared_experts is not None, \
+            f"{key}: shared gate without shared experts"
+
+
 def assert_block_supported(block):
     """
     Reject architectures the native forward can't faithfully reproduce, loudly,
@@ -63,11 +119,14 @@ def assert_block_supported(block):
     norm / activation / scale from the loaded modules, so it covers
     Llama/Mistral/Qwen2 (plain), Qwen3 (q/k-norm), Gemma3/4 (q/k/v-norm +
     sandwich post-norms + GeGLU + sliding/full window + per-layer head dims),
-    and the Qwen3.5/3.6 hybrid layers: GatedDeltaNet (linear/recurrent
+    the Qwen3.5/3.6 hybrid layers: GatedDeltaNet (linear/recurrent
     attention, split in_proj_qkv/z/b/a projection layout) and gated softmax
-    attention (interleaved output gate). What it still cannot do is rejected
-    here: fused-qkvz GatedDeltaNet (the Qwen3-Next layout), MoE, headwise
-    attention gating (g_proj), mRoPE, partial rotary, and non-NeoX RoPE.
+    attention (interleaved output gate), and BlockSparseMLP mixtures of
+    experts with the "std" softmax top-k router incl. the optional shared
+    expert + sigmoid shared gate (Qwen3-MoE, Qwen3.5-MoE). What it still
+    cannot do is rejected here: fused-qkvz GatedDeltaNet (the Qwen3-Next
+    layout), ds3/dots-router MoE, headwise attention gating (g_proj), mRoPE,
+    partial rotary, and non-NeoX RoPE.
     """
     from ..modules import GatedMLP, Attention, SlidingAttention
     key = getattr(block, "key", "?")
@@ -75,8 +134,11 @@ def assert_block_supported(block):
     mlp = getattr(block, "mlp", None)
     assert attn is not None and mlp is not None, \
         f"{key}: block must have both attention and MLP (parallel/no-op blocks unsupported)"
-    assert isinstance(mlp, GatedMLP), \
-        f"{key}: only GatedMLP is supported (no MoE), got {type(mlp).__name__}"
+    if is_block_sparse_mlp(mlp):
+        _assert_moe_supported(key, mlp)
+    else:
+        assert isinstance(mlp, GatedMLP), \
+            f"{key}: only GatedMLP or BlockSparseMLP is supported, got {type(mlp).__name__}"
     assert mlp.activation_fn in ("silu", "gelu"), \
         f"{key}: only SiLU/GeLU gated MLP is supported, got activation {mlp.activation_fn!r}"
     assert getattr(mlp, "act_limit", 0.0) in (0.0, None), \
@@ -117,13 +179,42 @@ def assert_block_supported(block):
         f"{key}: partial-rotary RoPE is not supported (rotary_dim != head_dim)"
 
 
+def _mlp_metadata(block) -> dict:
+    """
+    The MLP half of a block's metadata, shared by the ``attn`` and ``gdn``
+    block kinds. ``mlp_kind`` is ``"dense"`` (GatedMLP) or ``"moe"``
+    (BlockSparseMLP); the MoE keys describe the std softmax top-k router.
+    """
+    mlp = block.mlp
+    meta = {
+        # gated-MLP activation ("silu" or "gelu"/GeGLU) -- routed experts and
+        # dense MLP alike; the shared expert's own activation is read below.
+        "activation": mlp.activation_fn,
+    }
+    if not is_block_sparse_mlp(mlp):
+        meta["mlp_kind"] = "dense"
+        return meta
+    meta.update({
+        "mlp_kind": "moe",
+        "num_experts": mlp.num_experts,
+        "num_experts_per_tok": mlp.num_experts_per_tok,
+        # Post-softmax per-expert scale (bf16 tensor or None); multiplied onto
+        # the selected routing weights exactly as routing_std does.
+        "per_expert_scale": mlp.per_expert_scale,
+        "shared_activation": (mlp.shared_experts.activation_fn
+                              if mlp.shared_experts is not None else None),
+    })
+    return meta
+
+
 def block_metadata(block) -> dict:
     """
     Plain-data description of one decoder block's attention / RoPE / norm config,
     consumed by the differentiable block forward. Tensors are referenced, not
     copied (``inv_freq`` is the loaded RoPE table itself). ``kind`` is
     ``"attn"`` (softmax attention) or ``"gdn"`` (GatedDeltaNet); the two kinds
-    carry different keys.
+    carry different keys. ``mlp_kind`` is ``"dense"`` or ``"moe"`` (see
+    ``_mlp_metadata``).
     """
     attn = block.attn
     if is_gated_delta_net(attn):
@@ -148,8 +239,8 @@ def block_metadata(block) -> dict:
             "dt_bias": attn.dt_bias,             # [nv]
             "conv1d_weight": w,                  # [2*k_dim + v_dim, kernel]
             "conv1d_bias": attn.conv1d_bias,     # [2*k_dim + v_dim] or None
-            # gated-MLP activation for the block's MLP half.
-            "activation": block.mlp.activation_fn,
+            # MLP half (activation + dense/moe description).
+            **_mlp_metadata(block),
             "layer_scalar": getattr(block, "layer_scalar_f", None),
         }
     sw = getattr(attn, "sliding_window", -1)
@@ -167,8 +258,8 @@ def block_metadata(block) -> dict:
         "sliding_window": int(sw) if sw not in (None, 0) else -1,
         # tanh logit softcapping on the attention scores (Gemma2; 0 = none).
         "softcap": float(getattr(attn, "logit_softcapping", 0.0) or 0.0),
-        # gated-MLP activation ("silu" or "gelu"/GeGLU for Gemma).
-        "activation": block.mlp.activation_fn,
+        # MLP half (activation + dense/moe description).
+        **_mlp_metadata(block),
         # Some Gemma layers reuse the K projection as V (no separate v_proj).
         "use_k_as_v": bool(getattr(attn, "use_k_as_v", False)),
         # Qwen3.5 full-attention layers: q_proj emits [q | gate] interleaved
@@ -289,9 +380,43 @@ def mlp_projections(block):
     """
     Return ``(gates, ups, downs)`` linear lists of one block's gated MLP. Each is
     a list because a very wide MLP may be sliced across the intermediate dim.
+    For a BlockSparseMLP block use the ``moe_*`` accessors below instead (there
+    the lists are per-EXPERT, not intermediate-dim slices).
     """
     m = block.mlp
     return m.gates, m.ups, m.downs
+
+
+def moe_expert_projections(block):
+    """Return the per-expert ``(gates, ups, downs)`` linear lists of a
+    BlockSparseMLP block -- one entry per routed expert, index == expert id."""
+    m = block.mlp
+    return m.gates, m.ups, m.downs
+
+
+def moe_shared_projections(block):
+    """Return the shared expert's ``(gates, ups, downs)`` slice lists of a
+    BlockSparseMLP block (same shape as ``mlp_projections``), or ``None`` when
+    the architecture has no shared expert (Qwen3-MoE)."""
+    sh = block.mlp.shared_experts
+    if sh is None:
+        return None
+    return sh.gates, sh.ups, sh.downs
+
+
+def moe_router_linear(block):
+    """The router gate ``Linear`` (``[hidden, num_experts]``, fp16) of a
+    BlockSparseMLP block. Kept frozen by the training forward: adapting the
+    router under a top-k discontinuity destabilizes expert selection, and no
+    mainstream MoE-LoRA recipe trains it."""
+    return block.mlp.routing_gate
+
+
+def moe_shared_gate_linear(block):
+    """The sigmoid shared-expert gate ``Linear`` (``[hidden, 1]``) of a
+    BlockSparseMLP block (Qwen3.5-MoE), or ``None``. The inference kernel adds
+    ``shared_out * sigmoid(shared_gate(x))`` to the routed output."""
+    return block.mlp.shared_gate
 
 
 def rms_norm_eps(norm) -> float:

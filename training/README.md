@@ -41,6 +41,18 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
   style metrics, run scripts); kept for reproducibility, not part of the
   reusable path. See its README.
 
+## MoE models (Qwen3-MoE, Qwen3.5-MoE)
+
+Supported with the std softmax top-k router (incl. Qwen3.5-MoE's shared
+expert + sigmoid shared gate). Plain `gate_proj`/`up_proj`/`down_proj`
+targets adapt the dense / shared-expert paths only; opt in to the routed
+experts with `--targets ... expert_gate_proj expert_up_proj expert_down_proj`
+(consider a small `--expert-r` — it's one adapter pair per expert per layer).
+The router is always frozen and no aux load-balancing loss is added. Caveat:
+routed-expert adapters do not show up in native generation (the fused MoE
+inference kernels bypass the runtime LoRA slots) — deploy them by
+merge-and-requantize. See the Session 20 notes in `doc/qlora_handoff.md`.
+
 ## Docs
 
 - `doc/qlora_handoff.md` — the full engineering log (per-session results,

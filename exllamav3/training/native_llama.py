@@ -29,16 +29,27 @@ Scope: pre-norm decoders. Every norm / activation / scale is read from the
 loaded modules (see ``backbone.norm_spec``), so one block forward covers
 Llama/Mistral/Qwen2 (plain), Qwen3 (q/k-norm), Gemma3/4 (q/k/v-norm + sandwich
 post-norms + GeGLU + alternating sliding/full window + per-layer head dims +
-logit softcapping), and the Qwen3.5/3.6 hybrid: GatedDeltaNet layers (a
+logit softcapping), the Qwen3.5/3.6 hybrid: GatedDeltaNet layers (a
 differentiable gated delta rule -- see ``training.gdn``; the fla
 ``chunk_gated_delta_rule`` Triton kernel on CUDA fp16/bf16, the sequential
 fp32 reference elsewhere) and gated full-attention layers (interleaved output
-gate). It reduces bit-identically to the original Llama path when those
-features are absent. Still rejected loudly (``assert_block_supported``):
-fused-qkvz GatedDeltaNet (Qwen3-Next layout), MoE, headwise attention gating
-(g_proj), mRoPE, partial rotary and non-NeoX RoPE. Sample packing is not
-supported on GatedDeltaNet models (the recurrence would carry state across
-packed document boundaries); train them unpacked.
+gate), and BlockSparseMLP mixtures of experts with the std softmax top-k
+router (Qwen3-MoE, Qwen3.5-MoE incl. the shared expert + sigmoid shared
+gate) -- see ``_moe_out``. It reduces bit-identically to the original Llama
+path when those features are absent. Still rejected loudly
+(``assert_block_supported``): fused-qkvz GatedDeltaNet (Qwen3-Next layout),
+ds3/dots-router MoE, headwise attention gating (g_proj), mRoPE, partial
+rotary and non-NeoX RoPE. Sample packing is not supported on GatedDeltaNet
+models (the recurrence would carry state across packed document boundaries);
+train them unpacked.
+
+MoE target semantics: the familiar ``gate_proj``/``up_proj``/``down_proj``
+names adapt DENSE MLPs and the always-active shared expert only. The routed
+experts are opt-in via the explicit ``expert_gate_proj``/``expert_up_proj``/
+``expert_down_proj`` target names (one adapter pair per expert per layer --
+on a many-expert model that is a large trainable surface with sparse
+per-expert gradients; see ``_MOE_EXPERT_TARGET_ALIASES``). The router gate
+and the shared-expert gate stay frozen always.
 """
 
 from __future__ import annotations
@@ -164,6 +175,22 @@ _GDN_TARGET_ALIASES = {
     "in_proj_b": ("in_proj_b", "b_proj"),
     "in_proj_a": ("in_proj_a", "a_proj"),
     "out_proj": ("out_proj", "o_proj"),
+}
+
+# Routed-expert leaf -> the target names that select it. The routed experts
+# deliberately do NOT alias the plain gate_proj/up_proj/down_proj names: on a
+# many-expert model (Qwen3.5-MoE class) that would silently attach one adapter
+# pair per expert per layer -- hundreds of thousands of tiny adapters with
+# sparse gradients (each expert sees only its routed tokens) -- which is
+# exactly the trap the mainstream MoE-LoRA recipes avoid by training
+# attention + the dense/shared paths only. Adapting the routed experts is
+# opt-in via these explicit names. The router gate and shared-expert gate are
+# never adapted (top-k selection is discontinuous; standard recipes freeze
+# the router).
+_MOE_EXPERT_TARGET_ALIASES = {
+    "gate_proj": ("expert_gate_proj",),
+    "up_proj": ("expert_up_proj",),
+    "down_proj": ("expert_down_proj",),
 }
 
 
@@ -393,6 +420,7 @@ class NativeLlamaQLoRA(nn.Module):
         lora_head: bool = False,
         offload_activations: bool = False,
         use_liger: bool = False,
+        expert_r: Optional[int] = None,
     ):
         super().__init__()
         # Offload the (grad-checkpointed) saved activations to CPU via torch's
@@ -424,11 +452,18 @@ class NativeLlamaQLoRA(nn.Module):
             self._flash_ok = False
         else:
             self._flash_ok = _fn is not None
+        targets_defaulted = target_modules is None
         targets = set(target_modules) if target_modules is not None else set(DEFAULT_TARGET_MODULES)
         self.target_modules = sorted(targets)
         self.r = r
         self.lora_alpha = float(alpha)
         self.use_rslora = use_rslora
+        # Rank for ROUTED-expert adapters (expert_gate/up/down_proj targets)
+        # when it should differ from the net-wide r. On a many-expert model the
+        # per-expert adapters dominate the trainable parameter count, so PEFT's
+        # MoE recipe divides the rank by the expert count (rank_pattern); this
+        # is that knob. None = same rank as everything else.
+        self.expert_r = int(expert_r) if expert_r is not None else None
 
         # All reach into exllamav3's internal module layout goes through backbone:
         # embedding first, final RMSNorm + LM head last, transformer blocks between.
@@ -440,17 +475,22 @@ class NativeLlamaQLoRA(nn.Module):
         wrappers: list[DiffLinear] = []
         satisfied_targets: set[str] = set()   # requested names that matched a linear
         self.has_gdn = False
+        self.has_moe = False
 
-        def wrap(linear, leaf, aliases=None):
-            # `aliases` (GDN layers) lets several requested target names select
-            # one physical linear (see _GDN_TARGET_ALIASES); plain layers match
-            # on their own leaf name only.
+        def wrap(linear, leaf, aliases=None, r_override=None):
+            # `aliases` (GDN / MoE-expert layers) lets several requested target
+            # names select one physical linear (see _GDN_TARGET_ALIASES /
+            # _MOE_EXPERT_TARGET_ALIASES; an empty tuple = never targetable);
+            # plain layers match on their own leaf name only. `r_override`
+            # (MoE routed experts) trains the hit at a different rank than the
+            # net-wide r -- PEFT's rank_pattern recipe for many-expert models.
             names = aliases if aliases is not None else (leaf,)
             hit = targets.intersection(names)
             satisfied_targets.update(hit)
+            r_eff = (r_override if r_override is not None else r) if hit else 0
             w = DiffLinear(
                 linear,
-                r=r if hit else 0,
+                r=r_eff,
                 alpha=alpha,
                 use_rslora=use_rslora,
                 compute_dtype=compute_dtype,
@@ -461,7 +501,16 @@ class NativeLlamaQLoRA(nn.Module):
         for blk in blocks:
             backbone.assert_block_supported(blk)
             meta = backbone.block_metadata(blk)
-            gate_lins, up_lins, down_lins = backbone.mlp_projections(blk)
+            is_moe = meta.get("mlp_kind", "dense") == "moe"
+            if is_moe:
+                # MoE block: entry.gates/ups/downs hold the SHARED expert (a
+                # dense, always-active GatedMLP -- absent on Qwen3-MoE), so it
+                # rides the plain gate/up/down_proj target names like any dense
+                # MLP; the routed experts get their own lists below.
+                shared = backbone.moe_shared_projections(blk)
+                gate_lins, up_lins, down_lins = shared if shared is not None else ([], [], [])
+            else:
+                gate_lins, up_lins, down_lins = backbone.mlp_projections(blk)
             attn_norm, mlp_norm = backbone.block_norms(blk)
             attn_post, mlp_post = backbone.block_post_norms(blk)        # Gemma sandwich
 
@@ -472,6 +521,27 @@ class NativeLlamaQLoRA(nn.Module):
             downs = [wrap(d, "down_proj") for d in down_lins]
 
             entry = nn.Module()
+            entry.is_moe = is_moe
+            if is_moe:
+                self.has_moe = True
+                eg, eu, ed = backbone.moe_expert_projections(blk)
+                # One wrapper per routed expert; adapted only via the explicit
+                # expert_* target names (see _MOE_EXPERT_TARGET_ALIASES).
+                entry.expert_gates = nn.ModuleList(
+                    [wrap(g, "gate_proj", _MOE_EXPERT_TARGET_ALIASES["gate_proj"],
+                          r_override=self.expert_r) for g in eg])
+                entry.expert_ups = nn.ModuleList(
+                    [wrap(u, "up_proj", _MOE_EXPERT_TARGET_ALIASES["up_proj"],
+                          r_override=self.expert_r) for u in eu])
+                entry.expert_downs = nn.ModuleList(
+                    [wrap(d, "down_proj", _MOE_EXPERT_TARGET_ALIASES["down_proj"],
+                          r_override=self.expert_r) for d in ed])
+                # Router + shared-expert gate: frozen projections (aliases=() so
+                # no target name can select them), still DiffLinears so the
+                # routing weights stay differentiable w.r.t. the hidden state.
+                entry.router = wrap(backbone.moe_router_linear(blk), "router_gate", ())
+                sh_gate = backbone.moe_shared_gate_linear(blk)
+                entry.shared_gate = wrap(sh_gate, "shared_gate", ()) if sh_gate is not None else None
             # Norm specs (plain dicts read from the modules; see backbone.norm_spec),
             # so the block forward reproduces each arch's exact RMSNorm without
             # reaching into module internals. None means "no such norm here".
@@ -517,6 +587,22 @@ class NativeLlamaQLoRA(nn.Module):
             self._block_devices.append(backbone.block_device(blk))
 
         self._wrappers = wrappers
+        if self.has_moe:
+            expert_targets = targets.intersection(
+                n for names in _MOE_EXPERT_TARGET_ALIASES.values() for n in names)
+            if not expert_targets:
+                print(" -- note: MoE model; routed experts stay FROZEN (plain "
+                      "gate/up/down_proj targets adapt the dense/shared-expert "
+                      "paths only). Opt in with --targets ... expert_gate_proj "
+                      "expert_up_proj expert_down_proj (consider a small "
+                      "--expert-r; one adapter pair per expert per layer).")
+            elif self.expert_r is None:
+                n_exp = next(m["num_experts"] for m in self._block_meta
+                             if m.get("mlp_kind") == "moe")
+                print(f" -- note: adapting routed experts at rank {r} "
+                      f"({n_exp} experts/layer). If the adapter count is too "
+                      f"large, set --expert-r (PEFT's MoE recipe uses "
+                      f"~r/num_experts, min 1).")
         if self.has_gdn and _fla_chunk_fn() is None:
             print(" -- note: GatedDeltaNet layers present but the fla package "
                   "(flash-linear-attention) is not importable; the delta rule "
@@ -558,8 +644,18 @@ class NativeLlamaQLoRA(nn.Module):
                   "head loss. Watch head memory on a big-vocab base.")
 
         # Sanity: every requested target name actually matched something
-        # (directly by leaf name, or via a GDN alias -- see _GDN_TARGET_ALIASES).
+        # (directly by leaf name, or via a GDN / MoE alias). When the DEFAULT
+        # list was used (no explicit target_modules), unmatched names are
+        # dropped with a note instead -- e.g. a pure-MoE model with no shared
+        # expert has no plain gate/up/down_proj, and the default should still
+        # train its attention without the user hand-picking targets.
         missing = targets - satisfied_targets
+        if missing and targets_defaulted:
+            print(f" -- note: default target(s) {sorted(missing)} matched no "
+                  f"linear on this architecture; training the rest.")
+            targets -= missing
+            self.target_modules = sorted(targets)
+            missing = set()
         if missing:
             raise ValueError(
                 f"target_modules {sorted(missing)} matched no linear in the model "
@@ -940,31 +1036,128 @@ class NativeLlamaQLoRA(nn.Module):
         return hidden
 
     def _mlp_out(self, meta, entry, normed2):
-        # Gated MLP (SwiGLU / GeGLU) over the already-normed input; shared by the
-        # softmax-attention and GatedDeltaNet block forwards. The MLP may be
-        # sliced across the intermediate dim (very wide models) -- sum the downs.
-        is_silu = meta["activation"] == "silu"
+        # MLP half of a block, shared by the softmax-attention and
+        # GatedDeltaNet block forwards: dense gated MLP, or the block-sparse
+        # mixture of experts (meta["mlp_kind"] == "moe").
+        if meta.get("mlp_kind", "dense") == "moe":
+            return self._moe_out(meta, entry, normed2)
+        return self._gated_mlp(entry.gates, entry.ups, entry.downs,
+                               meta["activation"], normed2)
+
+    def _gated_mlp(self, gates, ups, downs, activation, x):
+        # Gated MLP (SwiGLU / GeGLU) over the already-normed input. The MLP may
+        # be sliced across the intermediate dim (very wide models) -- sum the
+        # downs. Also runs a MoE block's shared expert (its slices, its
+        # activation).
+        is_silu = activation == "silu"
         act = F.silu if is_silu else (lambda z: F.gelu(z, approximate="tanh"))
         # Liger fused SiLU*mul (CUDA, silu only -- GeGLU stays torch): fuses the
         # activation+multiply into one kernel, saving an intermediate. fp32 is
         # allowed for the parity gate's math tier (see _norm).
-        liger_silu = (self.use_liger and is_silu and normed2.is_cuda
+        liger_silu = (self.use_liger and is_silu and x.is_cuda
                       and self.compute_dtype in (torch.float16, torch.bfloat16,
                                                  torch.float32))
         liger_ops = _liger_ops() if liger_silu else None
         mlp_out = None
-        for gate, up, down in zip(entry.gates, entry.ups, entry.downs):
+        for gate, up, down in zip(gates, ups, downs):
             if liger_ops is not None:
                 # Pin the Triton launch to the block's device (split mode: a tail
                 # block on cuda:1 while current_device is cuda:0 would otherwise
                 # fault on an inaccessible pointer). See _norm for the full note.
-                with torch.cuda.device(normed2.device):
-                    a = liger_ops[1].apply(gate(normed2), up(normed2))   # silu(gate)*up
+                with torch.cuda.device(x.device):
+                    a = liger_ops[1].apply(gate(x), up(x))       # silu(gate)*up
             else:
-                a = act(gate(normed2)) * up(normed2)
+                a = act(gate(x)) * up(x)
             d = down(a)                                          # compute_dtype (no fp32 upcast)
             mlp_out = d if mlp_out is None else mlp_out + d
         return mlp_out
+
+    def _moe_out(self, meta, entry, normed2):
+        """Block-sparse mixture of experts (BlockSparseMLP, std softmax top-k
+        router -- Qwen3-MoE / Qwen3.5-MoE) over the already-normed input.
+
+        Routing reproduces the inference kernel (``ext.routing_std``): logits
+        from the frozen router gate, top-k over the logits, softmax over the
+        selected k in fp32 -- mathematically identical to HF's softmax-over-all
+        + renormalize-top-k with ``norm_topk_prob=True`` (which the Qwen MoE
+        configs assert), since restricting a softmax to a subset and
+        renormalizing equals the softmax over that subset's logits. The
+        routing weights stay differentiable w.r.t. the hidden state (gradients
+        flow through the weighted sum into the softmax and router matmul; the
+        arg-top-k selection itself is piecewise-constant, exactly as in HF /
+        PEFT training). The router itself is frozen (r=0) -- no mainstream
+        MoE-LoRA recipe trains it, and no auxiliary load-balancing loss is
+        added (HF leaves it off by default for fine-tuning; with a frozen
+        router it could not rebalance routing anyway).
+
+        Experts run as a gather -> gated-MLP -> weighted index_add scatter per
+        expert with assigned tokens (the HF Qwen3MoeSparseMoeBlock shape),
+        each projection through its DiffLinear wrapper so LoRA / pissa /
+        quant-aware compose. Accumulation is fp32, matching the inference
+        path's float output buffer. The optional shared expert (Qwen3.5-MoE)
+        adds ``sigmoid(shared_gate(x)) * shared_mlp(x)``, exactly the
+        inference ``add_sigmoid_gate`` kernel. Per-token math throughout, so
+        sample packing needs no special case (Qwen3.5-MoE still rejects
+        packing at the net level, for its GDN layers)."""
+        bsz, t, d = normed2.shape
+        y = normed2.reshape(-1, d)
+        nt = y.shape[0]
+        num_experts = meta["num_experts"]
+        top_k = meta["num_experts_per_tok"]
+        # Routing weights + output accumulation promote to >= fp32 (like the
+        # fused-CE head): fp32 for half/bf16/fp32 compute, fp64 preserved for
+        # the fp64 gradcheck path.
+        acc = torch.float64 if y.dtype == torch.float64 else torch.float32
+
+        logits = entry.router(y).to(acc)                        # [nt, E]
+        top_logits, top_idx = torch.topk(logits, top_k, dim=-1)
+        weights = torch.softmax(top_logits, dim=-1)             # [nt, k] >=fp32
+        pes = meta.get("per_expert_scale")
+        if pes is not None:
+            weights = weights * pes.to(acc).to(weights.device)[top_idx]
+
+        act = F.silu if meta["activation"] == "silu" \
+            else (lambda z: F.gelu(z, approximate="tanh"))
+
+        # Group token assignments by expert: one sort, then per-expert
+        # contiguous slices (the inference forward's batched layout). The
+        # bincount round-trip to host is one small sync per MoE layer --
+        # unavoidable for data-dependent expert batching (inference pays the
+        # same). stable sort so the grad-checkpoint recompute reproduces the
+        # exact fp reduction order.
+        flat_idx = top_idx.reshape(-1)                          # [nt*k]
+        flat_w = weights.reshape(-1)                            # [nt*k] fp32
+        flat_tok = torch.arange(nt, device=y.device).repeat_interleave(top_k)
+        order = torch.argsort(flat_idx, stable=True)
+        tok_sorted = flat_tok[order]
+        w_sorted = flat_w[order]
+        counts = torch.bincount(flat_idx, minlength=num_experts).tolist()
+
+        out = torch.zeros(nt, d, dtype=acc, device=y.device)
+        start = 0
+        for e in range(num_experts):
+            end = start + counts[e]
+            if end == start:
+                continue                                        # no tokens routed here
+            toks = tok_sorted[start:end]
+            w = w_sorted[start:end].unsqueeze(1)                # [c, 1] >=fp32
+            xe = y.index_select(0, toks)                        # [c, d]
+            h = act(entry.expert_gates[e](xe)) * entry.expert_ups[e](xe)
+            de = entry.expert_downs[e](h)                       # [c, d] compute dtype
+            out.index_add_(0, toks, de.to(acc) * w)
+            start = end
+
+        # Shared expert (always active), gated by sigmoid(shared_gate(x)).
+        if len(entry.gates):
+            sh = self._gated_mlp(entry.gates, entry.ups, entry.downs,
+                                 meta.get("shared_activation") or meta["activation"], y)
+            if entry.shared_gate is not None:
+                g = torch.sigmoid(entry.shared_gate(y).to(acc))  # [nt, 1]
+                out = out + g * sh.to(acc)
+            else:
+                out = out + sh.to(acc)
+
+        return out.view(bsz, t, d).to(normed2.dtype)
 
     # --- GatedDeltaNet (linear attention) block forward --------------------
 
@@ -1109,6 +1302,10 @@ class NativeLlamaQLoRA(nn.Module):
         why = "" if mem_eff else "  (eager: needs CUDA + fp16/bf16" + \
             ("" if self._flash_ok else " + flash_attn") + ")"
         line = f"attn: {plan}  [impl={self.attn_impl}, flash_attn {avail}]{why}"
+        moe = [m for m in self._block_meta if m.get("mlp_kind") == "moe"]
+        if moe:
+            line += (f"  [moe: {len(moe)} layers x {moe[0]['num_experts']} experts, "
+                     f"top-{moe[0]['num_experts_per_tok']}]")
         if counts["gdn"]:
             gdn_fast = (is_cuda and self.attn_impl != "eager"
                         and self.compute_dtype in (torch.float16, torch.bfloat16)
@@ -1576,7 +1773,22 @@ class NativeLlamaQLoRA(nn.Module):
 
         The native ``Linear.apply_lora`` computes ``x @ A @ B`` with no extra
         scale, so the LoRA scale is folded into B here.
+
+        MoE caveat: runtime LoRA fires only through ``Linear.forward``, and the
+        quantized ``BlockSparseMLP`` inference forward dispatches its routed
+        experts through fused kernels (bc / mgemm / exl3_moe) that bypass it --
+        so ROUTED-expert adapters will NOT be reflected in native generation
+        (live samples / qlora_infer_native). They still train correctly; deploy
+        them by merge-and-requantize (the recommended path per the handoff's
+        finding C anyway). A one-time warning is printed when that applies.
         """
+        if not getattr(self, "_warned_moe_apply", False) and any(
+                w.r > 0 and ".experts." in w.key for w in self._wrappers):
+            self._warned_moe_apply = True
+            print(" -- warning: routed-expert LoRA adapters are installed in the "
+                  "runtime slots, but the fused MoE inference kernels bypass "
+                  "them: native generation will NOT reflect the expert "
+                  "adapters. Merge-and-requantize to deploy them.")
         for w in self._wrappers:
             if w.r <= 0:
                 continue
@@ -1633,11 +1845,15 @@ class NativeLlamaQLoRA(nn.Module):
         sidecar: dict[str, torch.Tensor] = {}
         target_leaves: set[str] = set()
         r = alpha = None
+        expert_ranks: set[int] = set()   # routed-expert ranks (may differ: expert_r)
         use_rslora = self.use_rslora
         for w in self._wrappers:
             if w.r <= 0:
                 continue
-            r, alpha = w.r, w.lora_alpha
+            if ".experts." in w.key:
+                expert_ranks.add(w.r)
+            else:
+                r, alpha = w.r, w.lora_alpha
             target_leaves.add(w.key.split(".")[-1])
             key = f"base_model.model.{w.key}"
             if has_offset:
@@ -1660,10 +1876,29 @@ class NativeLlamaQLoRA(nn.Module):
             state[f"{key}.lora_B.weight"] = b.t().contiguous().to(torch.float16).cpu()
 
         if r is None:
-            # No per-linear LoRA (e.g. only --lora-embed/--lora-head requested); the
-            # saved config still needs a rank/alpha -- use the configured ones.
+            # No non-expert per-linear LoRA (e.g. only --lora-embed/--lora-head
+            # or only expert_* targets requested); the saved config still needs
+            # a rank/alpha -- use the configured ones.
             r, alpha = self.r, self.lora_alpha
         init_lora_r = r
+        # Routed experts trained at a different rank (expert_r): record a PEFT
+        # rank_pattern so external consumers scale their B by alpha/expert_r,
+        # not alpha/r. (LoRA.from_directory derives each module's rank from the
+        # tensor shapes and needs no pattern.)
+        rank_pattern = {}
+        alpha_pattern = {}
+        odd_expert_ranks = expert_ranks - {r}
+        if odd_expert_ranks:
+            assert len(odd_expert_ranks) == 1, \
+                f"mixed routed-expert ranks {sorted(expert_ranks)} can't be " \
+                f"described by one rank_pattern"
+            er = next(iter(odd_expert_ranks))
+            pat = r".*\.mlp\.experts\..*"
+            rank_pattern = {pat: 2 * er if has_offset else er}
+            if has_offset:
+                # The pissa conversion folds the scale into B (loader scale must
+                # be 1.0), so the pattern-matched modules need alpha == rank too.
+                alpha_pattern = {pat: float(2 * er)}
         if has_offset:
             # The exported tensors are rank 2r with the scale folded in.
             r, alpha, use_rslora = 2 * r, float(2 * r), False
@@ -1720,6 +1955,8 @@ class NativeLlamaQLoRA(nn.Module):
             "bias": "none",
             "fan_in_fan_out": False,
             "target_modules": sorted(target_leaves),
+            **({"rank_pattern": rank_pattern} if rank_pattern else {}),
+            **({"alpha_pattern": alpha_pattern} if alpha_pattern else {}),
             "modules_to_save": modules_to_save,
             "lora_embed": self.lora_embed,
             "lora_head": self.lora_head,

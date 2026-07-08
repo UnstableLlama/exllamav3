@@ -30,15 +30,17 @@
 > notes below (which remain the detailed context for each item). Newest
 > priority first, per the 2026-07 direction.
 
-0. **Gated DeltaNet (Qwen3.5/3.6) training — BUILT (Session 18), box gates
-   pending.** The native forward now covers the Qwen3.5/3.6 hybrid: a
-   differentiable GatedDeltaNet block (fla `chunk_gated_delta_rule` on CUDA
-   bf16/fp16, sequential fp32 reference elsewhere) + the interleaved
-   attention output gate on the full-attn layers. What remains is the box
-   work: the fp32 + bf16 validate gates on a real Qwen3.5 EXL3 quant, then a
-   first training run — see the Session 18 box list. Not covered: Qwen3.5-MoE
-   (BlockSparseMLP still rejected), Qwen3-Next (fused qkvz layout), sample
-   packing on GDN models (rejected loudly; train unpacked).
+0. **Qwen3.5 training — BUILT (Sessions 18 + 20), box gates pending.** The
+   native forward now covers the full Qwen3.5 family: the hybrid GDN +
+   gated-attention layers (Session 18: fla `chunk_gated_delta_rule` on CUDA
+   bf16/fp16, sequential fp32 reference elsewhere) AND the Qwen3.5-MoE /
+   Qwen3-MoE BlockSparseMLP (Session 20: std top-k router, shared expert +
+   sigmoid shared gate, opt-in routed-expert targets `expert_*_proj` with
+   `--expert-r`, router frozen, no aux loss). What remains is the box work:
+   fp32 + bf16 validate gates on real Qwen3.5(-MoE) EXL3 quants, then first
+   training runs — see the Session 18 and Session 20 box lists. Still not
+   covered: Qwen3-Next (fused qkvz layout), sample packing on GDN models
+   (rejected loudly; train unpacked — plain Qwen3-MoE packs fine).
 1. **Quantization-aware LoRA — BUILT (Session 17), box A/B pending.**
    `--quant-aware {noise,ste}` implements the two tractable directions from
    the original item (noise injection on the frozen-weight closure, and a
@@ -2445,6 +2447,143 @@ o_proj). Both were rejected by `assert_block_supported`. Both are now built:
    standing eval-prereq rules.
 4. Later / optional: fla cu_seqlens packing for GDN models, fused-qkvz
    support (Qwen3-Next), MoE (Qwen3.5-MoE) — each a separate project.
+
+### Session 20 — Qwen3.5-MoE: differentiable BlockSparseMLP (MoE) in the native forward
+
+> Branch `claude/qwen35-moe-training-oqc1p0`. Container-verified (new
+> `tests/test_moe.py` + all existing CPU suites pass); **nothing here is
+> box-verified yet** — the box list below is the next box session. This
+> removes the last blocker for Qwen3.5-MoE training (Session 18 built the
+> other half: GDN + gated attention). Also unlocks **Qwen3-MoE**
+> (`Qwen3MoeForCausalLM` — same BlockSparseMLP, std router, no shared
+> expert, standard attention, so it packs too). Qwen3-Next stays rejected
+> (fused qkvz GDN layout, a separate project).
+
+**What the inference module does (the spec).** `modules/block_sparse_mlp.py`:
+router `gate` (fp16 Linear `[hidden, E]`) → `ext.routing_std` = top-k over the
+logits, then softmax over the selected k (`routing.cu:routing_std_topk_kernel`)
+— mathematically identical to HF's softmax-over-all + top-k + renormalize with
+`norm_topk_prob=True` (which both Qwen MoE configs assert), since restricting
+a softmax to a subset and renormalizing equals the softmax over that subset's
+logits. Optional post-softmax `per_expert_scale`. Routed experts = per-expert
+gate/up/down EXL3 linears, SiLU, output accumulated in fp32. Qwen3.5-MoE adds
+a **shared expert** (dense GatedMLP, always active) added as
+`sigmoid(shared_expert_gate(x)) * shared_mlp(x)` (`ext.add_sigmoid_gate`).
+
+**Design decisions (researched against unsloth / axolotl / PEFT practice):**
+- **Target semantics:** plain `gate_proj`/`up_proj`/`down_proj` adapt dense
+  MLPs and the **shared expert** only. Routed experts are **opt-in** via the
+  explicit `expert_gate_proj`/`expert_up_proj`/`expert_down_proj` names
+  (`_MOE_EXPERT_TARGET_ALIASES`, the `_GDN_TARGET_ALIASES` sibling) — matches
+  axolotl's shipped MoE configs (attention-only default, experts via
+  `lora_target_parameters` commented out). Rationale: a many-expert model
+  gets one adapter pair per expert per layer (E×3×L), with sparse per-expert
+  gradients; that's a deliberate choice, not a default. (Unsloth *does*
+  default experts on, but behind custom grouped-GEMM kernels we don't have.)
+- **`--expert-r`** (all three native arms + YAML `expert_r`): a separate
+  (smaller) rank for routed-expert adapters — PEFT's own MoE recipe divides
+  rank by expert count (`rank_pattern`, citing "LoRA Without Regret").
+  Exported to `adapter_config.json` as a PEFT `rank_pattern`
+  (+ `alpha_pattern` in the pissa-converted case); `LoRA.from_directory` now
+  derives each module's rank **from its tensor shape** (+ honors
+  `alpha_pattern`), so mixed-rank adapters — ours or PEFT's — scale right.
+- **Router + shared gate: always frozen** (r=0 DiffLinears, not targetable).
+  Universal practice (unsloth docs say it outright; axolotl comments it out;
+  ms-swift has a router-freeze feature request citing routing collapse). The
+  routing WEIGHTS stay differentiable w.r.t. the hidden state (gradient flows
+  through the weighted sum → softmax → router matmul, exactly like HF); only
+  the top-k index selection is piecewise-constant.
+- **No auxiliary load-balancing loss.** HF computes it only when
+  `output_router_logits=true` (default off); axolotl enables it for Mixtral
+  but NOT for any Qwen-MoE config; with a frozen router it can't rebalance
+  routing anyway — it would only distort the expert-weight gradients.
+- **Routing softmax in fp32** (promoted to fp64 on the gradcheck path),
+  matching HF's `softmax(..., dtype=torch.float)`; output accumulation fp32,
+  matching the inference module's float output buffer.
+
+**What was changed:**
+- `training/backbone.py`: `is_block_sparse_mlp`, `_assert_moe_supported`
+  (accepts std-router BlockSparseMLP incl. shared expert + shared gate +
+  `per_expert_scale`; still rejects ds3/dots routers, grouped routing,
+  `routed_scaling_factor`, `e_score_correction_bias`, expert/TP splits,
+  Gemma4-style extra norms / `alt_residual_channel`), `_mlp_metadata`
+  (`mlp_kind: "dense"|"moe"` + E / top-k / scale / shared activation, merged
+  into `block_metadata` for both block kinds), and seam accessors
+  `moe_expert_projections`, `moe_shared_projections`, `moe_router_linear`,
+  `moe_shared_gate_linear`.
+- `training/native_llama.py`: `_moe_out` (router → top-k softmax → sort
+  tokens by expert (stable, so the grad-checkpoint recompute reproduces the
+  exact fp reduction order) → per-expert gather / gated-MLP / weighted
+  `index_add_` scatter → shared expert × sigmoid gate); `_mlp_out` split into
+  a dispatch + `_gated_mlp` (dense path bit-identical, also runs the shared
+  expert with liger support); construction wraps every expert projection in a
+  DiffLinear (LoRA / pissa / eva / quant-aware compose — they iterate
+  `net._wrappers` generically and skip r=0), `expert_r` knob, one-line notes
+  at build (frozen experts / expert adapter count), `describe_attn` gains
+  `[moe: N layers x E experts, top-k]`, and `save_adapter` emits
+  `rank_pattern`/`alpha_pattern` for mixed ranks. Default targets that match
+  nothing (e.g. `gate_proj` on a shared-expert-less Qwen3-MoE) are now
+  dropped with a note instead of raising — explicit `--targets` still raise.
+- `model/lora.py`: per-module B pre-scale (`_module_scaling`) from the
+  tensor's own rank + `alpha_pattern`, replacing the single global
+  `alpha/config_r` (which silently mis-scales mixed-rank adapters).
+- Trainers: `--expert-r` on `qlora_train_native.py` / DDP / pref + YAML key
+  `expert_r`; `--targets` help documents the MoE semantics; run-log CSV gains
+  an `expert_r` column. `qlora_validate_native.py`'s backward/liger-parity
+  smoke nets fall back to `q_proj`-only targets on a pure-MoE model.
+- `tests/test_moe.py` (all pass in-container): `_moe_out` vs an independent
+  HF-style reference (softmax-all + renorm — the equality IS the
+  norm_topk_prob equivalence proof), Qwen3-MoE shape (no shared expert) +
+  `per_expert_scale`, fp64 gradcheck through routing + experts + shared gate,
+  backward reaches expert/shared adapters at mixed ranks with base + router +
+  shared gate frozen, token-less experts get no gradient, dense dispatch
+  unchanged. Existing suites (gdn / native_llama / fused_ce / qlora_grad /
+  lora_init / preference / quant_aware) pass unchanged.
+
+**Known caveats (by design, documented in code):**
+- **Runtime-slot LoRA on routed experts does NOT fire at native inference:**
+  `Linear.apply_lora` runs only via `Linear.forward`, and the quantized
+  BlockSparseMLP inference forward dispatches experts through fused kernels
+  (bc / `exl3_mgemm` / `exl3_moe`) that bypass it. `apply_to_native` prints a
+  one-time warning; live `🎭` samples and `qlora_infer_native.py` will not
+  reflect expert adapters. Deploy expert adapters by **merge-and-requantize**
+  (already the recommended path per finding C). Attention/GDN/shared-expert
+  adapters behave as before.
+- **Cost:** every routed expert with ≥1 token in the batch dequantizes its
+  3 trellis weights per layer per forward (and again in the checkpointed
+  backward). At training batch sizes most experts are hit, so expect MoE
+  steps to be dequant-heavy — record `--profile-dequant 5` on the first run
+  (audit item A1, dequant caching, will matter more here than anywhere).
+- One small host sync per MoE layer per forward (the expert-count bincount →
+  `tolist`), same as inference pays.
+- **Train bf16, not fp16** (unsloth force-upcasts qwen3.5/qwen3_moe: "fp16
+  NaNs grad norms"); bf16 is already our default compute dtype.
+- The fp32 validate gate computes router logits in fp32 vs the kernel's fp16
+  hgemm + fp16 radix-sort top-k — a near-tie between two experts can select
+  differently and show as a small per-token logit diff. Expect a slightly
+  lower (still ~99%+) argmax agreement than dense models; a large drop means
+  a real bug, not routing ties.
+
+**Box list for next session (in order):**
+1. **Forward gates on a real Qwen3.5-MoE EXL3 quant**:
+   `qlora_validate_native.py --model $QWEN35_MOE` (fp32 eager; expect high
+   argmax agreement, see the routing-tie caveat), then `--compute-dtype
+   bfloat16` (fla chunked + flash on the attn layers; `describe_attn` should
+   print the `[moe: ...]` summary), then `--check-backward`. A Qwen3-MoE
+   quant (e.g. Qwen3-30B-A3B) also gates the no-shared-expert + packing
+   path if available.
+2. **Training smoke** (`--prompt-format qwen3.5-nothink`, `--inspect 3`
+   first): default targets (attention + shared expert; expect the "routed
+   experts stay FROZEN" note), short unpacked run, watch loss / grad norm /
+   `|dB|` / tok/s and `--profile-dequant 5` (expect a much higher dequant
+   share than dense).
+3. **Expert-adapter smoke**: same run + `--targets ... expert_gate_proj
+   expert_up_proj expert_down_proj --expert-r 1..4`; verify the trainable-
+   param count print, per-step time hit, and that a save → `--resume`
+   round-trips (shape-checked). Check `adapter_config.json` has
+   `rank_pattern` when `--expert-r` ≠ `--r`.
+4. **A real SFT + eval-split run**, judged per the standing eval-prereq
+   rules; A/B attention+shared vs +experts on held-out loss.
 
 ---
 

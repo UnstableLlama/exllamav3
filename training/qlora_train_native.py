@@ -160,7 +160,7 @@ class StepTimer:
 RUN_LOG_FIELDS = [
     "timestamp", "arm", "status", "model", "arch", "out",
     "dataset", "eval_split", "eval_dataset", "eval2_dataset",
-    "r", "alpha", "use_rslora", "init_lora", "quant_aware", "quant_aware_scale",
+    "r", "alpha", "expert_r", "use_rslora", "init_lora", "quant_aware", "quant_aware_scale",
     "lr", "scheduler", "warmup_steps", "weight_decay",
     "batch", "grad_accum", "world_size", "eff_batch",
     "epochs", "steps_planned", "steps_done", "seq_len",
@@ -1199,7 +1199,18 @@ def _run_main():
                          "response was truncated by --seq-len), then exit without "
                          "training. Run this once to verify a new dataset/schema.")
     ap.add_argument("--targets", nargs="*", default=None,
-                    help="Target module leaf names (default: attn+mlp projections)")
+                    help="Target module leaf names (default: attn+mlp projections). "
+                         "On a MoE model the plain gate/up/down_proj names adapt "
+                         "the dense/shared-expert paths only; add expert_gate_proj/"
+                         "expert_up_proj/expert_down_proj to also adapt the routed "
+                         "experts (one adapter pair per expert per layer -- see "
+                         "--expert-r). The router is always frozen.")
+    ap.add_argument("--expert-r", type=int, default=None,
+                    help="LoRA rank for ROUTED-expert adapters (expert_* targets) "
+                         "when it should differ from --r. On a many-expert model "
+                         "the per-expert adapters dominate the trainable size; "
+                         "PEFT's MoE recipe uses ~r/num_experts (min 1). Default: "
+                         "same as --r.")
     ap.add_argument("--train-embeddings", action="store_true",
                     help="Also FULLY train the input embeddings (modules_to_save), "
                          "not just LoRA. Saved to modules_to_save.safetensors. Big "
@@ -1387,6 +1398,7 @@ def _run_main():
         "eval_dataset": args.eval_dataset or "",
         "eval2_dataset": args.eval2_dataset or "",
         "r": args.r, "alpha": args.alpha,
+        "expert_r": "" if args.expert_r is None else args.expert_r,
         "use_rslora": int(bool(args.use_rslora)), "init_lora": args.init_lora,
         "quant_aware": args.quant_aware, "quant_aware_scale": args.quant_aware_scale,
         "lr": args.lr,
@@ -1463,6 +1475,7 @@ def _run_main():
         modules_to_save_dtype=ms_dtype,
         lora_embed=args.lora_embed, lora_head=args.lora_head,
         offload_activations=args.offload_activations, use_liger=args.use_liger,
+        expert_r=args.expert_r,
     )
     net.train()
     if args.pack and getattr(net, "has_gdn", False):
@@ -1854,6 +1867,7 @@ def _run_main():
             "eval_split": args.eval_split or "", "eval_dataset": args.eval_dataset or "",
             "eval2_dataset": args.eval2_dataset or "",
             "r": args.r, "alpha": args.alpha,
+            "expert_r": "" if args.expert_r is None else args.expert_r,
             "use_rslora": int(bool(args.use_rslora)), "init_lora": args.init_lora,
             "quant_aware": args.quant_aware, "quant_aware_scale": args.quant_aware_scale,
             "lr": args.lr,
