@@ -186,6 +186,9 @@ def _run_main():
                          "decreasing, ~97%%+ fill; nextfit = old behavior). "
                          "Deterministic, so ranks stay identical.")
     ap.add_argument("--targets", nargs="*", default=None)
+    ap.add_argument("--expert-r", type=int, default=None,
+                    help="LoRA rank for ROUTED-expert adapters (expert_* targets); "
+                         "default: same as --lora-r. See the single-GPU trainer.")
     ap.add_argument("--train-embeddings", action="store_true",
                     help="Also FULLY train the input embeddings (modules_to_save). "
                          "Big (vocab x hidden): raises VRAM AND the per-step LoRA-"
@@ -356,6 +359,7 @@ def _run_main():
         compute_dtype=cdt, gradient_checkpointing=not args.no_grad_ckpt,
         train_embeddings=args.train_embeddings, train_head=args.train_head,
         attn_impl=args.attn_impl, head_vocab_chunk=args.head_vocab_chunk,
+        expert_r=args.expert_r,
     )
     net.train()
     if args.pack and getattr(net, "has_gdn", False):

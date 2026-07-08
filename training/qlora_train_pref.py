@@ -367,6 +367,9 @@ def _run_main():
     ap.add_argument("--use-rslora", action="store_true")
     ap.add_argument("--targets", nargs="*", default=None,
                     help="Target module leaf names (default: attn+mlp projections)")
+    ap.add_argument("--expert-r", type=int, default=None,
+                    help="LoRA rank for ROUTED-expert adapters (expert_* targets); "
+                         "default: same as --r. See qlora_train_native.py.")
     ap.add_argument("--init-lora", choices=["default", "pissa", "qerr", "eva"],
                     default="default",
                     help="Adapter init (see qlora_train_native.py). default/pissa/"
@@ -523,6 +526,7 @@ def _run_main():
         gradient_checkpointing=not args.no_grad_ckpt,
         attn_impl=args.attn_impl, head_vocab_chunk=args.head_vocab_chunk,
         offload_activations=args.offload_activations, use_liger=args.use_liger,
+        expert_r=args.expert_r,
     )
     net.train()
     if args.init_lora in ("pissa", "qerr"):

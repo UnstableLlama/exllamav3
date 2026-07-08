@@ -39,7 +39,7 @@ DDP_LAUNCH_KEYS = {
 # parallel=ddp. Keep this explicit so a typo or unsupported DDP knob fails early
 # instead of being silently ignored.
 COMMON_KEYS = {
-    "model", "out", "r", "alpha", "lr", "weight_decay", "scheduler",
+    "model", "out", "r", "alpha", "expert_r", "lr", "weight_decay", "scheduler",
     "warmup_ratio", "warmup_steps", "epochs", "steps", "batch", "grad_accum",
     "dataset", "dataset_split", "instruction_key", "context_key", "response_key",
     "messages_key", "prompt_format", "clean_text", "no_clean_text",

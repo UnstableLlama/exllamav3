@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import json
 import math
+import re
 import torch
 from safetensors.torch import load_file as safe_load_file
 from ..modules.linear import Linear
@@ -98,11 +99,22 @@ class LoRA:
 
         self.lora_r = config["r"]
         self.lora_alpha = float(config["lora_alpha"])
+        self.use_rslora = bool(config.get("use_rslora", False))
+        # Per-module alpha overrides (PEFT alpha_pattern: regex -> alpha).
+        # Per-module RANKS need no config: each module's rank is read off its
+        # own lora_A/lora_B tensor shape below, so rank_pattern adapters
+        # (e.g. a smaller rank on MoE routed experts) scale correctly.
+        self.alpha_pattern = {k: float(v)
+                              for k, v in config.get("alpha_pattern", {}).items()}
+        self.user_scaling = lora_scaling
 
         effective_alpha = self.lora_alpha
-        if config.get("use_rslora", False):
+        if self.use_rslora:
             effective_alpha *= math.sqrt(self.lora_r)
 
+        # Global scaling (config-level r/alpha) -- reported in the load line and
+        # correct for uniform-rank adapters; mixed-rank/alpha modules get their
+        # own value from _module_scaling.
         self.lora_scaling = lora_scaling * effective_alpha / self.lora_r
 
         if config.get("fan_in_fan_out", False):
@@ -169,9 +181,14 @@ class LoRA:
             # We want A as [in_features, rank] and B as [rank, out_features].
             tensor = tensor.T.contiguous()
 
-            # Pre-scale B matrix
-            if lora_half == "lora_B" and self.lora_scaling != 1.0:
-                tensor.mul_(self.lora_scaling)
+            # Pre-scale B matrix. The module's rank is the tensor's own leading
+            # dim (post-transpose [r, out]), NOT config r: a rank_pattern
+            # adapter (e.g. smaller rank on MoE routed experts) has per-module
+            # ranks, and alpha_pattern can override alpha per module.
+            if lora_half == "lora_B":
+                scaling = self._module_scaling(full_path, tensor.shape[0])
+                if scaling != 1.0:
+                    tensor.mul_(scaling)
 
             # Pad to match target dimensions (quantized layers may pad features to multiples of block size)
             if lora_half == "lora_A" and tensor.shape[0] < target.in_features:
@@ -296,6 +313,23 @@ class LoRA:
             if applied:
                 print(f" -- LoRA '{self.name}': applied module LoRA {applied} "
                       f"(scaling={self.lora_scaling:.4f})")
+
+    def _module_scaling(self, full_path: str, module_r: int) -> float:
+        """
+        Effective B pre-scale for one module: ``user_scaling * alpha / r`` with
+        the module's OWN rank (taken from its tensor shape by the caller) and
+        any ``alpha_pattern`` override. Pattern keys use PEFT's matching rule
+        (``(^|.*\\.)pattern$`` against the module path). Equals the global
+        ``lora_scaling`` for a uniform-rank adapter.
+        """
+        alpha = self.lora_alpha
+        for pat, a in self.alpha_pattern.items():
+            if re.match(rf"(^|.*\.){pat}$", full_path):
+                alpha = a
+                break
+        if self.use_rslora:
+            alpha *= math.sqrt(module_r)
+        return self.user_scaling * alpha / module_r
 
     @staticmethod
     def _parse_key(key: str) -> tuple[str | None, str | None]:

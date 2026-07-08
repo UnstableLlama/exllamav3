@@ -53,10 +53,19 @@ def check_backward(model, tokenizer, prompt, device, cdt, attn_impl="auto",
     """
     print("\n" + "-" * 78)
     print("backward smoke: cross-device gradient flow through the split")
-    net = NativeLlamaQLoRA(model, r=4, alpha=8.0,
-                           target_modules=["q_proj", "down_proj"],
-                           compute_dtype=cdt, gradient_checkpointing=True,
-                           attn_impl=attn_impl, use_liger=use_liger)
+    try:
+        net = NativeLlamaQLoRA(model, r=4, alpha=8.0,
+                               target_modules=["q_proj", "down_proj"],
+                               compute_dtype=cdt, gradient_checkpointing=True,
+                               attn_impl=attn_impl, use_liger=use_liger)
+    except ValueError:
+        # A pure-MoE model with no shared expert has no plain down_proj (the
+        # routed experts need the explicit expert_* targets); q_proj alone
+        # still exercises the cross-device backward this smoke is for.
+        net = NativeLlamaQLoRA(model, r=4, alpha=8.0,
+                               target_modules=["q_proj"],
+                               compute_dtype=cdt, gradient_checkpointing=True,
+                               attn_impl=attn_impl, use_liger=use_liger)
     net.train()
     ids = tokenizer.encode(prompt, add_bos=True).to(device)
     loss = net.compute_loss(ids, ids.clone())
@@ -120,13 +129,21 @@ def check_liger_parity(model, tokenizer, prompt, device, cdt, attn_impl="auto"):
         # Same seed -> identical kaiming init of every lora_a (B starts at 0),
         # so the two nets are the same function and gradients are comparable.
         torch.manual_seed(0)
-        net = NativeLlamaQLoRA(
-            model, r=8, alpha=16.0,
-            # gate/up/down exercise the Liger SwiGLU (silu models); q_proj sits
-            # after the input RMSNorm so it sees the Liger norm's backward too.
-            target_modules=["q_proj", "gate_proj", "up_proj", "down_proj"],
-            compute_dtype=dtype, gradient_checkpointing=True,
-            attn_impl=attn_impl, use_liger=use_liger)
+        try:
+            net = NativeLlamaQLoRA(
+                model, r=8, alpha=16.0,
+                # gate/up/down exercise the Liger SwiGLU (silu models); q_proj sits
+                # after the input RMSNorm so it sees the Liger norm's backward too.
+                target_modules=["q_proj", "gate_proj", "up_proj", "down_proj"],
+                compute_dtype=dtype, gradient_checkpointing=True,
+                attn_impl=attn_impl, use_liger=use_liger)
+        except ValueError:
+            # Pure-MoE, no shared expert: no plain gate/up/down_proj to adapt.
+            torch.manual_seed(0)
+            net = NativeLlamaQLoRA(
+                model, r=8, alpha=16.0, target_modules=["q_proj"],
+                compute_dtype=dtype, gradient_checkpointing=True,
+                attn_impl=attn_impl, use_liger=use_liger)
         net.train()
         return net
 
