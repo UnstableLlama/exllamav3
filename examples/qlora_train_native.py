@@ -374,10 +374,34 @@ def format_prompt_and_eot(model, tokenizer, prompt_format):
       ``"gemma4"`` case in ``examples/common.py`` / ``PromptFormat_gemma4`` in
       ``examples/chat_templates.py`` used for inference. ``<turn|>`` (a
       registered special token) ends the turn, not EOS.
+    - ``llama3``: the explicit Llama-3 header format
+      ``<|begin_of_text|><|start_header_id|>system<|end_header_id|>\\n\\n{system}
+      <|eot_id|><|start_header_id|>user<|end_header_id|>\\n\\n{user}<|eot_id|>
+      <|start_header_id|>assistant<|end_header_id|>\\n\\n{response}<|eot_id|>``
+      (system turn omitted when there's no system text). Identical to ``auto``
+      on the llama arch -- the explicit option trains the Llama-3 pattern onto
+      any base without depending on arch detection (on non-Llama tokenizers the
+      header markers are plain text the model learns, like ``metharme``). The
+      model's own BOS is used; ``<|eot_id|>`` ends the turn.
+    - ``qwen3.5``: plain ChatML, ``<|im_start|>system\\n{system}<|im_end|>\\n
+      <|im_start|>user\\n{user}<|im_end|>\\n<|im_start|>assistant\\n{response}
+      <|im_end|>`` (system turn omitted when there's no system text). Identical
+      to ``auto`` on the qwen3/qwen3.5 archs. Use this when the responses carry
+      their own ``<think>...</think>`` spans (reasoning SFT) or the base is a
+      non-reasoning ChatML model. No BOS (Qwen tokenizers define none);
+      ``<|im_end|>`` ends the turn.
+    - ``qwen3.5-nothink``: ChatML with the reasoning block pre-closed empty --
+      the assistant turn opens with ``<think>\\n\\n</think>\\n\\n`` inside the
+      (masked) prompt, so the model is trained to answer directly. This matches
+      exactly what ``PromptFormat_qwen35`` in ``examples/chat_templates.py``
+      prefills at inference when thinking is disabled, so train and serve see
+      the same context (the gemma4-nothink of the Qwen3.5/3.6 family).
+      ``<|im_end|>`` ends the turn.
 
-    For ``mistral``/``metharme``/``gemma4-nothink`` a literal BOS is prepended so
-    the sequence starts with one; the caller's BOS-normalization then collapses
-    any duplicate the tokenizer auto-adds.
+    For ``mistral``/``metharme``/``gemma4-nothink``/``llama3`` a literal BOS is
+    prepended so the sequence starts with one; the caller's BOS-normalization
+    then collapses any duplicate the tokenizer auto-adds. The ChatML formats
+    prepend no BOS.
     """
     if prompt_format == "mistral":
         bos = tokenizer.bos_token or ""
@@ -400,11 +424,28 @@ def format_prompt_and_eot(model, tokenizer, prompt_format):
             return (f"{bos}{sys_part}<|turn>user\n{user}<turn|>\n<|turn>model\n"
                      f"<|channel>thought\n<channel|>")
         return build, "<turn|>"
+    if prompt_format == "llama3":
+        bos = tokenizer.bos_token or ""
+        def build(user, system=None):
+            sys_part = (f"<|start_header_id|>system<|end_header_id|>\n\n"
+                        f"{system}<|eot_id|>") if system else ""
+            return (f"{bos}{sys_part}"
+                    f"<|start_header_id|>user<|end_header_id|>\n\n{user}<|eot_id|>"
+                    f"<|start_header_id|>assistant<|end_header_id|>\n\n")
+        return build, "<|eot_id|>"
+    if prompt_format in ("qwen3.5", "qwen3.5-nothink"):
+        nothink = "<think>\n\n</think>\n\n" if prompt_format.endswith("-nothink") else ""
+        def build(user, system=None):
+            sys_part = f"<|im_start|>system\n{system}<|im_end|>\n" if system else ""
+            return (f"{sys_part}<|im_start|>user\n{user}<|im_end|>\n"
+                    f"<|im_start|>assistant\n{nothink}")
+        return build, "<|im_end|>"
     if prompt_format == "auto":
         return ((lambda user, system=None: model.default_chat_prompt(user, system_prompt=system)),
                 turn_end_token(tokenizer))
     raise ValueError(f"unknown prompt-format '{prompt_format}' "
-                      f"(expected auto/mistral/metharme/gemma4-nothink)")
+                      f"(expected auto/mistral/metharme/gemma4-nothink/llama3/"
+                      f"qwen3.5/qwen3.5-nothink)")
 
 
 # Stage directions / inline actions, e.g. "[as CAMBIO]", "[TRINCULO grabs ...]",
@@ -1096,7 +1137,8 @@ def _run_main():
                          "supervised response; --instruction/context/response-key "
                          "are ignored.")
     ap.add_argument("--prompt-format",
-                    choices=["auto", "mistral", "metharme", "gemma4-nothink"],
+                    choices=["auto", "mistral", "metharme", "gemma4-nothink",
+                             "llama3", "qwen3.5", "qwen3.5-nothink"],
                     default="auto",
                     help="Chat format. auto: the model's native template "
                          "(Llama-3, Mistral [INST], mistral3 [SYSTEM_PROMPT]/[INST]). "
@@ -1105,8 +1147,15 @@ def _run_main():
                          "Pygmalion <|user|>{q}<|model|>{a}</s>. gemma4-nothink: "
                          "<|turn>user\\n{q}<turn|>\\n<|turn>model\\n<|channel>thought\\n"
                          "<channel|>{a} with the thought span pre-closed empty (no "
-                         "reasoning trained). EOS ends the turn for mistral/metharme; "
-                         "<turn|> ends the turn for gemma4-nothink.")
+                         "reasoning trained). llama3: explicit Llama-3 headers "
+                         "(= auto for the llama arch). qwen3.5: plain ChatML "
+                         "(= auto for qwen3/3.5; use when responses carry their own "
+                         "<think> spans). qwen3.5-nothink: ChatML with an empty "
+                         "<think>\\n\\n</think>\\n\\n pre-closed in the masked prompt, "
+                         "matching the inference-side no-think prefill. "
+                         "EOS ends the turn for mistral/metharme; <turn|> for "
+                         "gemma4-nothink; <|eot_id|> for llama3; <|im_end|> for "
+                         "qwen3.5/qwen3.5-nothink.")
     ap.add_argument("--clean-text", action="store_true",
                     help="Strip [stage directions]/*actions* and normalize "
                          "whitespace before training (OFF by default). Helps "
@@ -1416,6 +1465,11 @@ def _run_main():
         offload_activations=args.offload_activations, use_liger=args.use_liger,
     )
     net.train()
+    if args.pack and getattr(net, "has_gdn", False):
+        raise SystemExit(
+            "--pack is not supported on GatedDeltaNet (Qwen3.5/3.6) models: the "
+            "linear-attention recurrence and causal conv would carry state "
+            "across packed document boundaries. Drop --pack and train unpacked.")
     if args.head_vocab_chunk and net._head_slice is None:
         print(" -- note: --head-vocab-chunk set but this head can't slice; using "
               "the single-shot fused head.")

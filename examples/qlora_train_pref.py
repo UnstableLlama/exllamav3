@@ -422,7 +422,8 @@ def _run_main():
     ap.add_argument("--label-key", default="label",
                     help="(kto) bool/int column; truthy = desirable")
     ap.add_argument("--prompt-format",
-                    choices=["auto", "mistral", "metharme", "gemma4-nothink"],
+                    choices=["auto", "mistral", "metharme", "gemma4-nothink",
+                             "llama3", "qwen3.5", "qwen3.5-nothink"],
                     default="auto")
     ap.add_argument("--max-samples", type=int, default=0, help="0 = all rows")
     ap.add_argument("--shuffle", action="store_true")

@@ -140,7 +140,8 @@ def _run_main():
                          "turn is the prompt and the assistant turn the supervised "
                          "response; the flat instruction/response keys are ignored.")
     ap.add_argument("--prompt-format",
-                    choices=["auto", "mistral", "metharme", "gemma4-nothink"],
+                    choices=["auto", "mistral", "metharme", "gemma4-nothink",
+                             "llama3", "qwen3.5", "qwen3.5-nothink"],
                     default="auto",
                     help="Chat format. auto: the model's native template "
                          "(Llama-3, Mistral [INST], mistral3 [SYSTEM_PROMPT]/[INST]). "
@@ -149,7 +150,10 @@ def _run_main():
                          "Pygmalion <|user|>{q}<|model|>{a}</s>. gemma4-nothink: "
                          "<|turn>user\\n{q}<turn|>\\n<|turn>model\\n<|channel>thought\\n"
                          "<channel|>{a} with the thought span pre-closed empty (no "
-                         "reasoning trained).")
+                         "reasoning trained). llama3: explicit Llama-3 headers "
+                         "(= auto for the llama arch). qwen3.5: plain ChatML "
+                         "(= auto for qwen3/3.5). qwen3.5-nothink: ChatML with an "
+                         "empty <think> block pre-closed in the masked prompt.")
     ap.add_argument("--clean-text", action="store_true",
                     help="Strip [stage directions]/*actions* + normalize whitespace "
                          "(OFF by default; leave off for reasoning/code/markdown).")
@@ -354,6 +358,11 @@ def _run_main():
         attn_impl=args.attn_impl, head_vocab_chunk=args.head_vocab_chunk,
     )
     net.train()
+    if args.pack and getattr(net, "has_gdn", False):
+        raise SystemExit(
+            "--pack is not supported on GatedDeltaNet (Qwen3.5/3.6) models: the "
+            "linear-attention recurrence and causal conv would carry state "
+            "across packed document boundaries. Drop --pack and train unpacked.")
     if is_main(rank):
         ms = net.modules_to_save_parameters()
         print(f" -- world_size {world_size}, trainable params: "
