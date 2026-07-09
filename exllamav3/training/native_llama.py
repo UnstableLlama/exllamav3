@@ -501,8 +501,10 @@ class NativeLlamaQLoRA(nn.Module):
             wrappers.append(w)
             return w
 
+        has_mrope = False
         for blk in blocks:
             backbone.assert_block_supported(blk)
+            has_mrope = has_mrope or backbone.attn_has_mrope(blk)
             meta = backbone.block_metadata(blk)
             is_moe = meta.get("mlp_kind", "dense") == "moe"
             if is_moe:
@@ -614,6 +616,11 @@ class NativeLlamaQLoRA(nn.Module):
                       f"({n_exp} experts/layer). If the adapter count is too "
                       f"large, set --expert-r (PEFT's MoE recipe uses "
                       f"~r/num_experts, min 1).")
+        if has_mrope:
+            print(" -- note: mRoPE detected (Qwen-VL text tower); training "
+                  "TEXT-ONLY, where mRoPE reduces exactly to 1D NeoX RoPE. The "
+                  "vision tower is not built or targeted. Image+text multimodal "
+                  "fine-tuning is NOT supported (would need 3D positions).")
         if self.has_gdn and _fla_chunk_fn() is None:
             print(" -- note: GatedDeltaNet layers present but the fla package "
                   "(flash-linear-attention) is not importable; the delta rule "
@@ -822,8 +829,19 @@ class NativeLlamaQLoRA(nn.Module):
         # fp32 (position-dependent precision) and the result is cast back to x's
         # dtype, so a bf16 activation stays bf16 instead of being upcast to fp32.
         in_dtype = x.dtype
+        rot = 2 * inv_freq.numel()          # rotary_dim; == head_dim for full rotary
+        if rot < x.shape[-1]:
+            # Partial rotary (Qwen-VL partial_rotary_factor): rotate only the
+            # leading `rot` dims of each head, pass the trailing dims through
+            # unrotated. exllamav3 builds inv_freq over the rotary slice only
+            # (util/rope.py "default"/"mrope" case), so 2*inv_freq.numel() IS the
+            # rotary width. The recursive call hits the full-rotary branch below
+            # (rot == x_rot.shape[-1]); for full-rotary models rot == head_dim so
+            # there is no split and behavior is byte-identical to before.
+            x_rot = self._apply_rope(x[..., :rot], inv_freq, attn_factor, position_ids)
+            return torch.cat((x_rot, x[..., rot:]), dim=-1)
         xf = x.float()
-        freqs = position_ids.float().unsqueeze(-1) * inv_freq.float().unsqueeze(0).unsqueeze(0)  # [b,t,hd/2]
+        freqs = position_ids.float().unsqueeze(-1) * inv_freq.float().unsqueeze(0).unsqueeze(0)  # [b,t,rot/2]
         emb = torch.cat((freqs, freqs), dim=-1)                  # [b,t,hd]  (NeoX layout)
         cos = (emb.cos() * attn_factor).unsqueeze(2)             # [b,t,1,hd]
         sin = (emb.sin() * attn_factor).unsqueeze(2)

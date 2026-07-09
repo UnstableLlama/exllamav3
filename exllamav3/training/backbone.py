@@ -125,8 +125,9 @@ def assert_block_supported(block):
     expert + sigmoid shared gate (Qwen3-MoE, Qwen3.5-MoE) and the Gemma4 MoE
     layout (alt residual channel + router/routed/shared extra norms). What it
     still cannot do is rejected here: fused-qkvz GatedDeltaNet (the Qwen3-Next
-    layout), ds3/dots-router MoE, headwise attention gating (g_proj), mRoPE,
-    partial rotary, and non-NeoX RoPE.
+    layout), ds3/dots-router MoE, headwise attention gating (g_proj),
+    and non-NeoX RoPE. mRoPE and partial rotary (Qwen-VL text towers) are
+    ACCEPTED for text-only training -- see the notes at the assertions below.
     """
     from ..modules import GatedMLP, Attention, SlidingAttention
     key = getattr(block, "key", "?")
@@ -172,11 +173,35 @@ def assert_block_supported(block):
         f"{key}: headwise attention gating (g_proj) is not supported"
     assert attn.rope is not None and attn.rope.inv_freq is not None, \
         f"{key}: model loaded without a RoPE table; cannot build positional encoding"
-    assert attn.rope.mrope_section is None, f"{key}: mRoPE is not supported"
+    # mRoPE (Qwen2/3-VL text towers) is ACCEPTED for text-only training. mRoPE
+    # only differs from ordinary 1D NeoX RoPE by assigning DIFFERENT position
+    # indices to different frequency bands (temporal/height/width sections) --
+    # a spread that exists only for image/video tokens. For a pure-text
+    # sequence every section shares the same position, so mRoPE collapses
+    # EXACTLY to 1D RoPE, which is precisely what native_llama._apply_rope
+    # computes (one position_id per token against the loaded inv_freq). All our
+    # training paths are text-only, so no forward-math change is needed; the
+    # native validate gate confirms the forward still matches the (mRoPE-aware)
+    # inference oracle. Actual image+text multimodal fine-tuning would need true
+    # per-token 3D positions and the vision tower -- a separate project.
     assert attn.rope.rope_settings.rope_style.name == "NEOX", \
         f"{key}: only NeoX-style RoPE is supported, got {attn.rope.rope_settings.rope_style.name}"
-    assert attn.rope.inv_freq.numel() * 2 == attn.head_dim, \
-        f"{key}: partial-rotary RoPE is not supported (rotary_dim != head_dim)"
+    # Partial rotary (rotary_dim < head_dim, e.g. Qwen-VL partial_rotary_factor)
+    # is supported: native_llama._apply_rope rotates the leading rotary_dim dims
+    # and passes the rest through. inv_freq is built over the rotary slice only
+    # (util/rope.py), so its width is rotary_dim; it must not exceed head_dim.
+    assert attn.rope.inv_freq.numel() * 2 <= attn.head_dim, \
+        f"{key}: rotary_dim ({attn.rope.inv_freq.numel() * 2}) exceeds " \
+        f"head_dim ({attn.head_dim})"
+
+
+def attn_has_mrope(block) -> bool:
+    """True if the block's softmax-attention RoPE carries an mRoPE section
+    (Qwen-VL text tower). Trained as text-only 1D RoPE -- see the note in
+    ``assert_block_supported``. False for GDN blocks (no rope) and plain RoPE."""
+    attn = getattr(block, "attn", None)
+    rope = getattr(attn, "rope", None)
+    return rope is not None and getattr(rope, "mrope_section", None) is not None
 
 
 def _mlp_metadata(block) -> dict:
@@ -212,6 +237,22 @@ def _mlp_metadata(block) -> dict:
     return meta
 
 
+def _frozen_normal(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Materialize a frozen loaded tensor as a NORMAL (non-inference) tensor.
+
+    The native model is loaded under ``torch.inference_mode``, so its weights are
+    "inference tensors" that autograd refuses to save for backward. Most reach
+    the differentiable forward through arithmetic (casts / adds) that happens to
+    launder them, but that laundering is a NO-OP whenever the op is a no-op --
+    ``w.to(compute_dtype)`` when the stored dtype already equals it,
+    ``w.float()`` when the weight is already fp32 -- and the raw inference tensor
+    then reaches an autograd op and dies ("Inference tensors cannot be saved for
+    backward"). A one-time ``detach().clone()`` at spec-build makes a normal,
+    still-frozen tensor regardless of dtype; cheap (norm/conv tensors are small)
+    and dtype-independent, so it can't silently regress on a future dtype combo."""
+    return None if t is None else t.detach().clone()
+
+
 def block_metadata(block) -> dict:
     """
     Plain-data description of one decoder block's attention / RoPE / norm config,
@@ -232,6 +273,12 @@ def block_metadata(block) -> dict:
                            attn.conv1d_v_weight], dim=0)
         if w.dim() == 3:
             w = w.squeeze(1)
+        # Launder the frozen GDN tensors out of inference-mode (see
+        # _frozen_normal): conv1d_weight/bias reach F.conv1d raw, and
+        # weight.to(x.dtype) is a no-op when the loaded dtype == the compute
+        # dtype (bf16), so without this the inference tensor reaches conv1d and
+        # backward dies. a_log/dt_bias are laundered defensively too.
+        _normal = _frozen_normal
         return {
             "kind": "gdn",
             "num_k_heads": attn.num_k_heads,
@@ -240,10 +287,10 @@ def block_metadata(block) -> dict:
             "v_head_dim": attn.v_head_dim,
             "conv_kernel_size": attn.conv_kernel_size,
             "beta_scale": float(attn.beta_scale),
-            "a_log": attn.a_log,                 # [nv]
-            "dt_bias": attn.dt_bias,             # [nv]
-            "conv1d_weight": w,                  # [2*k_dim + v_dim, kernel]
-            "conv1d_bias": attn.conv1d_bias,     # [2*k_dim + v_dim] or None
+            "a_log": _normal(attn.a_log),        # [nv]
+            "dt_bias": _normal(attn.dt_bias),    # [nv]
+            "conv1d_weight": _normal(w),         # [2*k_dim + v_dim, kernel]
+            "conv1d_bias": _normal(attn.conv1d_bias),  # [2*k_dim + v_dim] or None
             # MLP half (activation + dense/moe description).
             **_mlp_metadata(block),
             "layer_scalar": getattr(block, "layer_scalar_f", None),
@@ -293,7 +340,8 @@ def norm_spec(norm) -> Optional[dict]:
     assert isinstance(norm, RMSNorm), \
         f"native forward only supports RMSNorm, got {type(norm).__name__}"
     return {
-        "weight": None if getattr(norm, "unweighted", False) else norm.weight,
+        "weight": None if getattr(norm, "unweighted", False)
+                  else _frozen_normal(norm.weight),
         "eps": norm.rms_norm_eps,
         "bias": float(getattr(norm, "constant_bias", 0.0)),
         "scale": float(getattr(norm, "constant_scale", 1.0)),
@@ -374,7 +422,7 @@ def gdn_norm_spec(block) -> dict:
     assert isinstance(norm, GatedRMSNorm), \
         f"expected GatedRMSNorm on GatedDeltaNet, got {type(norm).__name__}"
     return {
-        "weight": norm.weight,
+        "weight": _frozen_normal(norm.weight),
         "eps": norm.rms_norm_eps,
         "bias": float(getattr(norm, "constant_bias", 0.0)),
         "scale": 1.0,
