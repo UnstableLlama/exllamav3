@@ -5,6 +5,7 @@ from ..model.config import Config
 from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2, g_tensor_cache
 from . import Module, Linear, RMSNorm, LayerNorm
+from .linear import has_runtime_lora
 from ..constants import PAGE_SIZE
 from flash_attn import flash_attn_func, flash_attn_with_kvcache, flash_attn_varlen_func
 from .multilinear import MultiLinear
@@ -501,7 +502,10 @@ class SlidingAttention(Module):
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
         bsz, q_len, dim = x.shape
 
-        if self.multi_qg is None or bsz * q_len > 32:
+        # The fused mgemm paths bypass Linear.forward, which is what applies a
+        # runtime LoRA -- fall back to the per-linear path while one is loaded.
+        if self.multi_qg is None or bsz * q_len > 32 \
+                or has_runtime_lora(self.q_proj, self.g_proj):
             q = self.q_proj.forward(x, params)
             if self.g_proj:
                 g = self.g_proj.forward(x, params)
@@ -535,7 +539,8 @@ class SlidingAttention(Module):
             q = qg[0].view(bsz, q_len, self.num_q_heads * self.head_dim)
             g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
 
-        if self.multi_kv is None or bsz * q_len > 32:
+        if self.multi_kv is None or bsz * q_len > 32 \
+                or has_runtime_lora(self.k_proj, self.v_proj):
             k = self.k_proj.forward(x, params)
             v = self.v_proj.forward(x, params)
 

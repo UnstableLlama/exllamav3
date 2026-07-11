@@ -11,6 +11,19 @@ from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 
 
+def has_runtime_lora(*linears) -> bool:
+    """
+    True when any of the given Linear modules currently carries a runtime LoRA
+    (tensors registered by ``model.lora.LoRA``). The fused multi-linear decode
+    kernels (``exl3_mgemm`` / BC graphs) read the trellis storage directly and
+    never see these tensors, so any fused branch over modules for which this
+    returns True must fall back to the per-linear ``Linear.forward`` path or
+    the adapter is silently dropped. ``None`` entries are allowed (optional
+    projections like g_proj).
+    """
+    return any(l is not None and l.lora_a_tensors for l in linears)
+
+
 class Linear(Module):
 
     def __init__(
