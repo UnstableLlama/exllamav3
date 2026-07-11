@@ -3054,15 +3054,66 @@ declined that check. **`ste`** mode untested (only `noise` ran), but it would
 now have to beat early-stopping. If quant-aware is ever revisited, 2.5bpw +
 `ste` is the only lane with a chance.
 
-**Reusable artifact built:** `merge_lora_bf16.py` (currently in the session
-scratchpad, NOT committed) — folds a PEFT/native default-init adapter into
+**Reusable artifact built:** `training/merge_lora_bf16.py` (**committed to master
+via PR #139**, `81fdd77`) — folds a PEFT/native default-init adapter into
 bf16 HF weights (`W += (α/r)·B@A`, preserves shard layout so `convert.py`
 consumes the output directly). Construction-validated (untouched tensors
 bit-identical; target delta matches `B@A`). This is the missing
-merge-and-requantize deploy tool referenced since Session 3; worth committing
-to `training/` if the deploy path is wanted. **PiSSA adapters need the 2r
-offset form** — the script asserts on a rank mismatch rather than
+merge-and-requantize deploy tool referenced since Session 3. **PiSSA adapters
+need the 2r offset form** — the script asserts on a rank mismatch rather than
 mis-merging.
+
+### Session 26 — Gemma4-MoE routed-expert TRAINING SMOKE — PASS (alt-residual arch)
+
+> No branch/commit yet — a box smoke, not a code change (master @ `81fdd77`,
+> PR #139 in). Closes the last MoE-training box item from Session 21 (box list
+> item 3) / Session 23 ("still open"): the routed-expert QLoRA path on the
+> **Gemma4 alt-residual MoE**, the analogue of the Session-23 Qwen3.6 smoke.
+> Model `/mnt/two/weights/dr-house_mdzerofata-gemma4-G4-MeroMero-26B-A4B-4.45bpw-exl3`
+> (30L×128e top-8, 5 global head_dim-512 layers, VL text tower), semancy,
+> `--parallel split --use-per-device 8 23` + `expandable_segments`,
+> `--prompt-format gemma4-nothink`, r32/α64 **`--expert-r 2`**, targets = 7
+> defaults + `expert_{gate,up,down}_proj`, seq-len 2048, batch 2, 20 steps.
+
+- **Param count (routed experts fire):** 119,930,880 trainable. Saved adapter =
+  23,450 tensors, **23,040 routed-expert** = 30L × 128e × 3proj × 2 (A+B) exactly
+  — none dropped. `expert-r 2` on the alt-residual expert keys
+  (`...language_model.layers.N.experts.K.{gate,up,down}_proj.lora_A/B`, VL
+  `language_model` prefix). `adapter_config.json` carries the corrected Gemma4
+  `rank_pattern` `.*\.experts\.\d+\..*` → 2 (the `\d+` form keeps shared_expert
+  out; Gemma4 expert keys have no `.mlp.` segment). **The 410 (not 420)
+  non-expert tensors is self-consistent:** the 5 global layers use
+  `attention_k_eq_v` (k-as-v) so have no separate `v_proj` → 30L×7×2 − 5×2 = 410.
+- **MoE wiring correct:** startup prints `[moe: 30 layers x 128 experts, top-8]`
+  and `attn: 25×flash, 5×sdpa` (the 5 global head_dim-512 layers take the
+  big-head SDPA-math branch, Session 8/21).
+- **Trains healthy:** first loss 3.08 (NOT ~11 random → gemma4-nothink masking
+  correct on the alt-residual arch without a separate `--inspect`), ema
+  3.76→3.22, `|dB|` climbs 0→6.57 monotonically, grad norms ~50–115. One step-3
+  roughness (loss 7.89, grad 1129) self-recovered by step 4 — cold-AdamW + high
+  LR, benign. Coherent throughout. Peak VRAM **9.56 / 15.90 GB** (starve-split
+  worked; head on cuda:1).
+- **Save → `--resume` round-trip PASS:** checkpoints at step 10 & 20; resume
+  restored **11,725 adapter pairs** (= 23,450 tensors / 2) + trainer state
+  ("continuing at step 21/23", cold AdamW as expected). Decisive: `|dB|` is
+  **continuous across the boundary** (6.574 at step 20 → 6.726 → 7.013) — the
+  adapter weights were genuinely restored, not reinitialized. Same two gotchas as
+  Session 23 (`--steps` is ABSOLUTE so resume a step-20 ckpt needs `--steps>20`;
+  resume restarts the data iterator → step-21 loss dipped to 1.98 on re-seen
+  early rows, benign).
+- **Dequant share (MoE cost):** `--profile-dequant 3` → 82,581 reconstructions,
+  **7.607 s/step = 41% of step wall**. Lower absolute than Qwen3.6's 21.56 s/step
+  (30L×128e vs 40L×256e) but the same MoE-dequant-dominates story — reinforces
+  backlog A1 as the MoE win. Step wall bwd-dominated (fwd 29% / bwd 67% / opt 4%).
+- **Gotcha (recorded):** the single-process `qlora_train_native.py` takes `--r`,
+  NOT `--lora-r` — `--lora-r` is the DDP-script rename (torchrun abbrev-eats
+  `--r`). First launch errored `unrecognized arguments: --lora-r 32`.
+
+**Still open (next box session):** a real Qwen3.6-35B-A3B **SFT + eval-split**
+run (`--eval-split test --save-best --profile-dequant`; A/B attention+shared vs
++experts on held-out loss) — the first *real* MoE training result vs a smoke;
+then S16 DPO/KTO smokes; MoE validate-gate improvement; backlog #10 fused-kernel
+LoRA perf.
 
 ---
 
