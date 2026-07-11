@@ -45,6 +45,12 @@ class LinearEXL3:
 
         if bias is not None and bias.dtype == torch.float: bias = bias.to(torch.half)
 
+        # Not a Module subclass, so the config-or-NullConfig default doesn't apply here; TP imports pass
+        # config=None and forward() reads config.infer_params
+        if config is None:
+            from ...model.config import NullConfig
+            config = NullConfig()
+        self.config = config
         self.transformers_fix = transformers_fix
         self.key = key
 
@@ -116,7 +122,7 @@ class LinearEXL3:
         reconstruct = params.get("reconstruct")
         if not reconstruct:
             rows = x.numel() // x.shape[-1]
-            if rows <= AUTO_RECONSTRUCT_THRESHOLD:
+            if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
                 dtype = out_dtype or self.default_out_dtype
                 return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
 
