@@ -35,6 +35,11 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
   Run this FIRST on any new model/architecture.
 - `qlora_infer_native.py` — before/after generation with an adapter on the
   native inference path.
+- `merge_lora_bf16.py` — fold a trained adapter into the unquantized bf16 HF
+  weights (`W += (alpha/r)·B@A`, matching the inference loader), preserving the
+  shard layout so `convert.py` can requantize the result. This is the
+  merge-and-requantize deploy path (baked-in adapter, no runtime LoRA). Default
+  and pissa inits; rejects mixed-rank (`rank_pattern`) adapters.
 - `qlora_train_bnb.py` — the bitsandbytes-NF4 comparison arm (matched
   benchmark harness; needs its own transformers+peft+bitsandbytes venv).
 - `experiments/` — one-off, experiment-specific tooling (dataset generation,
