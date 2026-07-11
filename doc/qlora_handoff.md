@@ -53,20 +53,28 @@
    applied on the fused MoE expert path at inference (the loader now warns);
    an expert-adapter inference demo needs a per-expert fallback or a
    post-mgemm LoRA add — merge-path deployment unaffected.
-1. **Quantization-aware LoRA — BUILT (Session 17), box A/B pending.**
-   `--quant-aware {noise,ste}` implements the two tractable directions from
-   the original item (noise injection on the frozen-weight closure, and a
-   straight-through proxy of the requantize step); QA-LoRA's own group-wise
-   operator was evaluated and ruled out for a trellis base (decision record
-   in the Session 17 notes). What remains is the box work: the same-seed
-   A/B/A2 (off vs noise vs ste) with the eval split ON, judged on held-out
-   loss after a real merge-and-requantize — see the Session 17 box list.
-   **PREREQUISITE (Session 24) — DONE:** the fused-decode runtime-LoRA fix is
-   box-verified & merged, so generation-based judgments of any adapter on an
-   EXL3 base are valid again (before it they were not — the Session-3
-   "attenuated LoRA on quant" evidence that partly motivated this item was an
-   inference artifact, and the first noise-mode box test looked like a no-op
-   because of it). The A/B/A2 can now proceed on the fixed path.
+1. **Quantization-aware LoRA — BUILT (Session 17), BOX-TESTED + SHELVED
+   (Session 25, verdict: not worth it).** `--quant-aware {noise,ste}` was
+   built (noise injection on the frozen-weight closure + a straight-through
+   proxy of the requantize step; QA-LoRA's own group-wise operator ruled out
+   for a trellis base — decision record in the Session 17 notes). **The box
+   A/B ran in Session 25 (3bpw, Llama-3.2-3B, semancy) and the user decided
+   to SCRAP it.** Headline: a plain **early-stopped** adapter matched
+   quant-aware `noise` on held-out loss AND quantized *better* (KL 0.058 vs
+   0.070) for less compute — the KL "win" of noise over an overtrained plain
+   arm was overfitting-regularization, which early-stopping does better. The
+   whole motivation (LoRAs weak on quants) was the Session-24 decode bug, now
+   fixed. The `code` (flags, `quant_aware.py`, tests, run-log fields) is
+   **MARKED FOR PROBABLE REMOVAL** — left in the tree for now as a documented
+   negative result, and pulled from the fork README (Session 25); rip it out
+   (trainer flags, `training/quant_aware.py`, `tests/test_quant_aware.py`,
+   YAML launcher keys, run-log schema fields, `adapter_config` provenance
+   keys) in a later cleanup unless the 2.5bpw+`ste` lane is ever pursued. Only untested
+   rescue path was 2.5bpw (S17 predicted the payoff grows as bpw drops); the
+   user declined it. `ste` mode also untested, but the bar is now
+   early-stopping, which is high. Full write-up: Session 25 notes. The
+   fused-decode runtime-LoRA prerequisite (Session 24) is done, so runtime
+   adapters on EXL3 bases do fire.
 2. **Near-inference-time training pipeline on KTO/DPO** (the reason Session 16
    built preference training): a workflow where preference signal collected at
    serving time feeds short adapter updates against the exact deployed quant.
@@ -2988,6 +2996,73 @@ on the box (Llama-3.2-1B/3B 4bpw, native infer path):
 5. **Fused-kernel LoRA perf follow-up** (new backlog item) — add the LoRA delta
    on top of the fused mgemm instead of falling back to the per-linear path, to
    recover most of the ~60% while-adapted decode hit measured above.
+
+---
+
+### Session 25 — BOX A/B on quant-aware LoRA → SHELVED (early-stopping wins)
+
+> No branch/commit — an experiment, not a code change. The `--quant-aware`
+> feature (Session 17) got its first-ever box run and its decision A/B. The
+> user decided to **scrap quant-aware LoRA**. Code left in tree as a
+> documented negative result. Experiment artifacts under `/mnt/two/qa_lora_exp/`
+> (merged bf16 + requants + KL logs); merge script in the scratchpad (see below).
+
+**Setup.** Llama-3.2-3B, deploy target **3bpw**, dataset `UnstableLlama/semancy`
+(chat `messages`; 436 train / **116-row `test` split held out** — a real
+generalization eval, not a val-frac carve). Adapters: r256/α256, **default
+init** (so merge = plain `W + (α/r)·BA`), lr **5e-5**, 2 epochs (110 steps),
+`--compute-dtype bfloat16`. Deploy path judged by **merge-into-bf16 →
+requantize to 3bpw → eval**, plus **KL(quant‖its-own-bf16)** via
+`eval/model_diff.py` (wiki2, 100 rows) as the clean quant-distortion metric.
+
+**First box run of `--quant-aware` — the S17 box list items 1–2 PASS** (even
+though the feature is being shelved, the mechanics are now box-verified):
+σ measured vs the bf16 ref = **~15% relative at 3bpw** (median 14.8; on the
+S17 curve between ~6% @4bpw and ~18% @2.5bpw), and the **determinism contract
+holds** (grad norms steady ~3–7, no 1e16 blowup).
+
+**Results (all merged+requantized at matched `-b 3.0`):**
+
+| arm | test loss | `‖dB‖` | KL(quant‖bf16) | top-1 |
+|-----|-----------|--------|----------------|-------|
+| base (no adapter) | 3.533 | 0 | 0.060\* | — |
+| `none` full (overfit) | 3.043 | 9.26 | 0.1036 | 0.847 |
+| `noise` (quant-aware) | 2.817 | 9.29 | 0.0705 | 0.866 |
+| **`none` early-stop @40** | 2.853 | 5.26 | **0.0576** | 0.876 |
+
+\*base KL has a convert-settings caveat (`/3/` predates the `-b 3.0` run); the
+other three are matched. Merge+requant was ~**lossless on task loss** for both
+full arms (none 3.043→3.035, noise 2.817→2.813) — the deploy degradation the
+S17 thesis worried about did NOT show up on task loss at 3bpw; it only showed
+in KL.
+
+**Verdict — scrap.** The plain **early-stopped** adapter matched `noise` on
+generalization (2.853 vs 2.817) AND quantized *better* (KL 0.0576 vs 0.0705,
+≈ the base model's own 3bpw distortion) for less than half the compute and no
+QA machinery. The real driver of quant-fragility was **overfitting** (r256 on
+436 rows → sharp, quant-fragile directions, KL 0.104), not quantization
+geometry: `noise` only *partially* undid it (regularization, 0.104→0.070),
+while early-stopping avoids it entirely (0.104→0.058). So `noise`'s apparent
+"win" over the overtrained plain arm was regularization all along, and the
+vanilla regularizer does it better. Combined with the Session-24 finding
+(QA's original motivation — weak LoRAs on quants — was the fused-decode bug,
+now fixed), quant-aware LoRA has no remaining justification here.
+
+**Caveats / not covered:** single regime (3bpw, one 436-row dataset, r256);
+S17 predicted the payoff grows at **2.5bpw** (~3× quant error) — the user
+declined that check. **`ste`** mode untested (only `noise` ran), but it would
+now have to beat early-stopping. If quant-aware is ever revisited, 2.5bpw +
+`ste` is the only lane with a chance.
+
+**Reusable artifact built:** `merge_lora_bf16.py` (currently in the session
+scratchpad, NOT committed) — folds a PEFT/native default-init adapter into
+bf16 HF weights (`W += (α/r)·B@A`, preserves shard layout so `convert.py`
+consumes the output directly). Construction-validated (untouched tensors
+bit-identical; target delta matches `B@A`). This is the missing
+merge-and-requantize deploy tool referenced since Session 3; worth committing
+to `training/` if the deploy path is wanted. **PiSSA adapters need the 2r
+offset form** — the script asserts on a rank mismatch rather than
+mis-merging.
 
 ---
 

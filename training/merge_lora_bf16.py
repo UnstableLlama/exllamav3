@@ -1,0 +1,109 @@
+#!/usr/bin/env python
+"""Merge a trained LoRA adapter into bf16 HF weights (the merge-and-requantize
+deploy path).
+
+For each adapted linear:
+
+    W_merged = W + scale * (lora_B @ lora_A)          # [out,in] += [out,r]@[r,in]
+    scale    = user_scaling * alpha / (sqrt(r) if rslora else r)
+
+This exactly replicates what ``exllamav3.model.lora.LoRA.from_directory`` applies
+at inference (same global ``alpha/r`` scale over the exported tensors), so the
+merged model reproduces the runtime-adapter behavior up to bf16 storage rounding.
+Output preserves the base model's exact shard layout + index, so ``convert.py``
+consumes it directly for requantization.
+
+Supports **default** and **pissa** inits (pissa exports the rank-2r combined
+``[A|A0] / [s·B;-s·B0]`` form with the scale baked into B and config ``r``
+unchanged, so the same ``alpha/r`` merge is correct). **Rejects** adapters with a
+PEFT ``rank_pattern``/``alpha_pattern`` (e.g. mixed-rank MoE ``expert_r``): those
+need per-module scales this single-scale merge would get wrong. Only touches
+linear ``lora_A``/``lora_B`` tensors — head/embed LoRA sidecars are not handled.
+
+Usage:
+    python training/merge_lora_bf16.py \
+        --base /path/to/bf16-hf-model --adapter out/my_adapter --out out/merged
+    python convert.py -i out/merged -o out/merged-3bpw -w /tmp/work -b 3.0 -d 0
+"""
+import argparse, json, os, shutil, re
+import torch
+from safetensors.torch import load_file, save_file
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--base", required=True, help="Unquantized bf16/fp16 HF model dir")
+    ap.add_argument("--adapter", required=True, help="Trained adapter dir (PEFT format)")
+    ap.add_argument("--out", required=True, help="Output HF dir for the merged model")
+    ap.add_argument("--scaling", type=float, default=1.0,
+                    help="Extra user scaling on top of alpha/r (matches "
+                         "LoRA.from_directory's lora_scaling; default 1.0)")
+    args = ap.parse_args()
+
+    cfg = json.load(open(os.path.join(args.adapter, "adapter_config.json")))
+    if cfg.get("rank_pattern") or cfg.get("alpha_pattern"):
+        raise SystemExit(
+            " !! adapter has a rank_pattern/alpha_pattern (mixed-rank, e.g. MoE "
+            "expert_r) -- this single-scale merge would mis-scale those modules. "
+            "Not supported.")
+    r = int(cfg["r"]); alpha = float(cfg["lora_alpha"])
+    use_rslora = bool(cfg.get("use_rslora", False))
+    scale = args.scaling * (alpha / (r ** 0.5 if use_rslora else r))
+    print(f"adapter r={r} alpha={alpha} rslora={use_rslora} init={cfg.get('init_lora','default')} "
+          f"-> merge scale={scale:.6f}")
+
+    # Collect lora_A/lora_B per module: base_model.model.<module>.lora_{A,B}.weight
+    ad = load_file(os.path.join(args.adapter, "adapter_model.safetensors"))
+    mods: dict[str, dict[str, torch.Tensor]] = {}
+    for k, t in ad.items():
+        m = re.match(r"base_model\.model\.(.+)\.lora_([AB])\.weight$", k)
+        if not m:
+            print(f"  note: skipping non-lora_A/B tensor {k}")
+            continue
+        mods.setdefault(m.group(1), {})[m.group(2)] = t
+    weight_of_mod = {}  # HF weight key -> module key
+    for mod, ab in mods.items():
+        assert "A" in ab and "B" in ab, f"{mod}: missing lora_A or lora_B"
+        assert ab["A"].shape[0] == ab["B"].shape[1], \
+            f"{mod}: rank mismatch A{tuple(ab['A'].shape)} B{tuple(ab['B'].shape)}"
+        weight_of_mod[f"{mod}.weight"] = mod
+    print(f"merging {len(weight_of_mod)} weights")
+
+    os.makedirs(args.out, exist_ok=True)
+    idx = json.load(open(os.path.join(args.base, "model.safetensors.index.json")))
+    shard_of: dict[str, list[str]] = {}
+    for wk, shard in idx["weight_map"].items():
+        shard_of.setdefault(shard, []).append(wk)
+
+    merged = 0
+    for shard, keys in shard_of.items():
+        sd = load_file(os.path.join(args.base, shard))
+        touched = False
+        for wk in keys:
+            if wk not in weight_of_mod:
+                continue
+            ab = mods[weight_of_mod[wk]]
+            delta = scale * (ab["B"].float() @ ab["A"].float())   # [out,in]
+            W = sd[wk]
+            assert delta.shape == W.shape, f"{wk}: delta{tuple(delta.shape)} != W{tuple(W.shape)}"
+            sd[wk] = (W.float() + delta).to(W.dtype)
+            merged += 1
+            touched = True
+        save_file(sd, os.path.join(args.out, shard), metadata={"format": "pt"})
+        print(f"  wrote {shard} ({'merged' if touched else 'verbatim'})")
+    assert merged == len(weight_of_mod), \
+        f"merged {merged} weights but adapter has {len(weight_of_mod)} " \
+        f"(a target module was missing from the base index?)"
+
+    # Copy every non-shard file verbatim (config, tokenizer, index, ...).
+    shard_names = set(shard_of)
+    for fn in os.listdir(args.base):
+        p = os.path.join(args.base, fn)
+        if fn not in shard_names and os.path.isfile(p):
+            shutil.copy2(p, os.path.join(args.out, fn))
+    print(f"done: {merged} weights merged into {args.out}")
+
+
+if __name__ == "__main__":
+    main()
