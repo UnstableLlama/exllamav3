@@ -31,7 +31,11 @@
 > priority first, per the 2026-07 direction.
 
 0. **MoE training (Qwen3.5 family + Gemma4 MoE) — BUILT (Sessions 18 + 20 +
-   21), box gates pending.** The native forward now covers the full Qwen3.5
+   21) and FORWARD-GATED (Session 22): forward + backward box-verified on
+   Qwen3.5-2B (GDN), Qwen3.6-35B-A3B (GDN+MoE) and a Gemma4-MoE finetune, plus
+   a clean GDN training smoke and new VL text-tower support. What remains is
+   MoE training smokes with routed-expert adapters + real SFT runs — see the
+   Session 22 notes.** The native forward now covers the full Qwen3.5
    family — the hybrid GDN + gated-attention layers (Session 18: fla
    `chunk_gated_delta_rule` on CUDA bf16/fp16, sequential fp32 reference
    elsewhere) and the Qwen3.5-MoE / Qwen3-MoE BlockSparseMLP (Session 20:
@@ -45,7 +49,7 @@
    quants, then first training runs — see the Session 18 / 20 / 21 box
    lists. Still not covered: Qwen3-Next (fused qkvz layout), sample packing
    on GDN models (rejected loudly; train unpacked — plain Qwen3-MoE and
-   Gemma4 MoE pack fine). Also open (Session 22): runtime LoRA is NOT
+   Gemma4 MoE pack fine). Also open (Session 24): runtime LoRA is NOT
    applied on the fused MoE expert path at inference (the loader now warns);
    an expert-adapter inference demo needs a per-expert fallback or a
    post-mgemm LoRA add — merge-path deployment unaffected.
@@ -57,11 +61,12 @@
    in the Session 17 notes). What remains is the box work: the same-seed
    A/B/A2 (off vs noise vs ste) with the eval split ON, judged on held-out
    loss after a real merge-and-requantize — see the Session 17 box list.
-   **PREREQUISITE (Session 22): verify the fused-decode runtime-LoRA fix
-   first** — generation-based judgments of any adapter on an EXL3 base were
-   invalid before it (the Session-3 "attenuated LoRA on quant" evidence that
-   partly motivated this item was an inference artifact; the first noise-mode
-   box test looked like a no-op because of it).
+   **PREREQUISITE (Session 24) — DONE:** the fused-decode runtime-LoRA fix is
+   box-verified & merged, so generation-based judgments of any adapter on an
+   EXL3 base are valid again (before it they were not — the Session-3
+   "attenuated LoRA on quant" evidence that partly motivated this item was an
+   inference artifact, and the first noise-mode box test looked like a no-op
+   because of it). The A/B/A2 can now proceed on the fixed path.
 2. **Near-inference-time training pipeline on KTO/DPO** (the reason Session 16
    built preference training): a workflow where preference signal collected at
    serving time feeds short adapter updates against the exact deployed quant.
@@ -84,6 +89,18 @@
 9. **Query-tiled big-head attention** + drop the pointless GQA
    `repeat_interleave` in the `sdpa` branch (Session 8 #1/#2; only bites at
    8k+ context on head_dim-512 layers).
+10. **Fused-kernel LoRA — recover the decode perf (Session 24 follow-up).**
+   The Session-24 fix makes runtime LoRA on an EXL3 base fall back from the
+   fused decode kernels (mgemm / BC bsz-1 graph) to the per-linear path
+   whenever an adapter is loaded — correct, but box-measured at a **~60%
+   decode tok/s hit while adapted** (1B r32 −65%, 3B r128 −59%; zero cost with
+   no adapter, `unload()` restores full speed). Follow-up: add the LoRA delta
+   **on top of** the fused mgemm output instead of falling back, so decode
+   keeps the fused k/v (and gate/up) path and only pays the two small LoRA
+   GEMVs. (BC bsz-1 stays disabled under LoRA — gate/up inject before the
+   activation.) Biggest relative win on small models where launch overhead
+   dominates. Until then: `unload()` when not steering, or deploy via
+   merge-and-requantize (no runtime adapter, no hit).
 
 ---
 
@@ -2711,15 +2728,156 @@ always-active dense path.
 4. **A real SFT + eval-split run** per the standing eval-prereq rules;
    A/B attention+shared vs +experts on held-out loss.
 
-### Session 22 — inference bug: fused decode kernels silently dropped runtime LoRA (fix + reframe)
+### Session 22 — BOX-VERIFIED: S18 GDN + S20/S21 MoE forwards on the box; VL text-tower support; GDN training smoke
 
-> Branch `claude/qlora-bitrate-update-floor-2yb7q0`. Found while investigating
-> a box report: a `--quant-aware noise` adapter on a 4 bpw base trained fine
-> (loss descended) but "applying the lora to the quant did not noticeably
-> modify its behavior". Root cause is NOT the noise mode — it is an
+> Branch `training/gdn-vl-mrope-partial-rotary` (pushed to origin). First GPU
+> box session for the Sessions 18/20/21 work. All three new differentiable
+> forwards (Gated DeltaNet, Qwen BlockSparseMLP, Gemma4 alt-residual MoE) are
+> now **box-verified correct, forward AND backward**, on real EXL3 quants —
+> plus a clean first GDN training run. Three code fixes landed (below); CPU
+> suite still 68 passed. Models used (all the user's own EXL3 quants):
+> `Qwen_Qwen3.5-2B/4` (S18, turned out to be the **VL** variant),
+> `Qwen_Qwen3.6-35B-A3B/6` (S20, 40L×256e top-8), and the
+> `dr-house...gemma4...26B-A4B-4.45bpw` finetune (S21, 30L×128e top-8).
+
+**Results (all `training/qlora_validate_native.py`):**
+- **S18 Qwen3.5-2B (dense GDN):** fp32 eager, bf16 (fla chunked kernel), and
+  `--check-backward` ALL PASS. 100% per-position argmax, cos 0.9999.
+  `describe_attn` = `6×flash, 18×gdn [gdn: fla chunked kernel]`. The hard
+  research forward (Session 18) is correct on real weights for the first time.
+- **S20 Qwen3.6-35B-A3B (GDN + MoE):** forward CORRECT, backward PASS (grads on
+  both GPUs). `--parallel split --use-per-device 18 23`.
+- **S21 Gemma4-MoE (alt residual + 4 extra norms):** forward math CORRECT (7/8
+  fp32 prompts cos 0.9999 incl. one that spiked Δ=11.9 in bf16), backward PASS.
+  Alt-residual channel + extra norms validated. `--parallel split
+  --use-per-device 8 23` + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+  (see split-balance note below).
+
+**MoE validate-gate caveat (both MoE models, NOT a bug).** The strict PASS/FAIL
+verdict is unreliable for MoE: the gate's fp32 router vs the kernel's fp16 hgemm
++ fp16 radix-sort top-k pick differently on a near-tie, and the reference oracle
+is itself non-deterministic run-to-run on those ties (directly observed: native
+flipped `young`↔`small` between identical runs). So a correct MoE forward shows
+occasional per-token divergence (up to Δ≈8-12 on one unlucky prompt while others
+are cos 0.9999) and the strict gate reports FAIL. Read MoE correctness from (a)
+fp32 with MANY prompts — most cos 0.9999, a bug corrupts ALL prompts / ties
+corrupt a few — and (b) backward PASS. **This is validation-only: training uses
+our forward consistently and never compares against the kernel, so it does not
+affect training.** Gate improvement (deferred, backlog): for MoE, report
+aggregate argmax over N prompts vs a threshold and/or exclude tokens where the
+oracle is non-deterministic.
+
+**Split-balance note (Gemma4-MoE, 26B/4.45bpw ≈ 14.5GB).** The model fits in one
+card's budget, so `--use-per-device 18 23` crammed all 30 layers on cuda:0 and
+OOM'd the fp32 head reconstruction (2.75GB) with no headroom. Fix: STARVE cuda:0
+(`--use-per-device 8 23`) so layers spill to cuda:1 and the output device keeps
+room for the head; add `expandable_segments:True`. Bigger models (Qwen3.6-35B at
+6bpw) split naturally.
+
+**GDN training smoke — PASS (Qwen3.5-2B, semancy, r32/α64, 30 steps, single GPU,
+`--prompt-format qwen3.5-nothink`).** First loss 3.02 (NOT ~11 random), EMA
+3.02→2.72, grad norms stable 17-37 (NO 1e16 determinism-blowup), `|dB|` climbs
+monotonically 0→1.58, cosine schedule exact. fla chunked kernel steady ~600
+tok/s; **backward is ~70% of step wall** (GDN fla backward dominates), **dequant
+27% of wall** (matches Session 12), peak VRAM 6.69GB, 36s. `--inspect 3` first
+confirmed the nothink prompt masking + `<|im_end|>` turn-end. The Qwen3.5/3.6
+hybrid GDN models now QLoRA-train end-to-end on EXL3.
+
+**Code changes (branch `training/gdn-vl-mrope-partial-rotary`; all
+backward-compatible, full-rotary / non-VL / CPU paths byte-identical):**
+1. **VL text-tower support — mRoPE accepted for text-only training.** The
+   `Qwen_Qwen3.5-2B/4` quant is the `Qwen3_5ForConditionalGeneration` (VL)
+   variant (text tower `model.language_model`, vision tower present but never
+   built/targeted). mRoPE differs from 1D NeoX RoPE only by giving different
+   position indices to different frequency sections (image/video); for a
+   pure-text sequence all sections share one position, so it reduces EXACTLY to
+   1D RoPE — which `native_llama._apply_rope` already computes. Relaxed the
+   `backbone.assert_block_supported` mRoPE assert + one-time startup note; the
+   validate gate confirms the forward still matches the mRoPE-aware oracle.
+   (Image+text multimodal still unsupported by design — needs 3D positions +
+   the vision forward.) **Nobody has to strip the vision tower to train the LM.**
+2. **Partial rotary** (`partial_rotary_factor < 1`, Qwen-VL = 0.25 → rotary_dim
+   64 of head_dim 256). `_apply_rope` now rotates the leading `rotary_dim =
+   2*inv_freq.numel()` dims and passes the rest through (recursion hits the
+   full-rotary branch); assert relaxed to `rotary_dim <= head_dim`.
+3. **Inference-tensor-in-backward fix (the important one — would crash ALL bf16
+   GDN/MoE training, not just VL).** Frozen conv/norm weights load under
+   `torch.inference_mode`; autograd refuses to save them for backward. The
+   laundering casts (`w.to(dtype)` / `w.float()`) are NO-OPs when the stored
+   dtype already equals the target (bf16 weight in a bf16 forward, fp32 norm on
+   the fp32 path), so the raw inference tensor reaches `F.conv1d` / the GDN
+   gated RMSNorm and backward dies ("Inference tensors cannot be saved for
+   backward"). Fixed with a shared `backbone._frozen_normal()` =
+   `detach().clone()` at spec-build in `block_metadata` (conv1d_weight/bias,
+   a_log, dt_bias) + `norm_spec` / `gdn_norm_spec` (all norms), dtype-independent
+   so it can't silently regress on a future dtype combo. Only bites in bf16, the
+   actual training dtype — so it blocked the GDN/MoE training smoke entirely and
+   was invisible to fp32 gates. Validated by the backward PASS on all three arches.
+
+**Still open (next box session):** MoE training smokes with routed-expert
+adapters (`--targets ... expert_gate_proj expert_up_proj expert_down_proj
+--expert-r <small>`) on Qwen3.6-35B-A3B / Gemma4-MoE — verify the expert-adapter
+param count, per-step dequant hit (expect much higher MoE dequant share), and a
+save → `--resume` round-trip; then a real SFT + eval-split run per the standing
+eval-prereq rules. The MoE validate-gate improvement above. Feature-test backlog
+untouched this session (S17 quant-aware A/B, S16 DPO/KTO smokes).
+
+### Session 23 — MoE routed-expert TRAINING SMOKE — PASS (Qwen3.6-35B-A3B)
+
+> Branch `training/gdn-vl-mrope-partial-rotary`. First routed-expert QLoRA
+> training run on EXL3. Model `/mnt/two/weights/Qwen_Qwen3.6-35B-A3B/6`
+> (40L×256e top-8, GDN+MoE, VL text tower), semancy, `--parallel split
+> --use-per-device 18 23` + `expandable_segments`, `--prompt-format
+> qwen3.5-nothink`, r32/α64, **`--expert-r 2`**, targets = 7 defaults +
+> `expert_gate_proj expert_up_proj expert_down_proj`. All smoke goals met.
+
+- **Param count (routed experts fire):** 195,624,960 trainable (vs 31.26M for
+  the dense-only GDN smoke). The saved adapter has 61,940 tensors, **61,440 of
+  them routed-expert** = 40L × 256e × 3proj × 2 (A+B) exactly — none dropped.
+  `expert-r 2` shapes correct (`down_proj.lora_A` `(2,512)`, `lora_B` `(2048,2)`).
+  Non-expert targets saved under GDN names (`linear_attn.in_proj_qkv/in_proj_z`)
+  — the target aliasing adapts hybrid GDN layers with the familiar q/k/v names.
+  PEFT-standard keys (`base_model...experts.N.gate_proj.lora_A.weight`).
+- **Trains healthy:** first loss 2.46 (NOT ~11 random → masking + nothink format
+  correct on Qwen3.6 without a separate `--inspect`), dropping, `|dB|` climbs
+  0→2.38 monotonically, grad norms 100–400 (cold-AdamW). Coherent base sample.
+  28/12 layer split (head on cuda:1). Peak VRAM 21.1 / 14.3 GB — comfortable.
+- **Save → `--resume` round-trip PASS:** checkpoints at `--save-every` step 10 &
+  20 (10 target types). Resume restores **30,970 adapters + trainer state** (step
+  counter + best_val; "optimizer state not restored" → cold AdamW, expected) and
+  the 195.6M param count matches. Continued training steps 21–23 ran fine.
+  **Gotcha:** `--steps` is the ABSOLUTE target, and resume restores the step
+  counter, so `--resume` a step-20 ckpt needs `--steps > 20` (it warns cleanly
+  "resume step 20 >= --steps N; nothing to do" and no-ops otherwise, doesn't
+  crash). Also `--resume` restarts the DATA ITERATOR from the seeded-shuffle
+  start (does not restore data position) → resumed steps re-see early examples
+  (loss dipped to ~0.7 on already-seen rows; benign, LR was at the cosine tail so
+  `|dB|` barely moved — measurement, not learning).
+- **Dequant share (the MoE cost characterization):** `--profile-dequant 3` →
+  **21.560 s/step = 37% of step wall** (324,660 trellis reconstructions / 3
+  steps ≈ 108k/step). vs the dense GDN smoke's **0.506 s/step** → MoE dequant is
+  **~43× higher** (every step reconstructs ~30,720 expert matrices from the
+  trellis, uncacheable at that count). Step wall otherwise bwd-dominated
+  (fwd 29% / bwd 67% / opt 3%; GDN fla backward). **This makes MoE the prime
+  target for backlog A1 (dequant 3×→1× per linear per step)** — a big win here.
+
+**Still open (next box session):** the same routed-expert smoke on **Gemma4-MoE**
+(30L×128e alt-residual; needs the starve-split `--use-per-device 8 23` +
+`expandable_segments`) to confirm the alt-residual MoE training path; then a real
+Qwen3.6-35B-A3B **SFT + eval-split** run (add `--eval-split test --save-best
+--profile-dequant`). MoE validate-gate improvement. Feature-test backlog still
+untouched (S17 quant-aware A/B, S16 DPO/KTO smokes).
+### Session 24 — BOX-VERIFIED + MERGED: fused decode kernels silently dropped runtime LoRA (fix + reframe)
+
+> Branch `claude/qlora-bitrate-update-floor-2yb7q0`, merged to master
+> 2026-07-11 alongside the GDN/VL branch (Session 22). Found while
+> investigating a box report: a `--quant-aware noise` adapter on a 4 bpw base
+> trained fine (loss descended) but "applying the lora to the quant did not
+> noticeably modify its behavior". Root cause is NOT the noise mode — it is an
 > inference-side bug that affects EVERY runtime-applied adapter on an EXL3
-> base. Container-verified (new tripwire tests + py_compile; this container
-> has no torch/GPU); **the before/after and perf checks are box work.**
+> base. Originally container-verified (tripwire tests + py_compile); **now
+> box-verified 2026-07-11 — payoff PASS and perf measured, see the box-results
+> block at the end of this section.**
 
 **The bug.** `Linear.forward` is the only place a runtime LoRA
 (`model/lora.py`, `lora_a_tensors`/`lora_b_tensors`) is applied — and the
@@ -2793,20 +2951,43 @@ free source tripwires on every guard (the failure mode is silent, so a
 refactor dropping a guard must fail loudly) + torch-gated semantics of
 `has_runtime_lora`. The end-to-end check needs the box.
 
-**Box list for next session (in order):**
-1. **The payoff check (no retraining):** re-run `qlora_infer_native.py` with
-   yesterday's noise-mode adapter, before vs after pulling this fix — if the
-   diagnosis is right, the style appears from the previously "dead" adapter.
-   Also re-try any older 4bpw adapter that under-steered.
-2. **Perf sanity:** decode tok/s with vs without the adapter loaded (expect a
-   modest hit only while loaded), and confirm no change at all with no
-   adapter.
-3. **Then re-run the Session 17 A/B/A2** (none vs noise vs ste) — both the
-   as-trained steering judgment and the merge-and-requantize judgment are
-   clean now.
+**BOX RESULTS (2026-07-11) — payoff PASS, perf worse than "modest".** Verified
+on the box (Llama-3.2-1B/3B 4bpw, native infer path):
+1. **Payoff check — PASS, decisive.** Fresh 30/40-step `--uppercase-response`
+   adapter on Llama-3.2-1B 4bpw (`out/allcaps_fixtest`, `|dB|` 0→4.6). Same
+   adapter, same 4× effective scaling, only the fix code differs:
+   **BEFORE** the fix the ADAPTED generation is normal case ≈ base (adapter
+   silently dropped at decode); **AFTER**, it SHOUTS IN CAPS. The live 🎭
+   training sample was likewise stuck normal-case because it uses
+   `apply_to_native` → the same fused decode path. Diagnosis confirmed. (The
+   caps carry UwU flavor only because the default dataset is `UwU_Alpaca` and
+   we uppercased *its* responses — irrelevant to the fix.)
+2. **Perf sanity — no-adapter path is free; while-adapted hit is LARGE, not
+   "modest".** Decode tok/s (greedy, 200 tok): 1B r32 — no-adapter 268, adapter
+   loaded 93 (**−65%**), after `unload()` 262 (−2%, noise). 3B r128 —
+   no-adapter 133, adapter loaded 54 (**−59%**), after `unload()` 133 (−0.4%).
+   So: **zero cost with no adapter** (off path behaviorally identical; base
+   generations byte-identical before/after the fix, `unload()` restores full
+   fused speed) but a **~60% decode slowdown WHILE a runtime adapter is loaded**
+   on these small models — the fallback trades the fused mgemm for per-linear
+   launches + LoRA GEMVs, worst where launch overhead dominates (small models,
+   short decode). The "modest" wording above was optimistic. Mitigations already
+   named: `unload()` when not steering, deploy via merge-and-requantize (no
+   runtime adapter), and the follow-up optimization below. **(Backlog item added
+   — see backlog "Fused-kernel LoRA (recover the decode perf)".)**
+
+**Still open after this session:**
+3. **Re-run the Session 17 A/B/A2** (none vs noise vs ste) — now that the
+   inference path is fixed, both the as-trained steering judgment and the
+   merge-and-requantize judgment are finally clean. (The `sem-no-QA` /
+   `sem-QA-LORA` r256 3B adapters on disk look like a prior A/B pair — re-judge
+   them on the fixed path.)
 4. **Re-examine Session 3 arc C** (bf16 vs 4bpw steering gap) with the fixed
    path before trusting any remaining "attenuation at 4bpw" claims — the gap
    should shrink; whatever remains is the real quant effect.
+5. **Fused-kernel LoRA perf follow-up** (new backlog item) — add the LoRA delta
+   on top of the fused mgemm instead of falling back to the per-linear path, to
+   recover most of the ~60% while-adapted decode hit measured above.
 
 ---
 
