@@ -52,7 +52,10 @@
    Gemma4 MoE pack fine). Also open (Session 24): runtime LoRA is NOT
    applied on the fused MoE expert path at inference (the loader now warns);
    an expert-adapter inference demo needs a per-expert fallback or a
-   post-mgemm LoRA add — merge-path deployment unaffected.
+   post-mgemm LoRA add — merge-path deployment unaffected. **Session 27
+   CONFIRMED this blocks expert-adapter eval/deploy** (11,520/23,040 expert
+   tensors silently dropped loading checkpoint-200); sequencing — **review
+   turbo's dev-branch refactor first**, then fix this path. See Session 27.
 1. **Quantization-aware LoRA — BUILT (Session 17), BOX-TESTED + SHELVED
    (Session 25, verdict: not worth it).** `--quant-aware {noise,ste}` was
    built (noise injection on the frozen-weight closure + a straight-through
@@ -3114,6 +3117,52 @@ run (`--eval-split test --save-best --profile-dequant`; A/B attention+shared vs
 +experts on held-out loss) — the first *real* MoE training result vs a smoke;
 then S16 DPO/KTO smokes; MoE validate-gate improvement; backlog #10 fused-kernel
 LoRA perf.
+
+### Session 27 — Gemma4-MoE semancy SFT with held-out eval → 1-epoch sweet spot; expert-inference blocker confirmed
+
+> No branch/commit for the run itself (a box experiment). Config committed:
+> `semancy_gemma_moe.yaml`. The first *real* MoE SFT with a held-out curve (vs
+> the S23/S26 smokes): the analogue of backlog item 1, run on the **Gemma4-MoE**
+> (MeroMero-26B-A4B-4.45bpw) instead of Qwen3.6. Dataset `UnstableLlama/semancy`
+> — **philosophy/epistemology chat data** ("what is truth/consciousness/mind"),
+> NOT the malazan RP set (different datasets). Recipe: r32/α64, `expert_r 2`,
+> 10 targets incl. `expert_{gate,up,down}_proj`, lr **5e-5**, cosine, seq_len
+> 1024, gemma4-nothink, split `[8,23]`. The prior *disappointing* Gemma/
+> Semancer-12B (dense) malazan runs had used lr **5e-6** — 10× too low, i.e.
+> undertrained, not a bad base; 5e-5 is the reframed fix.
+
+- **Held-out curve (116-row `test` split, `sweep_ckpts.py`, load base once →
+  `load_adapter` per checkpoint → completion-masked loss = the trainer's own
+  metric):** baseline 3.53 → step40 2.50 → 120 2.41 → 160 2.41 → **200 2.35
+  (BEST)** → 240 **2.72**. Clean **epoch-1 sweet spot**: held-out falls through
+  epoch 1 (ends step 218), then epoch 2 **overfits** — train loss collapsed to
+  0.56 at the boundary (memorization). Best deployable =
+  `out/gemma4moe_semancy/checkpoint-00000200`. **Lesson: train 1 epoch** on this
+  small (436-row) set; epoch 2 hurts held-out.
+- **BLOCKER (confirms backlog #0/#10):** the before/after gen (`infer_gemma.py`,
+  correct gemma4-nothink template — the stock `qlora_infer_native.py` hardcodes
+  llama3) showed the loader **silently skips runtime LoRA on the fused MoE expert
+  path**: `11520 target modules are routed-expert projections; runtime LoRA is not
+  applied ... (merge the adapter instead)`. So **half** the 23,040 trained expert
+  tensors are unseen at inference — the demo/deploy understates the adapter, and
+  only the merge-and-requantize path reflects the experts. `merge_lora_bf16.py`
+  is only dense-validated (S25) and needs bf16 base weights, both unverified for
+  this MoE.
+- **Config gotchas (all recorded to memory):** `messages_key: messages` REQUIRED
+  for semancy (else "0 SFT examples" — the trainer looks for `output`/
+  `instruction` cols); seq_len 1024 fine (prompts ~26 tok). `eval_every` defaults
+  to **0 = only-at-end** and **gates `save_best`** — set it (e.g. 40) or
+  reconstruct the curve post-hoc from `checkpoint_every` snapshots (what was
+  done). Don't pair `save_every` with `save_best` (both write `out/`). Single-
+  process trainer takes `--r` (not `--lora-r`); launch bg python with `-u`.
+
+**Still open (sequenced):** (1) review turbo's recent **dev-branch refactor**
+FIRST — lots of upstream activity, may move the fix surface; (2) then fix the
+**expert-inference LoRA path** (per-expert fallback, or LoRA-delta on the fused
+mgemm output — backlog #10); (3) then a proper **merged eval** of checkpoint-200
+to judge the semancy voice with experts applied. Reusable tools
+(`sweep_ckpts.py`, `infer_gemma.py`) currently in the ephemeral scratchpad —
+promote to `training/` if kept.
 
 ---
 
