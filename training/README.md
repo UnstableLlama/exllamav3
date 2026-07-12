@@ -57,9 +57,11 @@ paths only; opt in to the routed
 experts with `--targets ... expert_gate_proj expert_up_proj expert_down_proj`
 (consider a small `--expert-r` — it's one adapter pair per expert per layer).
 The router is always frozen and no aux load-balancing loss is added. Caveat:
-routed-expert adapters do not show up in native generation (the fused MoE
-inference kernels bypass the runtime LoRA slots) — deploy them by
-merge-and-requantize. See the Session 20/21 notes in `doc/qlora_handoff.md`.
+routed-expert adapters DO apply in native generation (fixed in Session 26 —
+the loader forces the unfused per-expert path), but MoE decode is
+significantly slower while such an adapter is loaded — for serving speed,
+deploy by merge-and-requantize. See the Session 20/21/26 notes in
+`doc/qlora_handoff.md`.
 
 ## Docs
 

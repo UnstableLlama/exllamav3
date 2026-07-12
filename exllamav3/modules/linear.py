@@ -554,14 +554,21 @@ class Linear(Module):
 
 
     def apply_lora(self, lora_input: torch.Tensor, x: torch.Tensor):
-        orig_shape = lora_input.shape
-        flat = lora_input.view(-1, orig_shape[-1])
+        flat = lora_input.view(-1, lora_input.shape[-1])
+        xf = x.view(-1, x.shape[-1])
         for lora, a in self.lora_a_tensors.items():
             b = self.lora_b_tensors.get(lora)
             if b is not None:
-                lora_in = flat if flat.dtype == a.dtype else flat.to(a.dtype)
-                delta = lora_in @ a @ b
-                x += delta.view(*orig_shape[:-1], -1).to(x.dtype)
+                if flat.dtype == a.dtype and xf.dtype == b.dtype:
+                    # Fused in-place accumulate: x += (x @ a) @ b, no
+                    # materialized delta or dtype-cast kernels. This runs per
+                    # adapted Linear on every decode step, so launch count
+                    # matters more than anything else here.
+                    xf.addmm_(flat @ a, b)
+                else:
+                    lora_in = flat.to(a.dtype)
+                    delta = lora_in @ a @ b
+                    xf += delta.to(xf.dtype)
 
 
     def quant_format_id(self):
