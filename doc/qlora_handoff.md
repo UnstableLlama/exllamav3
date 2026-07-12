@@ -98,18 +98,24 @@
 9. **Query-tiled big-head attention** + drop the pointless GQA
    `repeat_interleave` in the `sdpa` branch (Session 8 #1/#2; only bites at
    8k+ context on head_dim-512 layers).
-10. **Fused-kernel LoRA — recover the decode perf (Session 24 follow-up).**
-   The Session-24 fix makes runtime LoRA on an EXL3 base fall back from the
-   fused decode kernels (mgemm / BC bsz-1 graph) to the per-linear path
-   whenever an adapter is loaded — correct, but box-measured at a **~60%
-   decode tok/s hit while adapted** (1B r32 −65%, 3B r128 −59%; zero cost with
-   no adapter, `unload()` restores full speed). Follow-up: add the LoRA delta
-   **on top of** the fused mgemm output instead of falling back, so decode
-   keeps the fused k/v (and gate/up) path and only pays the two small LoRA
-   GEMVs. (BC bsz-1 stays disabled under LoRA — gate/up inject before the
-   activation.) Biggest relative win on small models where launch overhead
-   dominates. Until then: `unload()` when not steering, or deploy via
-   merge-and-requantize (no runtime adapter, no hit).
+10. **Fused-kernel LoRA decode perf — ATTEMPTED (Session 27): the delta-on-top
+   plan was built and box-measured but recovers almost nothing; the remaining
+   lever is LoRA-aware CUDA graphs (big, C++/upstream-coordination).** The
+   mgemm branches now stay fused under a runtime adapter (LoRA delta added on
+   the mgemm output, pre-RoPE/pre-activation) and `apply_lora` was fused to 2
+   kernels — but adapted decode only went 80.4 → 83.6 tok/s on the 1B,
+   because the Session-24 premise is obsolete after the upstream graph
+   refactor: the cost was never per-linear-vs-mgemm. Measured split (Session
+   27): losing the whole-block CUDA graphs costs ~49% (325 → 167 tok/s with
+   the adapter loaded but LoRA math no-op'd — **167 is the hard ceiling for
+   any correct LoRA that stays outside the graphs**), and the ~224 eager LoRA
+   GEMV launches/token cost the other half (167 → 84; the identical kernels
+   graph-replay 3.2× faster, so it's CPU-dispatch-bound, not GPU math). Real
+   recovery = get LoRA *inside* the graphs: make the BC graph paths LoRA-aware
+   (C++, coordinate with turbo) or torch-side CUDA-graph capture of the
+   adapted decode step. Only worth it if runtime-adapter serving (vs
+   merge-and-requant) becomes a real workflow. Mitigations unchanged and
+   verified: `unload()` restores full speed, merge-and-requantize has no hit.
 
 ---
 
@@ -2997,6 +3003,9 @@ on the box (Llama-3.2-1B/3B 4bpw, native infer path):
 5. **Fused-kernel LoRA perf follow-up** (new backlog item) — add the LoRA delta
    on top of the fused mgemm instead of falling back to the per-linear path, to
    recover most of the ~60% while-adapted decode hit measured above.
+   *(ATTEMPTED Session 27 — built and correct, but recovers almost nothing;
+   the premise didn't survive the upstream graph refactor. See the Session 27
+   notes and the rewritten backlog #10.)*
 
 ---
 
@@ -3117,6 +3126,93 @@ changes, decode slower-but-correct) — the gemma4moe semancy adapters were
 deleted, so this waits for the next trained expert adapter. GDN adapter-loaded
 decode smoke (Qwen3.5) likewise pending a GDN-target adapter. Expect a small
 follow-up merge when turbo tags v1.0.0.
+
+### Session 27 — backlog #10 (fused-kernel LoRA decode perf): BUILT + BOX-MEASURED, premise found obsolete
+
+> Branch `dev-merge`. Goal: recover the ~60% adapted-decode hit by adding the
+> LoRA delta **on top of** the fused mgemm output instead of falling back to
+> the per-linear path (the Session-24 follow-up, backlog #10). The change is
+> built, correct, and kept — but the measured win is small, and the session's
+> real product is the **finding** about where adapted-decode time actually
+> goes post-refactor. Verified before starting: all Session-24/26 guards
+> intact on dev-merge; upstream/dev has **zero** new commits since the
+> `1d44bd6` merge point; the C++ extension has no LoRA awareness anywhere.
+
+**Code changes (all Python, no C++):**
+
+- `attn.py` / `sliding_attn.py` `project_qkv`: the `multi_qg` and `multi_kv`
+  mgemm branches no longer fall back under a runtime LoRA — the delta is
+  added onto the mgemm output views via `Linear.apply_lora` (pre-RoPE, so
+  semantics match the per-linear path exactly). Safe by construction:
+  `MultiLinear` asserts no bias / no softcap / `post_scale == 1.0`, is never
+  built for `use_k_as_v`, and `multi_qg` requires a separate `g_proj` (so no
+  `interleaved_gate` case). No padding case either — mgemm requires the
+  activation width to equal `in_features`.
+- `mlp.py` `GatedMLP.forward`: the `multi_gu` branch stays fused; gate/up
+  deltas are added **pre-activation**; `down` already goes through
+  `Linear.forward` (which applies its own LoRA). The BC bsz-1 graph keeps its
+  guard (gate/up inject before the activation *inside* the graph — no
+  post-hoc delta possible). The Session-24 "uniform branch across slices"
+  constraint dissolves: the mgemm branch is now LoRA-correct, so branch
+  choice no longer affects correctness.
+- `linear.py` `apply_lora`: fused from ~5 kernels to 2 — `x @ a` then an
+  in-place `xf.addmm_(...)`; no materialized delta, no dtype-cast kernels
+  (the loader already stores fp16, pre-transposed, pre-scaled). This helps
+  EVERY adapted forward — prefill, the MoE per-expert path, the graph-path
+  fallbacks — not just the mgemm branches (only the 1B decode case was
+  measured).
+- Unchanged: all whole-block graph guards (bc_attn/bc_swa, BC MLP bsz-1, GDN
+  split, the fused MoE expert kernels) — none of them can take a post-hoc
+  delta, since LoRA on q/k/gate/up must inject before RoPE/activation, which
+  happen inside the graph/kernel.
+
+**Tests** (`tests/test_lora_fused_path.py`, 11/11 pass):
+- Tripwires rewritten for the new mechanism: they now assert the
+  `apply_lora` delta-add sits **inside** each mgemm branch (block-bounded so
+  pre-activation/pre-reshape placement is enforced); the graph-path guard
+  tripwires are unchanged.
+- NEW `test_mgemm_lora_delta_parity_gpu` (set `EXL3_TEST_MODEL` +
+  `EXL3_TEST_ADAPTER`): numerically compares the fused-path LoRA delta
+  against the per-linear path on a real quant + adapter (attention k/v and
+  GatedMLP), with a vacuousness check (delta must be nonzero). PASSED on the
+  box.
+- Training CPU suites still pass (41 tests). NOTE
+  `test_qlora_grad.py::test_real_exl3_layer` errors under pytest with
+  "fixture 'model_dir' not found" — pre-existing plumbing (it's the tier-3
+  script-mode entry point, run via `python tests/test_qlora_grad.py --model
+  ...`), unrelated to this session; do not chase.
+
+**BOX RESULTS (2026-07-11, Llama-3.2-1B-Instruct 4bpw, adapter
+`/mnt/two/Weights/qlora_test/base` = r32/α64 all-7-targets, greedy 200 tok,
+best-of-3, single 3090):**
+
+| configuration | tok/s |
+|---|---|
+| no adapter (upstream graph decode) | ~321–328 |
+| adapted, OLD per-linear fallback (stashed A/B, same base) | 80.4 |
+| adapted, NEW mgemm + delta + fused `apply_lora` | **83.6** |
+| adapted, diagnostic: branches as-adapted but LoRA math no-op'd | 167 |
+| LoRA GEMV chain alone, eager (micro-bench, 112×(mm+addmm_)) | 2.76 ms/tok |
+| identical kernels, CUDA-graph replayed | 0.85 ms/tok |
+
+Correctness: adapted generation **identical** old-path vs new-path;
+`unload()` restores the bit-identical base generation at ~101% of base speed.
+
+**THE FINDING — the backlog-#10 premise is obsolete post-refactor.**
+Per-linear-vs-mgemm on the base matmuls is noise (80.4 vs 83.6). The adapted
+decode hit is two other things: (1) **losing the whole-block CUDA graphs
+costs ~49%** (325 → 167) — that 167 is the hard ceiling for ANY correct
+runtime LoRA that stays outside the graphs; (2) **the eager LoRA GEMV chain
+costs the other half** (167 → 84), and the micro-benchmark proves it is
+CPU-dispatch-bound, not GPU math (same kernels 3.2× faster graph-replayed).
+Note the upstream refactor also *raised the no-adapter baseline* ~20% (268 →
+325 tok/s on this 1B vs Session 24), so the adapted-vs-base gap widened even
+though nothing regressed. Real recovery requires getting LoRA **inside** the
+CUDA graphs — LoRA-aware BC graphs (C++, coordinate with turbo) or torch-side
+graph capture of the adapted decode step. Deferred; backlog #10 rewritten
+accordingly. 3B/r128 was not re-measured. Also fixed this session: the stale
+`training/README.md` claim that routed-expert adapters don't apply at
+inference (closed in code in Session 26).
 
 ---
 

@@ -590,9 +590,11 @@ class SlidingAttention(Module):
         bsz, q_len, dim = x.shape
 
         # The fused mgemm paths bypass Linear.forward, which is what applies a
-        # runtime LoRA -- fall back to the per-linear path while one is loaded.
-        if self.multi_qg is None or bsz * q_len > 32 \
-                or has_runtime_lora(self.q_proj, self.g_proj):
+        # runtime LoRA. Rather than fall back to the (much slower) per-linear
+        # path, the low-rank delta is added onto the mgemm output below.
+        # MultiLinear is only built for bias/softcap/scale-free pairs, so the
+        # LoRA delta is the only epilogue Linear.forward would have applied.
+        if self.multi_qg is None or bsz * q_len > 32:
             q = self.q_proj.forward(x, params)
             if self.g_proj:
                 g = self.g_proj.forward(x, params)
@@ -625,9 +627,12 @@ class SlidingAttention(Module):
             )
             q = qg[0].view(bsz, q_len, self.num_q_heads * self.head_dim)
             g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
+            if has_runtime_lora(self.q_proj, self.g_proj):
+                xf = x.view(bsz * q_len, dim)
+                self.q_proj.apply_lora(xf, q.view(bsz * q_len, -1))
+                self.g_proj.apply_lora(xf, g.view(bsz * q_len, -1))
 
-        if self.multi_kv is None or bsz * q_len > 32 \
-                or has_runtime_lora(self.k_proj, self.v_proj):
+        if self.multi_kv is None or bsz * q_len > 32:
             k = self.k_proj.forward(x, params)
             v = self.v_proj.forward(x, params)
 
@@ -658,6 +663,10 @@ class SlidingAttention(Module):
             )
             k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
+            if has_runtime_lora(self.k_proj, self.v_proj):
+                xf = x.view(bsz * q_len, dim)
+                self.k_proj.apply_lora(xf, k.view(bsz * q_len, -1))
+                self.v_proj.apply_lora(xf, v.view(bsz * q_len, -1))
 
         q = q.view(bsz, q_len, self.num_q_heads, self.head_dim)
         k = k.view(bsz, q_len, self.num_kv_heads, self.head_dim)

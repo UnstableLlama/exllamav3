@@ -650,23 +650,25 @@ class GatedMLP(Module):
             d = None
 
             # The fused paths below bypass Linear.forward, which is what applies
-            # a runtime LoRA -- fall back to the per-linear path while one is
-            # loaded. Checked across ALL slices so every slice takes the same
-            # branch (mixed branches would disagree on the working shape of x).
+            # a runtime LoRA. The BC graph fuses the whole MLP (gate/up/act/down)
+            # and cannot take a LoRA delta (gate/up inject before the activation
+            # inside the graph), so any adapter on the three forces the branches
+            # below. The mgemm branch stays LoRA-correct on its own: gate/up
+            # deltas are added onto the mgemm output pre-activation, and down
+            # goes through Linear.forward (which applies its LoRA). Checked
+            # across ALL slices so the BC decision is uniform.
             gu_lora = has_runtime_lora(*self.gates, *self.ups)
             down_lora = has_runtime_lora(*self.downs)
 
             for s in r:
 
-                # The BC graph fuses the whole MLP (gate/up/act/down), so any
-                # runtime LoRA on any of the three forces the per-linear path.
                 if self.bc is not None and bsz == 1 and q_len == 1 \
                         and not (gu_lora or down_lora):
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
                     x = x.view(1, bsz * q_len, dim)
                     self.bc.run_bsz1(x, d.view(x.shape))
 
-                elif self.multi_gu[s] is None or bsz * q_len > 32 or gu_lora:
+                elif self.multi_gu[s] is None or bsz * q_len > 32:
                     g = self.gates[s].forward(x, params)
                     u = self.ups[s].forward(x, params)
                     a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
@@ -700,6 +702,10 @@ class GatedMLP(Module):
                     )
                     g = gu[0].view(bsz, q_len, self.multi_gu[s].out_features)
                     u = gu[1].view(bsz, q_len, self.multi_gu[s].out_features)
+                    if gu_lora:
+                        xf = x.view(bsz * q_len, dim)
+                        self.gates[s].apply_lora(xf, g.view(bsz * q_len, -1))
+                        self.ups[s].apply_lora(xf, u.view(bsz * q_len, -1))
 
                     a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
                     self.activation_fn_call(g, u, a, self.act_limit)

@@ -58,7 +58,7 @@ optim: paged_adamw8bit
 - **Memory levers** for long context on consumer cards: gradient checkpointing, activation offload to CPU RAM, fused/chunked cross-entropy (chunked over the vocab too, for 256k-vocab models), 8-bit and paged optimizers, Liger kernels (RMSNorm/RoPE/SwiGLU).
 - **A real eval harness**: held-out loss from your dataset's own split (`eval_split`) or a carved fraction (`val_frac`), an optional second monitor set (`eval2_*`, e.g. wikitext LM loss watched next to your task loss), `save_best` checkpointing, periodic live sample generations, and a per-run CSV log of hyperparameters/losses/VRAM/throughput.
 - **Correctness gates, not vibes**: `qlora_validate_native.py` checks the differentiable forward against the native inference forward, the Liger backward against plain torch, packing isolation, and each adapter init's step-0 math — before you spend GPU-days. A CPU test suite covers the gradient path end-to-end.
-- **Standard outputs**: adapters save as PEFT-format safetensors, loadable by exllamav3's native LoRA loader (TabbyAPI), PEFT, or merge scripts.
+- **Standard outputs**: adapters save as PEFT-format safetensors, loadable by exllamav3's native LoRA loader (TabbyAPI), PEFT, or merge scripts. Runtime adapters apply correctly on every inference path; note that decode is slower **while an adapter is loaded** (the graph-fused decode paths can't run under one — `unload()` restores full speed), and deploying via merge-and-requantize has no hit at all.
 
 ### Modern PEFT: SVD adapter initializations
 
