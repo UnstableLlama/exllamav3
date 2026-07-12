@@ -9,3 +9,7 @@ dist
 
 # produced by `pip install -e .`
 exllamav3_ext.cpython-*.so
+# training run outputs (adapters/checkpoints/logs) and run-log CSVs
+out/
+qlora_runs.csv
+qlora_runs.csv.errors.log

@@ -25,6 +25,8 @@ from exllamav3 import Config, Model, Cache, Tokenizer, Generator
 from exllamav3.model.lora import LoRA
 from exllamav3.generator.sampler import ComboSampler
 
+from qlora_train_native import format_prompt_and_eot
+
 
 # General everyday prompts: a style adapter is most convincing on plain,
 # open-ended questions, where the learned voice (e.g. florid Shakespearean
@@ -37,17 +39,19 @@ PROMPTS = [
 ]
 
 
-def llama3_prompt(user: str) -> str:
-    return (
-        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
-        f"{user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-    )
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--adapter", required=True)
+    ap.add_argument("--prompt-format", default="llama3",
+                    help="Chat template the adapter was trained with (same choices "
+                         "as the trainer: auto/mistral/metharme/gemma4-nothink/"
+                         "llama3/qwen3.5/qwen3.5-nothink). Default llama3 matches "
+                         "this script's original hardcoded template.")
+    ap.add_argument("--use-per-device", type=float, nargs="*", default=None,
+                    help="Split the model across GPUs with these per-device VRAM "
+                         "caps in GB (same semantics as the trainer's "
+                         "use_per_device). Default: load fully on cuda:0.")
     ap.add_argument("--max-new-tokens", type=int, default=120)
     ap.add_argument("--lora-scaling", type=float, default=1.0,
                     help="Extra multiplier on the adapter (on top of alpha/r). "
@@ -79,9 +83,13 @@ def main():
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
     cache = Cache(model, max_num_tokens=4096)
-    model.load(device="cuda:0", progressbar=True)
+    if args.use_per_device:
+        model.load(use_per_device=args.use_per_device, progressbar=True)
+    else:
+        model.load(device="cuda:0", progressbar=True)
     tokenizer = Tokenizer.from_config(config)
     generator = Generator(model=model, cache=cache, tokenizer=tokenizer)
+    build_prompt, eot = format_prompt_and_eot(model, tokenizer, args.prompt_format)
 
     # Stop at end-of-turn so the demo shows one clean answer instead of running
     # past <|eot_id|> into hallucinated new assistant turns.
@@ -89,6 +97,8 @@ def main():
     if tokenizer.eos_token_id is not None and tokenizer.eos_token_id not in stop:
         stop.append(tokenizer.eos_token_id)
     stop += ["<|eot_id|>", "<|start_header_id|>", "</s>", "<|im_end|>"]
+    if eot and eot not in stop:
+        stop.append(eot)
 
     def run(label: str, dump=None):
         print("=" * 70)
@@ -96,7 +106,7 @@ def main():
         print("=" * 70)
         for p in prompts:
             resp = generator.generate(
-                prompt=llama3_prompt(p),
+                prompt=build_prompt(p),
                 max_new_tokens=args.max_new_tokens,
                 sampler=sampler,
                 seed=args.seed,
