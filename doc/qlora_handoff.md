@@ -88,8 +88,10 @@
    scheduled short runs, adapter hot-reload via `LoRA.from_directory`).
    **Box gate 1/4 DONE (Session 29): DPO smoke on Llama-3.2-3B PASS** — clean
    held-out loss/acc/margin curve, adapter loads and applies at inference.
-   Remaining: KTO smoke, the reference-forward probe, then the real
-   DPO-vs-KTO comparison — see Session 29 notes.
+   **Box gate 2/4 DONE (Session 30): KTO smoke on Llama-3.2-3B PASS** — clean
+   held-out pref-loss + growing desirable/undesirable reward separation.
+   Remaining: the reference-forward probe, then the real DPO-vs-KTO
+   comparison — see Session 30 notes.
 3. **Trainable-head chunked CE** with a head/LoRA-B gradient (Session 10
    next-work #1's remaining half; supersedes Session 9 #7).
 4. **Audit item A1 — dequant 3×→1× per linear per step** (~13% wall at the
@@ -3359,6 +3361,80 @@ should be checked the same way before assuming it matches
 `--completion-key/--label-key`); (3) optional one-off reference-forward
 correctness probe; (4) the real DPO-vs-KTO comparison on a held-out set
 (the actual point of backlog #2 — near-inference-time preference tuning).
+
+---
+
+### Session 30 — backlog #2 continued: KTO smoke on Llama-3.2-3B — PASS
+
+> Box list item 2 of the Session-16 preference-training plan (backlog #2),
+> same model as Session 29 for a direct comparison later.
+
+**Schema check (per the Session 29 lesson — verify before assuming):**
+`trl-lib/kto-mix-14k` README schema is `prompt`/`completion` (TRL-conversational
+lists of `{role, content}`) + bool `label` — matches `qlora_train_pref.py`'s
+KTO defaults (`--prompt-key prompt --completion-key completion --label-key
+label`) exactly, and `_prompt_text`/`_completion_text` already handle the
+conversational-list form (not just plain strings). `--inspect 3` confirmed
+clean single-BOS spans, correct turn-end token, and labels reading right on
+both branches. **Unlike Session 29, this dataset needed no swap** — the box
+list's suggested dataset just worked. 13,500 train rows → 13,346 usable after
+seq-len skips, **exactly balanced 6673 desirable / 6673 undesirable** (no
+`--desirable-weight`/`--undesirable-weight` needed).
+
+**Setup:** same recipe as Session 29 for comparability — r32/α32
+`--use-rslora --init-lora pissa`, lr 5e-6 (default), batch 4/grad-accum 8
+(eff-batch 32), 20 steps, `--eval-split test --eval-max-samples 100
+--eval-every 10`, `--method kto` (default `--kto-loss kto`, needs `--batch
+>= 2` for the batch-KL reference term — satisfied).
+
+**Result — clean signal, held-out `test` (capped 100 → 99 rows):**
+
+| step | pref-loss | reward D | reward U | D−U gap |
+|---|---|---|---|---|
+| 0 (baseline) | 0.4996 | 0.004 | 0.002 | 0.002 |
+| 10 | 0.4593 | -0.392 | -0.989 | 0.597 |
+| 20 | 0.4358 | -0.324 | -1.221 | 0.897 |
+
+Pref-loss falls monotonically; both rewards drift negative (expected —
+unpaired KTO has no chosen/rejected pair to anchor an absolute scale per
+batch, only the desirable/undesirable split) but the **D−U separation grows
+monotonically** — the real KTO analog of DPO's margin. `|dB|` climbed
+0.025→0.132, grad norm steady 20-29, no divergence. [PERF] 889s/20 steps
+(vs Session 29's 969s despite KTO's extra reference+KL forward — same
+eff-batch, so wall-clock is comparable), 211 sup tok/s, peak VRAM 7.46GB.
+Adapter: `out/llama3b_kto_smoke/` (untracked).
+
+**The batch-KL reference-point metric (`kl` in the log):** estimated each
+step from *mismatched* prompt/completion pairs (shift-by-one permutation,
+`mismatched_kl_shift`, [preference.py:154](../exllamav3/training/preference.py:154))
+as `mean(policy_logps - reference_logps)` on those mismatched rows, clamped
+≥0 — the KTO paper's `z_0` baseline that desirable/undesirable rewards are
+measured against, not a real convergence metric to watch. Baseline (step 0)
+read 0.102 rather than the theoretical ~0 (PiSSA init ⇒ reference ==
+step-0 policy exactly) — read as bf16 rounding noise in the
+residual-minus-offset-plus-adapter reconstruction ([native_llama.py:309-330](../exllamav3/training/native_llama.py:309),
+comment flags this precision tradeoff explicitly), not a bug. Every step
+after read exactly 0.000 — `--batch 4` is a small micro-batch for this
+estimate, plausibly clamping to zero most steps. Not chased further; doesn't
+affect the loss's correctness (the KL term only shifts the sigmoid input,
+and reads near-zero throughout, so this run is effectively behaving like
+`apo_zero_unpaired` in practice — worth a real KL sanity check with a
+bigger batch if the metric itself is ever load-bearing).
+
+**Inference check** (`qlora_infer_native.py`, greedy, `--seed 0`): loads
+clean (392 tensors = 28 layers × 7 targets × 2, PiSSA offset `r=64,
+alpha=64, scaling=1.0`, identical shape to Session 29). Generations on the
+4 built-in prompts are again nearly indistinguishable base-vs-adapted —
+same read as Session 29: a subtle preference signal at 20 steps/lr 5e-6
+doesn't visibly diverge greedy decode, the held-out curve is the real
+evidence. **Not yet attempted:** more steps / higher lr / `--lora-scaling`
+to force a visible demo on either DPO or KTO.
+
+**Remaining backlog #2 box items:** (3) optional one-off reference-forward
+correctness probe; (4) the real DPO-vs-KTO comparison on a held-out set —
+now unblocked (both smokes PASS on the same model/recipe/eval-cap
+convention, so a matched comparison is just picking a shared dataset both
+loaders can read and running both `--method`s back to back).
 
 ---
 
