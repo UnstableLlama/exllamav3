@@ -35,6 +35,10 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
   Run this FIRST on any new model/architecture.
 - `qlora_infer_native.py` — before/after generation with an adapter on the
   native inference path.
+- `expert_demo.py` — BASE → ADAPTED → UNLOADED generation check for MoE
+  routed-expert adapters, using the trainer's chat formats (gemma4-nothink,
+  qwen3.5-nothink, …) and layer-split loading; greedy so unload can be
+  compared byte-for-byte (see the MoE routing-tie caveat in its docstring).
 - `merge_lora_bf16.py` — fold a trained adapter into the unquantized bf16 HF
   weights (`W += (alpha/r)·B@A`, matching the inference loader), preserving the
   shard layout so `convert.py` can requantize the result. This is the
@@ -57,10 +61,11 @@ paths only; opt in to the routed
 experts with `--targets ... expert_gate_proj expert_up_proj expert_down_proj`
 (consider a small `--expert-r` — it's one adapter pair per expert per layer).
 The router is always frozen and no aux load-balancing loss is added. Caveat:
-routed-expert adapters DO apply in native generation (fixed in Session 26 —
-the loader forces the unfused per-expert path), but MoE decode is
+routed-expert adapters DO apply in native generation (fixed in Session 26,
+box-verified end-to-end in Session 28 — `expert_demo.py` shows the trained
+style at runtime on both Qwen3.5-MoE-family and Gemma4-MoE), but MoE decode is
 significantly slower while such an adapter is loaded — for serving speed,
-deploy by merge-and-requantize. See the Session 20/21/26 notes in
+deploy by merge-and-requantize. See the Session 20/21/26/28 notes in
 `doc/qlora_handoff.md`.
 
 ## Docs
