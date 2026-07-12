@@ -3064,14 +3064,13 @@ declined that check. **`ste`** mode untested (only `noise` ran), but it would
 now have to beat early-stopping. If quant-aware is ever revisited, 2.5bpw +
 `ste` is the only lane with a chance.
 
-**Reusable artifact built:** `merge_lora_bf16.py` (currently in the session
-scratchpad, NOT committed) — folds a PEFT/native default-init adapter into
+**Reusable artifact built:** `training/merge_lora_bf16.py` (**committed to master
+via PR #139**, `81fdd77`) — folds a PEFT/native default-init adapter into
 bf16 HF weights (`W += (α/r)·B@A`, preserves shard layout so `convert.py`
 consumes the output directly). Construction-validated (untouched tensors
 bit-identical; target delta matches `B@A`). This is the missing
-merge-and-requantize deploy tool referenced since Session 3; worth committing
-to `training/` if the deploy path is wanted. **PiSSA adapters need the 2r
-offset form** — the script asserts on a rank mismatch rather than
+merge-and-requantize deploy tool referenced since Session 3. **PiSSA adapters
+need the 2r offset form** — the script asserts on a rank mismatch rather than
 mis-merging.
 
 ### Session 26 — MERGED turbo's v1.0.0-prep dev refactor; LoRA guards extended to the new fused paths; MoE expert-adapter blocker CLOSED (code)
