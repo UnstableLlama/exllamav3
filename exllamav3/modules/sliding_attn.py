@@ -800,10 +800,15 @@ class SlidingAttention(Module):
         causal = params.get("causal", True)
         non_causal_spans = params.get("non_causal_spans")
 
-        # Graph-captured C++ path for the whole decode step
+        # Graph-captured C++ path for the whole decode step. The graph reads the
+        # projection trellis directly and never sees a runtime LoRA, so fall back to
+        # the python path while one is loaded (guard must sit here, per call: the
+        # graph is cached and a LoRA can be attached/detached after build).
         if (
             _bc_attn_enable and causal and non_causal_spans is None and
-            bsz <= 4 and seqlen <= 16
+            bsz <= 4 and seqlen <= 16 and
+            not has_runtime_lora(self.q_proj, self.k_proj, self.v_proj,
+                                 self.o_proj, self.g_proj)
         ):
             rsg = params.get("recurrent_states")
             if rsg is not None:

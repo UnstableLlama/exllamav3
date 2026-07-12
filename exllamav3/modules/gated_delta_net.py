@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from ..model.config import Config
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear
+from .linear import has_runtime_lora
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from .gated_rmsnorm import GatedRMSNorm
@@ -733,11 +734,16 @@ class GatedDeltaNet(Module):
             self.ba_weight_filled = True
 
         # Fused C++ path for single-token decode with split projections. Runs the entire layer
-        # in one call, replayed through an internal CUDA graph from the third invocation on
+        # in one call, replayed through an internal CUDA graph from the third invocation on.
+        # The graph reads projection weights directly (qkv/z/o trellis, b/a via the merged
+        # ba_weight_t buffer, base weights only) and never sees a runtime LoRA, so fall back
+        # to the torch path while one is loaded.
         if (
             self.bc_split and bsz == 1 and seqlen == 1 and
             save_state and not save_history and
-            recurrent_slots is not None
+            recurrent_slots is not None and
+            not has_runtime_lora(self.qkv_proj, self.z_proj, self.b_proj,
+                                 self.a_proj, self.o_proj)
         ):
             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
             self.bc.run_bsz1(x, y, conv_state, recurrent_state, recurrent_slots)

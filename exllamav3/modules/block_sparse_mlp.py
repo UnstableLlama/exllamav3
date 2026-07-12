@@ -9,6 +9,7 @@ from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP
+from .linear import has_runtime_lora
 from .rmsnorm import RMSNorm
 from .layernorm import LayerNorm
 from ..model.model_tp_alloc import TPAllocation
@@ -833,6 +834,22 @@ class BlockSparseMLP(Module):
             params["backend"].broadcast(selected_experts, src_device = self.routing_device)
             params["backend"].broadcast(routing_weights, src_device = self.routing_device)
 
+        # Runtime-LoRA guards: every fused expert path (exl3_moe, mgemm loops, the BC
+        # single-expert kernels and the bsz-1 graph) reads the expert trellis weights
+        # directly and never sees a runtime LoRA. When one is loaded on any routed
+        # expert projection, force the branch below that can take the per-expert torch
+        # path. The bsz-1 graph may also embed the shared experts (bc_sh_exp) and the
+        # shared gate, so it is additionally skipped when those carry a LoRA -- the
+        # unfused fallback runs them through their own (guarded) forwards instead.
+        # NOTE: routing reads routing_gate.inner.weight directly on all paths; a LoRA
+        # on the router is not supported (and not used by training).
+        experts_lora = has_runtime_lora(*self.gates, *self.ups, *self.downs)
+        sh_fused_lora = self.bc_sh_exp and (
+            has_runtime_lora(*self.shared_experts.gates, *self.shared_experts.ups,
+                             *self.shared_experts.downs) or
+            has_runtime_lora(self.shared_gate)
+        )
+
         # Empty slice
         if self.intermediate_size == 0 or self.num_local_experts == 0:
             final_hidden_states = torch.zeros_like(x, dtype = torch.float)
@@ -840,7 +857,7 @@ class BlockSparseMLP(Module):
         # Torch/C++/fused path
         elif (
             bsz >= self.f_threshold or not self.is_quantized or
-            self.config.infer_params.no_reconstruct or
+            self.config.infer_params.no_reconstruct or experts_lora or
             not (self.support_quant_paths or (bsz == 1 and self.bc is not None))
         ):
             final_hidden_states = torch.zeros_like(y, dtype = torch.float)
@@ -884,7 +901,7 @@ class BlockSparseMLP(Module):
                 expert_count_list = expert_count.tolist()
 
                 # Run fused path if possible, skips experts with more than TEMP_ROWS_FUSED tokens
-                if self.fused_mode_buffers is not None:
+                if self.fused_mode_buffers is not None and not experts_lora:
                     num_active = sum(1 for c in expert_count_list[:num_ex] if 0 < c <= TEMP_ROWS_FUSED)
                     ext.exl3_moe(
                         y,
@@ -940,7 +957,7 @@ class BlockSparseMLP(Module):
 
                     current_state = y.index_select(0, top_x)
 
-                    if self.bc is not None and self.support_quant_paths:
+                    if self.bc is not None and self.support_quant_paths and not experts_lora:
                         # Graph path
                         if count <= TEMP_ROWS_GRAPH:
                             self.bc.run_single_expert(current_state, expert_idx)
@@ -1072,7 +1089,7 @@ class BlockSparseMLP(Module):
             final_hidden_states = final_hidden_states.view(x.shape)
 
         # Bsz 1
-        elif self.bc is not None:
+        elif self.bc is not None and not sh_fused_lora:
             self.bc.run_bsz1(y, selected_experts, routing_weights)
             if self.experts_cfg.out_trim is not None:
                 final_hidden_states = self.experts_cfg.out_trim.view(x.shape)
@@ -1157,7 +1174,9 @@ class BlockSparseMLP(Module):
             if self.shared_experts_post_norm:
                 y = self.shared_experts_post_norm.forward(y, params)
             if self.shared_gate:
-                if bsz > 32:
+                # add_sigmoid_gate_proj projects against the raw gate weight, skipping
+                # any runtime LoRA on the shared gate -- take the forward path then
+                if bsz > 32 or has_runtime_lora(self.shared_gate):
                     z = self.shared_gate.forward(x, params)
                     ext.add_sigmoid_gate(y, z, final_hidden_states)
                 else:

@@ -829,10 +829,15 @@ class Attention(Module):
         simulate_kv_quant = params.get("sim_kvq", None)
 
         # Graph-captured C++ path for the whole decode attention block (causality is baked
-        # into the slot kernels, so non-causal callers like the DFlash draft graph too)
+        # into the slot kernels, so non-causal callers like the DFlash draft graph too).
+        # The graph reads the projection trellis directly and never sees a runtime LoRA,
+        # so fall back to the python path while one is loaded (guard must sit here, per
+        # call: the graph is cached and a LoRA can be attached/detached after build).
         if (
             _bc_attn_enable and non_causal_spans is None and
-            bsz <= 4 and seqlen <= 16
+            bsz <= 4 and seqlen <= 16 and
+            not has_runtime_lora(self.q_proj, self.k_proj, self.v_proj,
+                                 getattr(self, "kv_proj", None), self.o_proj, self.g_proj)
         ):
             o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens)
             if o is not None:
