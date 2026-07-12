@@ -49,10 +49,11 @@
    quants, then first training runs — see the Session 18 / 20 / 21 box
    lists. Still not covered: Qwen3-Next (fused qkvz layout), sample packing
    on GDN models (rejected loudly; train unpacked — plain Qwen3-MoE and
-   Gemma4 MoE pack fine). Also open (Session 24): runtime LoRA is NOT
-   applied on the fused MoE expert path at inference (the loader now warns);
-   an expert-adapter inference demo needs a per-expert fallback or a
-   post-mgemm LoRA add — merge-path deployment unaffected.
+   Gemma4 MoE pack fine). The Session-24 hole — runtime LoRA NOT applied on
+   the fused MoE expert path — is CLOSED in code (Session 26: `experts_lora`
+   forces the per-expert torch branch; loader warning is now a slow-path
+   notice); end-to-end box demo still pending, needs a trained expert
+   adapter (the gemma4moe semancy ones were deleted).
 1. **Quantization-aware LoRA — BUILT (Session 17), BOX-TESTED + SHELVED
    (Session 25, verdict: not worth it).** `--quant-aware {noise,ste}` was
    built (noise injection on the frozen-weight closure + a straight-through
@@ -3063,6 +3064,59 @@ merge-and-requantize deploy tool referenced since Session 3; worth committing
 to `training/` if the deploy path is wanted. **PiSSA adapters need the 2r
 offset form** — the script asserts on a rank mismatch rather than
 mis-merging.
+
+### Session 26 — MERGED turbo's v1.0.0-prep dev refactor; LoRA guards extended to the new fused paths; MoE expert-adapter blocker CLOSED (code)
+
+> Branch `dev-merge` (commits `5beda4d` merge + `0dc258e` guards). Merged
+> upstream/dev at `1d44bd6` (95 commits: CUDA-graph decode paths everywhere,
+> FA2 removed, int8/mul1 mode on by default, extension split into compilation
+> units — 142 C++ files; we touch zero C++). Only 2 textual conflicts
+> (xformers.py — same ImportError fix both sides, took theirs; mlp.py — BC
+> branch reordered, guards re-placed). All our hooks survived the automerge
+> (`has_runtime_lora` guards, `lora_full_weight`, `get_weight_tensor_slice`;
+> `ext.reconstruct_slice` signature unchanged).
+
+**The real risk was semantic, not textual:** upstream added NEW fused paths
+that bypass `Linear.forward` — exactly the Session-24 silent-no-op class.
+All now guarded at their per-call dispatch (graphs stay cached; adapters can
+attach/detach between calls):
+
+- `attn.py` / `sliding_attn.py`: `bc_attn_step` / `bc_swa_step` graph-captured
+  decode blocks (all projections through o_proj as one C++ call, bsz≤4 q_len≤16).
+- `gated_delta_net.py`: `BC_GatedDeltaNetSplit` bsz-1 whole-layer fused decode
+  (Qwen3.5 split layout; qkv/z/o trellis + merged base-only `ba_weight_t`).
+  The non-split `BC_GatedDeltaNet` (`run_bsz1_a/b`) has no Python dispatch yet
+  — re-audit when turbo wires it.
+- `block_sparse_mlp.py`: **this closes backlog item "runtime LoRA not applied
+  on fused MoE expert path" (Session 24 note) in code** — `experts_lora`
+  forces the per-expert torch branch past `exl3_moe`, the BC single-expert
+  graph/DQ kernels, and the bsz-1 graph; `sh_fused_lora` keeps the bsz-1 graph
+  (which embeds shared experts + shared gate) honest; `add_sigmoid_gate_proj`
+  falls back when the shared gate carries LoRA. `lora.py` warning downgraded
+  to a slow-path notice (expert adapters now apply, unfused = slower decode —
+  merge for deploy). **Router LoRA remains unsupported** (routing reads
+  `routing_gate.inner.weight` raw on every path) — documented, not guarded.
+
+**Verified on the box (this machine, 2×3090):**
+- CPU training suite 64/64; `test_lora_fused_path.py` tripwires extended to
+  every new guard, 10/10.
+- Ext rebuilt clean from merged C++ (`setup.py build_ext --inplace`).
+- End-to-end fused-path LoRA smoke (Llama-3.2-1B 4bpw, adapter
+  `/mnt/two/Weights/qlora_test/base`, bsz-1 decode = the new graph path):
+  base coherent → adapter visibly pirates the output → unload restores
+  bit-identical base. Guards engage and release.
+
+**Known-stale upstream tests, do not chase:** `test_ext_norm.py`,
+`test_rope.py`, `test_kv_quant.py`, `test_cache_rotate.py`,
+`test_gated_delta_rule.py` (~488 failures) call pre-refactor kernel
+signatures and fail identically on a pristine upstream/dev checkout —
+upstream test debt, not a merge regression.
+
+**Still on the box list:** MoE expert-adapter END-TO-END (guard fires, output
+changes, decode slower-but-correct) — the gemma4moe semancy adapters were
+deleted, so this waits for the next trained expert adapter. GDN adapter-loaded
+decode smoke (Qwen3.5) likewise pending a GDN-target adapter. Expect a small
+follow-up merge when turbo tags v1.0.0.
 
 ---
 
