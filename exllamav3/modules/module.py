@@ -31,6 +31,11 @@ class Module(ABC):
             in linear layers during quantization, e.g. to allow sharing between Q/K/V projections that have the same
             input state.
         """
+        # Imported here rather than at the top of the file: importing ..model.config at module scope would pull in
+        # the model package while the modules package may still be mid-import
+        if config is None:
+            from ..model.config import NullConfig
+            config = NullConfig()
         self.config = config
         self.key = key
         self.alt_key = None
@@ -106,6 +111,10 @@ class Module(ABC):
 
     def quant_format_id(self):
         return None
+
+    def can_fuse_residual(self, x: torch.Tensor, y: torch.Tensor) -> bool:
+        # Overridden by norm modules that support forward(residual_in = ...)
+        return False
 
     def get_name(self):
         return self.__class__.__name__

@@ -62,19 +62,71 @@ def test_gated_mlp_fused_branches_guarded():
     assert re.search(
         r"self\.multi_gu\[s\] is None or bsz \* q_len > 32 or gu_lora",
         src), "GatedMLP: multi_gu branch lost its runtime-LoRA guard"
-    # the fully-fused BC bsz-1 branch also skips down_proj -> must yield to the
-    # mgemm branch (which calls downs[s].forward) when down carries a LoRA
+    # the BC bsz-1 graph fuses the whole MLP (gate/up/act/down), so it must
+    # yield to an unfused branch when ANY of the three carries a LoRA
     assert re.search(
-        r"self\.bc is not None and bsz == 1 and q_len == 1 and not down_lora",
-        src), "GatedMLP: BC bsz-1 branch lost its runtime-LoRA guard"
+        r"self\.bc is not None and bsz == 1 and q_len == 1[^:]*?"
+        r"not \(gu_lora or down_lora\)",
+        src, re.S), "GatedMLP: BC bsz-1 branch lost its runtime-LoRA guard"
 
 
-def test_moe_expert_lora_warning_present():
-    # Routed experts (BlockSparseMLP) have no per-linear fallback yet; the
-    # loader must warn instead of silently no-opping the adapter.
+@pytest.mark.parametrize("fname", ["attn.py", "sliding_attn.py"])
+def test_bc_attn_graph_dispatch_guarded(fname):
+    # bc_attn/bc_swa graph-captured decode blocks run projections through
+    # o_proj as one C++ call; the dispatch (not the cached graph build) must
+    # check for a runtime LoRA on every involved projection
+    src = _src("exllamav3", "modules", fname)
+    assert re.search(
+        r"bsz <= 4 and seqlen <= 16 and\s*"
+        r"not has_runtime_lora\(self\.q_proj, self\.k_proj, self\.v_proj,",
+        src), f"{fname}: graph-captured decode dispatch lost its runtime-LoRA guard"
+
+
+def test_gdn_split_bsz1_graph_guarded():
+    # BC_GatedDeltaNetSplit runs the whole layer in one call, reading qkv/z/o
+    # trellis and the merged (base-weights-only) ba_weight_t buffer directly
+    src = _src("exllamav3", "modules", "gated_delta_net.py")
+    assert re.search(
+        r"self\.bc_split and bsz == 1 and seqlen == 1[^:]*?"
+        r"not has_runtime_lora\(self\.qkv_proj, self\.z_proj, self\.b_proj,",
+        src, re.S), "GatedDeltaNet: split bsz-1 fused decode lost its runtime-LoRA guard"
+
+
+def test_moe_expert_dispatch_guarded():
+    # Every fused expert path must yield to the per-expert torch path (the
+    # mlp() closure calling gates/ups/downs .forward) while an adapter is
+    # loaded on any routed expert projection
+    src = _src("exllamav3", "modules", "block_sparse_mlp.py")
+    assert "experts_lora = has_runtime_lora(*self.gates, *self.ups, *self.downs)" in src
+    # branch selection forces the torch-capable branch
+    assert re.search(
+        r"no_reconstruct or experts_lora or",
+        src), "BlockSparseMLP: torch-path branch selection lost experts_lora"
+    # exl3_moe fused kernel skipped under LoRA
+    assert re.search(
+        r"self\.fused_mode_buffers is not None and not experts_lora",
+        src), "BlockSparseMLP: exl3_moe fused path lost its runtime-LoRA guard"
+    # BC single-expert graph/DQ kernels skipped under LoRA
+    assert re.search(
+        r"self\.bc is not None and self\.support_quant_paths and not experts_lora",
+        src), "BlockSparseMLP: BC single-expert path lost its runtime-LoRA guard"
+    # bsz-1 graph (which may embed shared experts + shared gate) skipped when
+    # the fused shared-expert linears carry a LoRA
+    assert "sh_fused_lora" in src and re.search(
+        r"elif self\.bc is not None and not sh_fused_lora",
+        src), "BlockSparseMLP: bsz-1 graph lost its shared-experts LoRA guard"
+    # raw-weight shared gate projection falls back to Linear.forward
+    assert re.search(
+        r"bsz > 32 or has_runtime_lora\(self\.shared_gate\)",
+        src), "BlockSparseMLP: add_sigmoid_gate_proj lost its shared-gate LoRA guard"
+
+
+def test_moe_expert_lora_slow_path_notice_present():
+    # Expert adapters now apply via the unfused per-expert path; the loader
+    # should still tell the user MoE decode will be slower while loaded.
     src = _src("exllamav3", "model", "lora.py")
-    assert re.search(r"\\\.experts\\\.", src) and "not applied" in src, \
-        "lora.py: routed-expert no-op warning removed without a MoE fallback"
+    assert re.search(r"\\\.experts\\\.", src) and "per-expert" in src, \
+        "lora.py: routed-expert slow-path notice removed"
 
 
 def test_has_runtime_lora_semantics():

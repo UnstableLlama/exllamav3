@@ -227,19 +227,19 @@ class LoRA:
                 f"on tensor-parallel sliced modules"
             )
 
-        # Routed-expert projections (BlockSparseMLP) are computed by fused
-        # expert kernels at inference on a quantized model; those never call
-        # Linear.forward, so LoRA tensors registered on them are NOT applied.
-        # (Dense attention/MLP fall back to the per-linear path when a LoRA is
-        # loaded; the MoE expert dispatch has no such fallback yet.) Warn so a
-        # trained expert adapter isn't silently judged as a no-op.
+        # Routed-expert projections (BlockSparseMLP): while an adapter is loaded
+        # on any expert projection, the MoE dispatch skips the fused expert
+        # kernels (exl3_moe / BC graphs / mgemm) and runs the per-expert torch
+        # path so the adapter is applied -- at a real decode-speed cost. Note it
+        # so a slow MoE decode isn't mysterious (merge the adapter for deploy).
         expert_pat = re.compile(r"\.experts\.\d+\.")
         n_expert = sum(1 for k in self.target_modules if expert_pat.search(k))
         if n_expert:
             print(
-                f" !! LoRA '{self.name}': {n_expert} target modules are routed-"
-                f"expert projections; runtime LoRA is not applied on the fused "
-                f"MoE inference path (merge the adapter instead)"
+                f" -- LoRA '{self.name}': {n_expert} target modules are routed-"
+                f"expert projections; MoE layers will use the unfused per-expert "
+                f"path while this adapter is loaded (slower decode -- merge the "
+                f"adapter for deployment)"
             )
 
         # Embedding / LM-head adapters trained by the native QLoRA trainer live in

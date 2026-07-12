@@ -49,13 +49,11 @@
    quants, then first training runs — see the Session 18 / 20 / 21 box
    lists. Still not covered: Qwen3-Next (fused qkvz layout), sample packing
    on GDN models (rejected loudly; train unpacked — plain Qwen3-MoE and
-   Gemma4 MoE pack fine). Also open (Session 24): runtime LoRA is NOT
-   applied on the fused MoE expert path at inference (the loader now warns);
-   an expert-adapter inference demo needs a per-expert fallback or a
-   post-mgemm LoRA add — merge-path deployment unaffected. **Session 27
-   CONFIRMED this blocks expert-adapter eval/deploy** (11,520/23,040 expert
-   tensors silently dropped loading checkpoint-200); sequencing — **review
-   turbo's dev-branch refactor first**, then fix this path. See Session 27.
+   Gemma4 MoE pack fine). The Session-24 hole — runtime LoRA NOT applied on
+   the fused MoE expert path — is CLOSED in code (Session 26: `experts_lora`
+   forces the per-expert torch branch; loader warning is now a slow-path
+   notice); end-to-end box demo still pending, needs a trained expert
+   adapter (the gemma4moe semancy ones were deleted).
 1. **Quantization-aware LoRA — BUILT (Session 17), BOX-TESTED + SHELVED
    (Session 25, verdict: not worth it).** `--quant-aware {noise,ste}` was
    built (noise injection on the frozen-weight closure + a straight-through
@@ -3066,103 +3064,58 @@ merge-and-requantize deploy tool referenced since Session 3. **PiSSA adapters
 need the 2r offset form** — the script asserts on a rank mismatch rather than
 mis-merging.
 
-### Session 26 — Gemma4-MoE routed-expert TRAINING SMOKE — PASS (alt-residual arch)
+### Session 26 — MERGED turbo's v1.0.0-prep dev refactor; LoRA guards extended to the new fused paths; MoE expert-adapter blocker CLOSED (code)
 
-> No branch/commit yet — a box smoke, not a code change (master @ `81fdd77`,
-> PR #139 in). Closes the last MoE-training box item from Session 21 (box list
-> item 3) / Session 23 ("still open"): the routed-expert QLoRA path on the
-> **Gemma4 alt-residual MoE**, the analogue of the Session-23 Qwen3.6 smoke.
-> Model `/mnt/two/weights/dr-house_mdzerofata-gemma4-G4-MeroMero-26B-A4B-4.45bpw-exl3`
-> (30L×128e top-8, 5 global head_dim-512 layers, VL text tower), semancy,
-> `--parallel split --use-per-device 8 23` + `expandable_segments`,
-> `--prompt-format gemma4-nothink`, r32/α64 **`--expert-r 2`**, targets = 7
-> defaults + `expert_{gate,up,down}_proj`, seq-len 2048, batch 2, 20 steps.
+> Branch `dev-merge` (commits `5beda4d` merge + `0dc258e` guards). Merged
+> upstream/dev at `1d44bd6` (95 commits: CUDA-graph decode paths everywhere,
+> FA2 removed, int8/mul1 mode on by default, extension split into compilation
+> units — 142 C++ files; we touch zero C++). Only 2 textual conflicts
+> (xformers.py — same ImportError fix both sides, took theirs; mlp.py — BC
+> branch reordered, guards re-placed). All our hooks survived the automerge
+> (`has_runtime_lora` guards, `lora_full_weight`, `get_weight_tensor_slice`;
+> `ext.reconstruct_slice` signature unchanged).
 
-- **Param count (routed experts fire):** 119,930,880 trainable. Saved adapter =
-  23,450 tensors, **23,040 routed-expert** = 30L × 128e × 3proj × 2 (A+B) exactly
-  — none dropped. `expert-r 2` on the alt-residual expert keys
-  (`...language_model.layers.N.experts.K.{gate,up,down}_proj.lora_A/B`, VL
-  `language_model` prefix). `adapter_config.json` carries the corrected Gemma4
-  `rank_pattern` `.*\.experts\.\d+\..*` → 2 (the `\d+` form keeps shared_expert
-  out; Gemma4 expert keys have no `.mlp.` segment). **The 410 (not 420)
-  non-expert tensors is self-consistent:** the 5 global layers use
-  `attention_k_eq_v` (k-as-v) so have no separate `v_proj` → 30L×7×2 − 5×2 = 410.
-- **MoE wiring correct:** startup prints `[moe: 30 layers x 128 experts, top-8]`
-  and `attn: 25×flash, 5×sdpa` (the 5 global head_dim-512 layers take the
-  big-head SDPA-math branch, Session 8/21).
-- **Trains healthy:** first loss 3.08 (NOT ~11 random → gemma4-nothink masking
-  correct on the alt-residual arch without a separate `--inspect`), ema
-  3.76→3.22, `|dB|` climbs 0→6.57 monotonically, grad norms ~50–115. One step-3
-  roughness (loss 7.89, grad 1129) self-recovered by step 4 — cold-AdamW + high
-  LR, benign. Coherent throughout. Peak VRAM **9.56 / 15.90 GB** (starve-split
-  worked; head on cuda:1).
-- **Save → `--resume` round-trip PASS:** checkpoints at step 10 & 20; resume
-  restored **11,725 adapter pairs** (= 23,450 tensors / 2) + trainer state
-  ("continuing at step 21/23", cold AdamW as expected). Decisive: `|dB|` is
-  **continuous across the boundary** (6.574 at step 20 → 6.726 → 7.013) — the
-  adapter weights were genuinely restored, not reinitialized. Same two gotchas as
-  Session 23 (`--steps` is ABSOLUTE so resume a step-20 ckpt needs `--steps>20`;
-  resume restarts the data iterator → step-21 loss dipped to 1.98 on re-seen
-  early rows, benign).
-- **Dequant share (MoE cost):** `--profile-dequant 3` → 82,581 reconstructions,
-  **7.607 s/step = 41% of step wall**. Lower absolute than Qwen3.6's 21.56 s/step
-  (30L×128e vs 40L×256e) but the same MoE-dequant-dominates story — reinforces
-  backlog A1 as the MoE win. Step wall bwd-dominated (fwd 29% / bwd 67% / opt 4%).
-- **Gotcha (recorded):** the single-process `qlora_train_native.py` takes `--r`,
-  NOT `--lora-r` — `--lora-r` is the DDP-script rename (torchrun abbrev-eats
-  `--r`). First launch errored `unrecognized arguments: --lora-r 32`.
+**The real risk was semantic, not textual:** upstream added NEW fused paths
+that bypass `Linear.forward` — exactly the Session-24 silent-no-op class.
+All now guarded at their per-call dispatch (graphs stay cached; adapters can
+attach/detach between calls):
 
-**Still open (next box session):** a real Qwen3.6-35B-A3B **SFT + eval-split**
-run (`--eval-split test --save-best --profile-dequant`; A/B attention+shared vs
-+experts on held-out loss) — the first *real* MoE training result vs a smoke;
-then S16 DPO/KTO smokes; MoE validate-gate improvement; backlog #10 fused-kernel
-LoRA perf.
+- `attn.py` / `sliding_attn.py`: `bc_attn_step` / `bc_swa_step` graph-captured
+  decode blocks (all projections through o_proj as one C++ call, bsz≤4 q_len≤16).
+- `gated_delta_net.py`: `BC_GatedDeltaNetSplit` bsz-1 whole-layer fused decode
+  (Qwen3.5 split layout; qkv/z/o trellis + merged base-only `ba_weight_t`).
+  The non-split `BC_GatedDeltaNet` (`run_bsz1_a/b`) has no Python dispatch yet
+  — re-audit when turbo wires it.
+- `block_sparse_mlp.py`: **this closes backlog item "runtime LoRA not applied
+  on fused MoE expert path" (Session 24 note) in code** — `experts_lora`
+  forces the per-expert torch branch past `exl3_moe`, the BC single-expert
+  graph/DQ kernels, and the bsz-1 graph; `sh_fused_lora` keeps the bsz-1 graph
+  (which embeds shared experts + shared gate) honest; `add_sigmoid_gate_proj`
+  falls back when the shared gate carries LoRA. `lora.py` warning downgraded
+  to a slow-path notice (expert adapters now apply, unfused = slower decode —
+  merge for deploy). **Router LoRA remains unsupported** (routing reads
+  `routing_gate.inner.weight` raw on every path) — documented, not guarded.
 
-### Session 27 — Gemma4-MoE semancy SFT with held-out eval → 1-epoch sweet spot; expert-inference blocker confirmed
+**Verified on the box (this machine, 2×3090):**
+- CPU training suite 64/64; `test_lora_fused_path.py` tripwires extended to
+  every new guard, 10/10.
+- Ext rebuilt clean from merged C++ (`setup.py build_ext --inplace`).
+- End-to-end fused-path LoRA smoke (Llama-3.2-1B 4bpw, adapter
+  `/mnt/two/Weights/qlora_test/base`, bsz-1 decode = the new graph path):
+  base coherent → adapter visibly pirates the output → unload restores
+  bit-identical base. Guards engage and release.
 
-> No branch/commit for the run itself (a box experiment). Config committed:
-> `semancy_gemma_moe.yaml`. The first *real* MoE SFT with a held-out curve (vs
-> the S23/S26 smokes): the analogue of backlog item 1, run on the **Gemma4-MoE**
-> (MeroMero-26B-A4B-4.45bpw) instead of Qwen3.6. Dataset `UnstableLlama/semancy`
-> — **philosophy/epistemology chat data** ("what is truth/consciousness/mind"),
-> NOT the malazan RP set (different datasets). Recipe: r32/α64, `expert_r 2`,
-> 10 targets incl. `expert_{gate,up,down}_proj`, lr **5e-5**, cosine, seq_len
-> 1024, gemma4-nothink, split `[8,23]`. The prior *disappointing* Gemma/
-> Semancer-12B (dense) malazan runs had used lr **5e-6** — 10× too low, i.e.
-> undertrained, not a bad base; 5e-5 is the reframed fix.
+**Known-stale upstream tests, do not chase:** `test_ext_norm.py`,
+`test_rope.py`, `test_kv_quant.py`, `test_cache_rotate.py`,
+`test_gated_delta_rule.py` (~488 failures) call pre-refactor kernel
+signatures and fail identically on a pristine upstream/dev checkout —
+upstream test debt, not a merge regression.
 
-- **Held-out curve (116-row `test` split, `sweep_ckpts.py`, load base once →
-  `load_adapter` per checkpoint → completion-masked loss = the trainer's own
-  metric):** baseline 3.53 → step40 2.50 → 120 2.41 → 160 2.41 → **200 2.35
-  (BEST)** → 240 **2.72**. Clean **epoch-1 sweet spot**: held-out falls through
-  epoch 1 (ends step 218), then epoch 2 **overfits** — train loss collapsed to
-  0.56 at the boundary (memorization). Best deployable =
-  `out/gemma4moe_semancy/checkpoint-00000200`. **Lesson: train 1 epoch** on this
-  small (436-row) set; epoch 2 hurts held-out.
-- **BLOCKER (confirms backlog #0/#10):** the before/after gen (`infer_gemma.py`,
-  correct gemma4-nothink template — the stock `qlora_infer_native.py` hardcodes
-  llama3) showed the loader **silently skips runtime LoRA on the fused MoE expert
-  path**: `11520 target modules are routed-expert projections; runtime LoRA is not
-  applied ... (merge the adapter instead)`. So **half** the 23,040 trained expert
-  tensors are unseen at inference — the demo/deploy understates the adapter, and
-  only the merge-and-requantize path reflects the experts. `merge_lora_bf16.py`
-  is only dense-validated (S25) and needs bf16 base weights, both unverified for
-  this MoE.
-- **Config gotchas (all recorded to memory):** `messages_key: messages` REQUIRED
-  for semancy (else "0 SFT examples" — the trainer looks for `output`/
-  `instruction` cols); seq_len 1024 fine (prompts ~26 tok). `eval_every` defaults
-  to **0 = only-at-end** and **gates `save_best`** — set it (e.g. 40) or
-  reconstruct the curve post-hoc from `checkpoint_every` snapshots (what was
-  done). Don't pair `save_every` with `save_best` (both write `out/`). Single-
-  process trainer takes `--r` (not `--lora-r`); launch bg python with `-u`.
-
-**Still open (sequenced):** (1) review turbo's recent **dev-branch refactor**
-FIRST — lots of upstream activity, may move the fix surface; (2) then fix the
-**expert-inference LoRA path** (per-expert fallback, or LoRA-delta on the fused
-mgemm output — backlog #10); (3) then a proper **merged eval** of checkpoint-200
-to judge the semancy voice with experts applied. Reusable tools
-(`sweep_ckpts.py`, `infer_gemma.py`) currently in the ephemeral scratchpad —
-promote to `training/` if kept.
+**Still on the box list:** MoE expert-adapter END-TO-END (guard fires, output
+changes, decode slower-but-correct) — the gemma4moe semancy adapters were
+deleted, so this waits for the next trained expert adapter. GDN adapter-loaded
+decode smoke (Qwen3.5) likewise pending a GDN-target adapter. Expect a small
+follow-up merge when turbo tags v1.0.0.
 
 ---
 
