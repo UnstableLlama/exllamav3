@@ -50,10 +50,15 @@
    lists. Still not covered: Qwen3-Next (fused qkvz layout), sample packing
    on GDN models (rejected loudly; train unpacked — plain Qwen3-MoE and
    Gemma4 MoE pack fine). The Session-24 hole — runtime LoRA NOT applied on
-   the fused MoE expert path — is CLOSED in code (Session 26: `experts_lora`
-   forces the per-expert torch branch; loader warning is now a slow-path
-   notice); end-to-end box demo still pending, needs a trained expert
-   adapter (the gemma4moe semancy ones were deleted).
+   the fused MoE expert path — is fully CLOSED: fixed in code (Session 26)
+   AND box-demoed end-to-end on both MoE arches (Session 28,
+   `training/expert_demo.py` — adapters steer generation at runtime,
+   `unload()` restores base). Remaining here: the **full-curve Qwen3.6
+   attention-only vs +experts A/B** — the 20-step matched read (Session 28)
+   says experts ≈ tie (2.243 vs 2.260, baseline 2.616) and exonerates them
+   from the Session-26 "worse than baseline" result (that was the old
+   recipe), but whether they earn their 5× params over a full run is
+   unanswered.
 1. **Quantization-aware LoRA — BUILT (Session 17), BOX-TESTED + SHELVED
    (Session 25, verdict: not worth it).** `--quant-aware {noise,ste}` was
    built (noise injection on the frozen-weight closure + a straight-through
@@ -3212,6 +3217,75 @@ graph capture of the adapted decode step. Deferred; backlog #10 rewritten
 accordingly. 3B/r128 was not re-measured. Also fixed this session: the stale
 `training/README.md` claim that routed-expert adapters don't apply at
 inference (closed in code in Session 26).
+
+### Session 28 — rsLoRA+PiSSA recipe validated (MeroMero rerun), 20-step MoE-expert A/B, expert-adapter inference demo PASS
+
+> All-box session, three results. New standing recipe per the user:
+> **`use_rslora: true` + `init_lora: pissa` + `alpha = r`** on pretty much
+> every run from here on. Under rsLoRA the effective adapter scale is
+> `alpha/sqrt(r)` (not `alpha/r`), so `r32/alpha32` ≈ 5.7 — hotter than the old
+> `alpha/r = 2.0` runs — and the r32-main vs r2-expert scale disparity drops
+> from 16× (old `alpha 64` default scaling) to 4×. Run YAMLs committed at repo
+> root (`semancy_meromero_1ep.yaml`, `semancy_qwen36_{attn,experts}.yaml`).
+
+**1. MeroMero (Gemma4-MoE 26B) semancy 1-epoch rerun — the recipe pays.**
+Same model/data/split/lr as the Session-26/27 run, new recipe, 1 epoch
+(218 steps), eval every 20 + `save_best`, `checkpoint_every 40` (NOT
+`save_every`, which clobbers the best adapter). Held-out: 3.488 baseline →
+**2.160 best @ step 200** — **8% below the old recipe's best** (2.35 @ 200) —
+with a monotonically descending curve (one noise blip at step 80) and NO
+overfit inside epoch 1. Early convergence ~3× faster (2.41 by step 40 vs step
+120 before). [PERF] ~15 s/step, 7290 s total, peak VRAM 9.7/15.9 GB. PiSSA
+init: 11,725 adapters in 72.6 s. Checkpoint census matches Session 26 exactly
+(23,040 expert + 410 non-expert tensors). Adapter kept in
+`out/meromero_semancy_1ep/` (+5 retained checkpoints).
+
+**2. Qwen3.6-35B-A3B 20-step matched A/B — the Session-26 "experts hurt"
+read was the RECIPE, not the experts.** Both arms identical (new recipe,
+seq 1024, batch 2) except targets; user-truncated at the step-20 eval via
+SIGINT (the trainer's graceful-interrupt path keeps the best-val adapter —
+works nicely as a manual early-stop). Baseline 2.616 (matches S26 exactly):
+
+| arm | params | step-20 held-out |
+|---|---|---|
+| A: attention+shared only (7 targets) | 38.3M | 2.260 |
+| B: + routed experts, `expert_r 2` (10 targets) | 195.6M | **2.243** |
+| Session-26 short run (+experts, old recipe) | 195.6M | 2.912 (WORSE than base) |
+
+Verdict at 20 steps: expert adapters ≈ tie / hair better — decisively NOT the
+2.912 disaster, which is now attributed to the old recipe (no early-stop
+around it, default init, alpha-64 scaling). "Experts actively hurt on small
+data" is dead as a hypothesis under the current recipe; whether they *earn*
+their 5× params and MoE dequant cost needs the full-curve A/B (still open —
+backlog #0). Adapters in `out/qwen36_semancy_{attn,experts}/`; PiSSA init for
+arm B: 30,970 adapters / 163.5 s.
+
+**3. Expert-adapter inference demo — PASS on BOTH MoE arches (closes the
+last Session-26 box item).** New tool `training/expert_demo.py` (BASE →
+ADAPTED → UNLOADED, greedy, trainer chat formats). Prompt "what is truth":
+- **MeroMero + best@200:** base = generic markdown listicle; adapted =
+  unmistakable semancy register ("Truth is not a thing you can hold. It is a
+  relation between a statement and the world it describes."). All 23,450
+  tensors load, the per-expert slow-path notice fires as designed,
+  `unload()` → **byte-identical** base generation.
+- **Qwen3.6 + arm-B best@20:** clear semancy register already at 20 steps
+  ("A mountain existed before anyone named it."). 61,940 tensors load
+  (30,720 routed-expert). `unload()` differed from base by a few words — NOT
+  a leak: two back-to-back BASE-only greedy runs in the same process differ
+  the same way (directly verified; the Session-22 MoE routing-tie
+  non-determinism, worse on a 256-expert router). Demo criterion for MoE:
+  judge unload-restore by "same up to routing-tie noise", confirmed by a
+  base-vs-base rerun.
+- Loader note: a PiSSA adapter loads in its 2r offset form, so the loader
+  line reports `r=64, alpha=64, scaling=1.0` for an r32 pissa adapter —
+  expected, not a config error.
+
+**Ops notes (learned the annoying way):** launch trainers with
+`PYTHONUNBUFFERED=1` — `qlora_train.py` `os.execvp`s the backend, so `-u` on
+the launcher does NOT propagate and the log block-buffers for ~30 min at a
+time. `--no-clean-text` is now deprecated (cleaning is off by default; the
+flag is a harmless no-op). Graceful stop mid-run = SIGINT *after* an `[eval]`
+line prints (the best-adapter write completes before that line).
 
 ---
 
