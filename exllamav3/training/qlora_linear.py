@@ -169,6 +169,166 @@ class EXL3LoRAFunction(torch.autograd.Function):
         return grad_x, grad_a, grad_b, grad_bias, None, None
 
 
+class EXL3LoRAHadFunction(torch.autograd.Function):
+    """
+    Activation-side-transform variant of :class:`EXL3LoRAFunction` (audit A1).
+
+    ``get_weight_tensor()`` builds the effective weight as
+    ``W_eff = diag(suh) @ H @ W_inner @ H @ diag(svh)`` (H = the normalized
+    128-block Hadamard, symmetric and orthogonal), which costs four extra
+    full-weight passes + a dtype cast on EVERY reconstruction. Since the
+    transforms are cheap on activations, this Function reconstructs only the
+    inner weight and computes
+
+        y_base = had(had(x * suh) @ W_inner) * svh
+
+    -- the same math exllamav3's own ``reconstruct_hgemm`` inference path uses.
+    The base matmul runs in the inner weight's native dtype (fp16 on a real
+    quant; whatever the mock closure returns under tests), with the result cast
+    to the compute dtype. The backward adjoint uses the transforms' self-
+    transposedness (H^T = H, diagonals symmetric):
+
+        grad_x_base = had(had(grad_y * svh) @ W_inner^T) * suh
+
+    computed in the GRAD dtype (one weight cast; fp16 grads would risk
+    overflow, so the backward pays the cast the forward avoids).
+
+    The frozen PiSSA offset, folded into the weight closure on the legacy path
+    (``W_eff - offs_scale*(a0@b0)``, a full-weight addmm per reconstruction),
+    is passed here as ``offs_a``/``offs_b`` and applied as a low-rank
+    activation term instead: ``y -= offs_scale*(x@a0)@b0``.
+
+    Tensor shapes: as :class:`EXL3LoRAFunction`, plus ``suh [in]``, ``svh
+    [out]``, ``had [128, 128]``, ``offs_a [in, r]``, ``offs_b [r, out]``.
+    ``inner_fn`` returns the UNtransformed ``[in, out]`` inner weight
+    (``backbone.frozen_trellis_parts``), recomputed in backward, not stored.
+    """
+
+    @staticmethod
+    def _base_matmul(x2d: torch.Tensor, weight: torch.Tensor, suh, svh, had):
+        n_in, n_out = weight.shape
+        xh = ((x2d * suh).view(-1, n_in // 128, 128) @ had).view(-1, n_in)
+        y = xh @ weight
+        y = ((y.view(-1, n_out // 128, 128) @ had).view(-1, n_out)) * svh
+        return y
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        lora_a: Optional[torch.Tensor],
+        lora_b: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
+        scale: float,
+        inner_fn: WeightFn,
+        suh: torch.Tensor,
+        svh: torch.Tensor,
+        had: torch.Tensor,
+        offs_a: Optional[torch.Tensor],
+        offs_b: Optional[torch.Tensor],
+        offs_scale: float,
+    ) -> torch.Tensor:
+        weight = inner_fn()  # [in, out] inner weight, constant w.r.t. autograd
+        wd = weight.dtype
+        n_in = weight.shape[0]
+        xf = x.reshape(-1, n_in)
+
+        yb = EXL3LoRAHadFunction._base_matmul(
+            xf.to(wd), weight, suh.to(wd), svh.to(wd), had.to(wd))
+        y = yb.to(x.dtype)
+
+        if offs_a is not None:
+            a0 = offs_a.to(x.dtype)
+            b0 = offs_b.to(x.dtype)
+            y = y - offs_scale * ((xf @ a0) @ b0)
+        if lora_a is not None and lora_b is not None:
+            a = lora_a.to(x.dtype)
+            b = lora_b.to(x.dtype)
+            y = y + scale * ((xf @ a) @ b)
+        if bias is not None:
+            y = y + bias.to(y.dtype)
+
+        ctx.save_for_backward(x, lora_a, lora_b, offs_a, offs_b)
+        ctx.scale = scale
+        ctx.offs_scale = offs_scale
+        ctx.inner_fn = inner_fn
+        ctx.transforms = (suh, svh, had)
+        ctx.has_bias = bias is not None
+        return y.view(x.shape[:-1] + (weight.shape[1],))
+
+    @staticmethod
+    def backward(ctx, grad_y: torch.Tensor):
+        x, lora_a, lora_b, offs_a, offs_b = ctx.saved_tensors
+        scale = ctx.scale
+        suh, svh, had = ctx.transforms
+
+        in_features = x.shape[-1]
+        out_features = grad_y.shape[-1]
+        xf = x.reshape(-1, in_features)
+        gf = grad_y.reshape(-1, out_features)
+        gd = gf.dtype
+
+        grad_x = grad_a = grad_b = grad_bias = None
+
+        if ctx.needs_input_grad[0]:
+            # Adjoint of the base map: the same transform sandwich with W and
+            # H transposed and suh/svh swapped (the diagonals are their own
+            # transpose; the runtime H happens to be symmetric too, but the
+            # adjoint doesn't rely on it). Runs in the grad dtype -- this is
+            # where the one full-weight cast lives (fp16 grads would risk
+            # overflow).
+            weight = ctx.inner_fn()  # recomputed (or backward-cache hit)
+            grad_x = EXL3LoRAHadFunction._base_matmul(
+                gf, weight.to(gd).transpose(-1, -2),
+                svh.to(gd), suh.to(gd), had.to(gd).transpose(-1, -2),
+            ).view_as(x)
+
+        if offs_a is not None and grad_x is not None:
+            a0 = offs_a.to(gd)
+            b0 = offs_b.to(gd)
+            grad_x = grad_x - ctx.offs_scale * (
+                (gf @ b0.transpose(-1, -2)) @ a0.transpose(-1, -2)).view_as(x)
+
+        if lora_a is not None and lora_b is not None:
+            a = lora_a.to(gd)
+            b = lora_b.to(gd)
+            g_through_b = gf @ b.transpose(-1, -2)               # [N, r]
+            if grad_x is not None:
+                grad_x = grad_x + scale * (
+                    g_through_b @ a.transpose(-1, -2)).view_as(x)
+            if ctx.needs_input_grad[1]:
+                grad_a = (scale * (xf.transpose(-1, -2) @ g_through_b)).to(lora_a.dtype)
+            if ctx.needs_input_grad[2]:
+                p = xf @ a                                        # [N, r]
+                grad_b = (scale * (p.transpose(-1, -2) @ gf)).to(lora_b.dtype)
+
+        if ctx.has_bias and ctx.needs_input_grad[3]:
+            grad_bias = gf.sum(dim=0)
+
+        return (grad_x, grad_a, grad_b, grad_bias,
+                None, None, None, None, None, None, None, None)
+
+
+def qlora_had_linear_forward(
+    x: torch.Tensor,
+    inner_fn: WeightFn,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+    had: torch.Tensor,
+    lora_a: Optional[torch.Tensor] = None,
+    lora_b: Optional[torch.Tensor] = None,
+    scale: float = 1.0,
+    bias: Optional[torch.Tensor] = None,
+    offs_a: Optional[torch.Tensor] = None,
+    offs_b: Optional[torch.Tensor] = None,
+    offs_scale: float = 1.0,
+) -> torch.Tensor:
+    """Functional entry point for the activation-side-transform Function."""
+    return EXL3LoRAHadFunction.apply(
+        x, lora_a, lora_b, bias, scale, inner_fn, suh, svh, had,
+        offs_a, offs_b, offs_scale)
+
+
 def qlora_linear_forward(
     x: torch.Tensor,
     weight_fn: WeightFn,

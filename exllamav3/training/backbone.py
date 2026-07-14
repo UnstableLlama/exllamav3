@@ -590,14 +590,139 @@ def linear_device(linear):
         return getattr(linear, "device", None)
 
 
+# --- backward-phase dequant cache (audit A1; OPT-IN via --dequant-cache) ----
+#
+# Under (unconditional) gradient checkpointing every frozen weight is
+# reconstructed three times per step: outer forward, checkpoint-recompute
+# forward, and the Function backward. The recompute and the backward run
+# back-to-back per block, so caching the weight between exactly those two
+# calls removes one reconstruction per step at the memory cost of one block's
+# frozen weights held live at a time.
+#
+# Box-measured (Session 30): under the FAST dequant path this trade is a net
+# loss -- inner-only reconstructions are so cheap (0.06-0.23 ms) that the
+# cache's bookkeeping and allocator pressure cost ~1-4% tok/s AND +0.5-1.5 GB
+# peak VRAM (worst on many-expert MoE). It therefore defaults OFF; it can pay
+# only under --dequant-mode legacy, where each avoided reconstruction is a
+# 5-7 ms full get_weight_tensor.
+#
+# The trainer wraps ``loss.backward()`` in ``backward_dequant_cache()``; while
+# the phase is active a closure's first call stores its result and the second
+# call returns-and-evicts it (so a block's weights free as its backward
+# consumes them). Outside the phase every call is a plain reconstruction --
+# eval, validation and the outer forward are untouched. Correct for any call
+# count: an unpaired store is dropped when the phase ends, a third call is
+# just a fresh miss. Closures whose result is consumed only once per backward
+# (the fused-CE head) are deliberately NOT cache-wrapped -- they would hold
+# the weight for the whole phase for no reuse.
+_BWD_WEIGHT_CACHE: Optional[dict] = None
+
+
+class backward_dequant_cache:
+    """Context manager arming the recompute->backward weight cache (no-op when
+    constructed with ``enable=False``, so call sites stay unconditional)."""
+
+    def __init__(self, enable: bool = True):
+        self.enable = enable
+
+    def __enter__(self):
+        global _BWD_WEIGHT_CACHE
+        self.prev = _BWD_WEIGHT_CACHE
+        if self.enable:
+            _BWD_WEIGHT_CACHE = {}
+        return self
+
+    def __exit__(self, *exc):
+        global _BWD_WEIGHT_CACHE
+        _BWD_WEIGHT_CACHE = self.prev
+        return False
+
+
+def _cached_weight(key, fn):
+    """Wrap a weight closure with the backward-phase store/evict-on-hit cache.
+    Sits OUTSIDE the profiling wrapper so cache hits cost (and count) nothing
+    toward the ``--profile-dequant`` reconstruction share."""
+    def wrapped():
+        c = _BWD_WEIGHT_CACHE
+        if c is None:
+            return fn()
+        w = c.pop(key, None)
+        if w is None:
+            w = fn()
+            c[key] = w
+        return w
+    return wrapped
+
+
+# --- dequant mode (audit A1, the cheap-per-reconstruction half) -------------
+
+# "fast": DiffLinear runs trellis linears through EXL3LoRAHadFunction --
+# reconstruct only the inner weight and apply the Hadamard/sign transforms to
+# the activations (the same math as inference's ``reconstruct_hgemm``),
+# skipping the four full-weight transform passes + dtype cast that
+# ``get_weight_tensor`` performs per reconstruction. "legacy": the original
+# full-weight closure path, kept for A/B measurement and as the fallback
+# (fp16 inners, quant-aware runs, float64 gradchecks use it regardless).
+_DEQUANT_MODE = "fast"
+
+
+def set_dequant_mode(mode: str) -> None:
+    assert mode in ("fast", "legacy"), f"unknown dequant mode {mode!r}"
+    global _DEQUANT_MODE
+    _DEQUANT_MODE = mode
+
+
+def dequant_mode() -> str:
+    return _DEQUANT_MODE
+
+
+def hadamard_128(device, dtype: torch.dtype) -> torch.Tensor:
+    """The normalized 128x128 Hadamard matrix used by the EXL3 transforms
+    (orthogonal and symmetric: H^-1 = H^T = H), cached per device/dtype."""
+    from ..util.hadamard import get_hadamard_dt
+    return get_hadamard_dt(128, device, dtype, 128 ** -0.5)
+
+
+def frozen_trellis_parts(linear):
+    """
+    The pieces of a standard trellis linear needed for activation-side
+    transforms: ``(inner_fn, suh, svh)`` where ``inner_fn()`` reconstructs the
+    INNER ``[in, out]`` fp16 weight (no Hadamard/sign transforms, no cast) and
+    ``suh``/``svh`` are the input/output sign vectors, such that
+
+        get_weight_tensor() == diag(suh) @ H_128 @ inner @ H_128 @ diag(svh)
+
+    (H block-diagonal at 128). Returns ``None`` when the layer can't take the
+    activation-side path (fp16 inner, or feature dims not 128-aligned) --
+    callers fall back to ``frozen_weight_closure``.
+    """
+    inner = getattr(linear, "inner", None)
+    if getattr(inner, "quant_type", None) != "exl3":
+        return None
+    if inner.in_features % 128 or inner.out_features % 128:
+        return None
+    suh, svh = inner.suh, inner.svh
+    if suh is None or svh is None:
+        return None
+    inner_fn = _cached_weight(
+        (id(inner), "inner"),
+        _timed_reconstruct(lambda: inner.get_inner_weight_tensor()),
+    )
+    return inner_fn, suh, svh
+
+
 def frozen_weight_closure(linear, dtype: torch.dtype) -> Callable[[], torch.Tensor]:
     """
     Closure that reconstructs the frozen effective weight (``[in, out]``) from the
     EXL3 trellis on every call, cast to ``dtype``. Recomputing rather than caching
-    is what lets the backward pass avoid stashing the dense weight.
+    is what lets the backward pass avoid stashing the dense weight (the
+    backward-phase cache above then removes the recompute->backward duplicate).
     """
     inner = linear.inner
-    return _timed_reconstruct(lambda: inner.get_weight_tensor().to(dtype))
+    return _cached_weight(
+        (id(inner), dtype),
+        _timed_reconstruct(lambda: inner.get_weight_tensor().to(dtype)),
+    )
 
 
 def linear_quant_bits(linear) -> Optional[float]:

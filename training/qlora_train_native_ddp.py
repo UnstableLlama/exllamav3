@@ -298,7 +298,17 @@ def _run_main():
                          "token share of the whole step (one small all-reduce of "
                          "the counts per step), so the step gradient equals one "
                          "big batch. mean: the pre-Session-11 mean-of-means.")
+    ap.add_argument("--dequant-mode", choices=["fast", "legacy"], default="fast",
+                    help="Frozen-weight dequant path (audit A1); see the "
+                         "single-GPU arm. Ranks behave identically either way.")
+    ap.add_argument("--dequant-cache", action="store_true",
+                    help="Opt-in recompute->backward frozen-weight cache (3 -> 2 "
+                         "dequants per step, costs VRAM; a net loss under the "
+                         "default fast path -- see the single-GPU arm).")
     args = ap.parse_args()
+
+    from exllamav3.training import backbone as _backbone_cfg
+    _backbone_cfg.set_dequant_mode(args.dequant_mode)
 
     # Cleaning is opt-in (--clean-text); --no-clean-text is now a no-op kept for
     # backward compatibility (warned once, on rank 0, below after setup).
@@ -654,10 +664,11 @@ def _run_main():
 
     # Optional dequant profiling window (all ranks profile so timing stays in
     # lockstep; rank 0 reports).
+    from exllamav3.training import backbone as _backbone
+    dequant_cache = args.dequant_cache and not args.no_grad_ckpt
     dq_profile = None
     dequant_s_per_step = None
     if args.profile_dequant > 0:
-        from exllamav3.training import backbone as _backbone
         dq_profile = {"calls": 0, "s": 0.0}
         _backbone.profile_dequant(dq_profile)
         if is_main(rank):
@@ -693,7 +704,8 @@ def _run_main():
                 timer.mark("fwd")
                 w_i = (n_sup * world_size / total_sup) if args.ga_loss == "token" \
                     else (1.0 / args.grad_accum)
-                (loss * w_i).backward()
+                with _backbone.backward_dequant_cache(enable=dequant_cache):
+                    (loss * w_i).backward()
                 timer.mark("bwd")
                 # The log line below SUMs accum_loss across ranks then divides
                 # by world_size; since the token weights w_i sum to world_size

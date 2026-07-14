@@ -467,7 +467,15 @@ def _run_main():
     ap.add_argument("--head-vocab-chunk", type=int, default=0)
     ap.add_argument("--offload-activations", action="store_true")
     ap.add_argument("--use-liger", action="store_true")
+    ap.add_argument("--dequant-mode", choices=["fast", "legacy"], default="fast",
+                    help="Frozen-weight dequant path (audit A1); see the SFT arm.")
+    ap.add_argument("--dequant-cache", action="store_true",
+                    help="Opt-in recompute->backward frozen-weight cache (a net "
+                         "loss under the default fast path; see the SFT arm).")
     args = ap.parse_args()
+
+    from exllamav3.training import backbone as _backbone
+    _backbone.set_dequant_mode(args.dequant_mode)
 
     method = args.method
     _FAIL_CTX["run_log"] = args.run_log
@@ -814,7 +822,9 @@ def _run_main():
                 loss_val = loss.item()
                 timer.mark("fwd")
                 w_i = m["n"] / total_n
-                (loss * w_i).backward()
+                with _backbone.backward_dequant_cache(
+                        enable=args.dequant_cache and not args.no_grad_ckpt):
+                    (loss * w_i).backward()
                 timer.mark("bwd")
                 accum_loss += loss_val * w_i
                 step_sup += m["sup"]

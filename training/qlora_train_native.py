@@ -1383,7 +1383,27 @@ def _run_main():
                          "HF/Unsloth GA fix). mean: the pre-Session-11 mean-of-"
                          "means (over-weights tokens in short micro-batches), "
                          "kept for reproducing old runs. No-op at --grad-accum 1.")
+    ap.add_argument("--dequant-mode", choices=["fast", "legacy"], default="fast",
+                    help="Frozen-weight dequant path (audit A1). fast (default): "
+                         "reconstruct only the inner trellis weight and apply the "
+                         "Hadamard/sign transforms to the activations (the "
+                         "inference reconstruct_hgemm math). legacy: the original "
+                         "full get_weight_tensor per reconstruction, kept for A/B "
+                         "and reproducing old runs.")
+    ap.add_argument("--dequant-cache", action="store_true",
+                    help="Opt-in: reuse each frozen weight between the checkpoint-"
+                         "recompute forward and its backward (3 -> 2 dequants per "
+                         "step) at the cost of one block's frozen weights held "
+                         "live at a time. Box-measured tradeoffs (Session 30): "
+                         "under the default fast dequant path this is a net LOSS "
+                         "-- reconstructions are so cheap that cache bookkeeping "
+                         "costs ~1-4%% tok/s AND +0.5-1.5 GB peak VRAM (worst on "
+                         "MoE). Only worth trying with --dequant-mode legacy, "
+                         "where each avoided reconstruction is 5-7 ms.")
     args = ap.parse_args()
+
+    from exllamav3.training import backbone as _backbone_cfg
+    _backbone_cfg.set_dequant_mode(args.dequant_mode)
 
     # Seed the failure logger with everything knowable before work starts, so a
     # crash at ANY later point (bad dataset name, OOM, unsupported arch guard)
@@ -1908,10 +1928,14 @@ def _run_main():
 
     # Optional dequant profiling: time every frozen-weight reconstruction for the
     # first N steps to answer "how much of the step is trellis reconstruction".
+    from exllamav3.training import backbone as _backbone
+    # The recompute->backward weight cache only has a second use to serve when
+    # gradient checkpointing recomputes the forward; without it the stores
+    # would just pin every weight for the whole backward.
+    dequant_cache = args.dequant_cache and not args.no_grad_ckpt
     dq_profile = None
     dequant_s_per_step = None
     if args.profile_dequant > 0:
-        from exllamav3.training import backbone as _backbone
         dq_profile = {"calls": 0, "s": 0.0}
         _backbone.profile_dequant(dq_profile)
         print(f" -- profiling dequant (trellis reconstruction) for the first "
@@ -1946,7 +1970,8 @@ def _run_main():
                 timer.mark("fwd")
                 w_i = (n_sup / total_sup) if args.ga_loss == "token" \
                     else (1.0 / args.grad_accum)
-                (loss * w_i).backward()
+                with _backbone.backward_dequant_cache(enable=dequant_cache):
+                    (loss * w_i).backward()
                 timer.mark("bwd")
                 # accum_loss uses the same weights, so under "token" it is the
                 # true per-token mean over the whole accumulation window.

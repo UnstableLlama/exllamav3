@@ -14,7 +14,19 @@ Ordered by expected impact. File references are to the state at commit
 ### Compute waste
 
 **A1. Trellis dequantization runs 3× per linear per step — the biggest
-throughput lever.** `EXL3LoRAFunction` calls `weight_fn()` (a full
+throughput lever.** **DONE (Session 30, see the handoff notes):** landed as
+`EXL3LoRAHadFunction` (reconstruct the inner weight only; Hadamard/sign
+transforms on the activations — inference's `reconstruct_hgemm` math; the
+first fix sketched below was found not to exist at training shapes, since the
+no-reconstruct fused kernel is the ≤144-row decode path and inference itself
+reconstructs at prefill sizes). Box: +28% tok/s (1B), +6% (12B 6bpw), +32%
+(MoE 26B). The second fix below (recompute→backward cache, 3→2) was also
+built but shipped opt-in (`--dequant-cache`): once reconstructions are
+inner-only-cheap, the cache's bookkeeping + held weights measured as a net
+loss (−1–4% tok/s, +0.5–1.5 GB); it can only pay in `--dequant-mode legacy`.
+Original analysis kept below.
+
+`EXL3LoRAFunction` calls `weight_fn()` (a full
 `get_weight_tensor()` reconstruction) in forward AND backward
 (`exllamav3/training/qlora_linear.py`), and non-reentrant gradient
 checkpointing runs the forward twice (outer pass + backward recompute). So
