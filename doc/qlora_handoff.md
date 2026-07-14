@@ -3655,6 +3655,148 @@ via the same aliases, untested — same status as other MoE arches' expert
 smokes); router LoRA (frozen by design); the DDP/pref arms on AFMoE (shared
 code, not box-smoked).
 
+### Session 32 — first framework comparison: EXL3 native vs unsloth (Llama-3.2-3B semancy) + run-log clobber postmortem
+
+> Run 2026-07-14, single 3090 (GPU1), sequential arms; committed in `9f7cb1a`
+> (local master). New arm: `training/qlora_train_unsloth.py` — a clone of the
+> bnb arm using `FastLanguageModel` (NF4 load, `use_gradient_checkpointing=
+> "unsloth"`, `--use-rslora`), run from `~/exl3/unsloth-venv` (torch 2.10,
+> transformers 5.5, unsloth 2026.7.2). Configs:
+> `vs_unsloth_llama3b_exl3{,_pissa}.yaml`; artifacts in
+> `out/vs_unsloth_llama3b_*`. Matched on everything but the frozen-weight
+> format/framework: same collate (pad-to-longest), same fp32 torch AdamW +
+> cosine schedule, batch 4 / seq 1024 / r32 α32 rsLoRA / lr 5e-5, 1 epoch
+> (109 steps). **unsloth's `get_peft_model` REJECTS `init_lora_weights=
+> "pissa"`** (whitelist: True/False/gaussian/loftq/corda), so the matched
+> arms ran default init; PiSSA ran as a third EXL3-only arm.
+
+| arm | held-out loss (start → final) | wall clock | sup tok/s | peak VRAM |
+|---|---|---|---|---|
+| **EXL3 4bpw** (default init) | 3.487 → **2.729** | 314s | 397 | 6.34 GB |
+| **unsloth NF4** (default init) | 3.550 → 2.809 | **168s** | **741** | **4.28 GB** |
+| **EXL3 4bpw + PiSSA** (standing recipe) | 3.487 → 2.775 | 356s | 349 | 6.43 GB |
+
+**Takeaways:**
+- **Speed/VRAM: unsloth wins clearly** — ~1.9× faster wall clock and ~2 GB
+  less peak VRAM on the matched run. Its fwd/bwd split looks like ours
+  (≈35/63); it's just faster per token.
+- **Loss: EXL3 finishes 0.08 nats lower**, but the Δ-from-baseline is nearly
+  identical (−0.758 vs −0.742). So the loss edge is mostly the **better
+  starting quant** (EXL3 4bpw base evals 3.487 vs NF4's 3.550), not better
+  training dynamics. Both arms show clean monotone descent with no
+  intra-epoch overfit.
+- **PiSSA lost to default init here** (2.775 vs 2.729 final) despite the
+  expected faster start (3.085 vs 3.122 at step 10). Single datapoint on a
+  dense 3B — but it's contra the Session-28 MoE result, and the PiSSA arm is
+  also ~12% slower per step (the 2r-offset form doubles adapter FLOPs).
+  Might be worth a rerun at some point before trusting it.
+
+**Why unsloth is ~2× faster — it is NOT gradient checkpointing (verified
+2026-07-14 against the run logs + code):** both arms checkpoint (native
+default; unsloth mode "unsloth") and both offload activations to CPU
+(`offload_activations: true` = torch sync `save_on_cpu`; unsloth's is the
+async variant). Padding is matched (identical collate, pad-to-longest, NOT
+to seq_len), tokens/step match (~1,240 non-pad in both logs), optimizer
+matched (fp32 torch AdamW, 48.6M trainable both arms). The 2× is UNIFORM
+across phases — fwd 0.43→0.24s, bwd 0.94→0.44s per step — i.e. per-linear
+cost, not any single feature:
+1. **EXL3 frozen-weight cost is structural**: even on the S30 fast path,
+   every wrapped linear reconstructs its trellis inner weight 3×/step
+   (fwd, ckpt recompute, bwd) + Hadamard activation transforms; bnb's NF4
+   "dequant" is a 16-entry LUT fused into its kernel. A 3B sits in the
+   small-matrix regime where S30 showed per-reconstruction overhead
+   dominates.
+2. **Unsloth runs fused Triton kernels** (RoPE, RMSNorm, SwiGLU, chunked CE,
+   hand-written fused LoRA fwd/bwd with manual grads — few launches, no
+   autograd-graph overhead) vs our eager autograd. **`use_liger` was OFF in
+   the comparison config** — we didn't field the fused-kernel support we
+   have.
+
+VRAM gap (6.34 vs 4.28 GB), partial attribution (medium confidence, needs a
+diff-run): heavier base on GPU (2.5 GB EXL3 file incl. fp16 embed vs ~2.1 GB
+NF4), fast-path transient fp16 weight reconstructions live at peak, Liger
+off (measured −1.1 GB on the 12B, §Session 12). Side observation: raw grad
+norms differ ~10× between arms (EXL3 ~25–35, unsloth ~3.3) with
+near-identical loss curves — both clip to 1.0 so it's cosmetic here, but
+mind it when transferring unclipped recipes across arms.
+
+**THE PROBLEM, REDUCED (analysis 2026-07-14):** backward ≈ 2× forward in
+BOTH arms (both checkpoint → both pay the recompute; frozen base → no
+weight grads, so bwd = recompute-fwd + dgrad ≈ 2 forwards). The entire 2×
+deficit therefore collapses to one number: **our forward pass is ~1.8×
+slower per token (0.43s vs 0.24s)**. Three components, split NOT yet
+measured (the split needs a profiler pass — do not build on the estimates):
+1. **EXL3 frozen-weight overhead** — trellis inner reconstruct on every
+   linear call (196 linears × 3 calls/step even on the fast path) + 2
+   Hadamard activation passes per call. Est. 10–20% of fwd from the S30
+   microbenches; estimate only.
+2. **Unfused eager ops** — stock PyTorch norms/rope/glue; at 3B/batch-4 the
+   step is substantially launch-bound. (Liger was OFF in the comparison;
+   unsloth's fused kernels were ON — Liger-Kernel is essentially a
+   reimplementation of unsloth's kernel set, so turning it on is PARITY on
+   this axis, not an edge. Same for adamw8bit — and note both comparison
+   arms actually ran fp32 torch AdamW, so the optimizer explains none of
+   the measured gap.)
+3. **LoRA adapters through autograd** — 2 extra GEMMs per linear as
+   separate autograd nodes; unsloth's `fast_lora` fuses these with
+   hand-written backwards.
+
+**POTENTIAL SOLUTIONS (tiered):**
+- **Tier 1 — flags, no code:** `use_liger: true` (+8.8% tok/s / −1.1 GB
+  measured at 12B; likely more on a 3B) and `--no-grad-ckpt` (= audit A2:
+  deletes the recompute forward entirely — ceiling ~1.45× step speedup —
+  and cuts reconstructs 3→2; at 6.3/24 GB there's headroom; trades VRAM
+  the other way).
+- **Tier 2 — engineering (days), biggest structural win:**
+  - **Resident dequant mode** — decode the trellis weights ONCE at load,
+    keep fp16 inner weights in VRAM (~4.8 GB extra on a 3B; fits). Per-
+    linear cost becomes a plain cuBLAS fp16 GEMM — arguably FASTER than
+    unsloth per-linear (they still pay NF4 dequant every call; we'd pay
+    zero). Natural shape: a third `--dequant-mode`, with partial residency
+    (hottest layers) as the fallback when the full model doesn't fit.
+  - **Fused LoRA path** — fold the adapter GEMMs into
+    `EXL3LoRAHadFunction`'s manual backward (the base backward is already
+    hand-written; extending it to adapters kills the per-linear autograd-
+    node overhead — our analog of unsloth's `fast_lora`).
+  - **Async double-buffered CPU offload** (the "unsloth refinement" flagged
+    in Session 9) — ours is synchronous save_on_cpu, ~3% cost.
+- **Tier 3 — real custom Triton:** fuse the suh-scale + Hadamard-128
+  activation transforms into the GEMM prologue/epilogue (~4 extra kernel
+  passes per linear today). Explicitly NOT worth building: a fused
+  trellis-decode-inside-GEMM for training shapes — exllamav3's own
+  inference chose reconstruct-then-cuBLAS at large batch because it wins
+  there, and resident caching makes it moot anyway.
+
+**Honest bottom line:** with Tier 1+2, matching or beating unsloth's tok/s
+on this run class is realistic — but at HIGHER VRAM (resident weights and
+no-ckpt both spend memory for speed). On VRAM we're structurally behind at
+matched bpw (fp16 embeddings, decode transients); the EXL3 story there
+remains low-bpw reach (2–3bpw where NF4 can't follow). Net: a VRAM↔speed
+dial per run, not winning both axes at once.
+
+**THE PLAN (in order; measure before building):**
+1. **Profiler pass** (~15 min box time): 20 steps of the exact comparison
+   config under `torch.profiler` → measure the 1/2/3 split of the 190ms
+   forward gap. This picks the Tier-2 build order; don't skip it.
+2. **Tier-1 A/B** (two ~6-min runs, same 3-arm config): `+use_liger`, then
+   `+use_liger +no_grad_ckpt` → quantifies how much of the 2× the existing
+   flags recover, and A2's real number vs its ~1.45× ceiling.
+3. **Build the Tier-2 item the profile points at** (expected: resident
+   dequant mode first, fused LoRA backward second), re-A/B against the
+   unsloth arm after each.
+
+**Run-log clobber incident (RESOLVED, fixes in `9f7cb1a`):** the unsloth
+clone inherited the bnb arm's drifted `RUN_LOG_FIELDS` (missing `expert_r`)
+→ `append_run_log` saw a schema change and rotated `qlora_runs.csv` → `.bak`;
+arm 3 then rotated AGAIN and overwrote the `.bak`. No compute artifacts lost
+(adapters/out dirs/train logs all survived); the CSV was rebuilt — 12
+historical rows reconstructed from surviving train/driver logs, the errors
+sidecar, and this doc (marked in `notes`), + the 3 comparison rows. Fixes:
+`RUN_LOG_FIELDS` drift corrected in both clones, `.bak` names now
+TIMESTAMPED (a rotation can never overwrite the previous backup), and
+`qlora_runs.csv` is now **git-tracked** (un-ignored). Lessons: keep
+`RUN_LOG_FIELDS` byte-identical across arms; commit the CSV after runs.
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)
