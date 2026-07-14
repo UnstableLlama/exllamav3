@@ -196,7 +196,9 @@ def append_run_log(path, record):
         with open(path, newline="", encoding="utf-8") as f:
             header = next(csv.reader(f), None)
         if header is not None and header != RUN_LOG_FIELDS:
-            bak = path + ".bak"
+            # Timestamped .bak: a fixed name loses the PREVIOUS backup when two
+            # arms with different schemas alternate (2026-07-14 incident).
+            bak = f"{path}.{datetime.datetime.now():%Y%m%d-%H%M%S}.bak"
             os.replace(path, bak)
             print(f"[run-log] schema changed; moved old log to {bak}")
     is_new = not os.path.exists(path)

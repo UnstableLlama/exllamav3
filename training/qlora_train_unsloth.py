@@ -1,36 +1,39 @@
 """
-BNB-NF4 QLoRA baseline arm — the comparison point for QLoRA-on-EXL3.
+Unsloth QLoRA arm — the framework-comparison point for QLoRA-on-EXL3.
 
-Trains the SAME model / data / LoRA config as training/qlora_train_native.py and
-qlora_train_native_ddp.py (the EXL3 arms); the ONLY difference is the frozen
-base-weight format (bitsandbytes NF4 here vs the EXL3 trellis there). Everything
-else is matched so the comparison isolates the quantization format:
+Clone of training/qlora_train_bnb.py with the model/adapters loaded through
+unsloth's FastLanguageModel (bnb NF4 4-bit base + unsloth's patched kernels and
+"unsloth" gradient checkpointing) instead of stock transformers+peft. Everything
+else — data pipeline, masking, scheduler, eval convention, run-log schema — is
+byte-identical to the bnb/EXL3 arms so the comparison isolates the framework:
 
   - same Llama-3 chat prompt + completion-only masking (prompt tokens = -100)
   - same `datasets` shuffle(seed=0)+select and the same deterministic val split
-  - same LoRA (r/alpha/targets, dropout 0, bias none), fp32 adapters, bf16 compute
+  - same LoRA (r/alpha/targets, dropout 0, bias none), optional rsLoRA/PiSSA to
+    match the EXL3 arm's standing recipe (--use-rslora / --init-lora pissa)
   - same optimizer (AdamW, lr, weight decay) + the same LR schedule helper
     (--scheduler/--warmup-*, identical to the EXL3 arm), grad-clip
   - same OpenAI `messages` loader (--messages-key) and real test-split eval
     (--eval-split), so a matched run needs identical flags on both arms
   - held-out loss computed identically (mean per-example completion loss, batch 1)
 
-Runs in a SEPARATE venv (transformers + bitsandbytes + peft + accelerate +
-datasets) so it cannot disturb the pinned torch/EXL3 extension in qlora-venv.
-Point --model at the bf16/fp16 HF safetensors (bnb quantizes to NF4 on load).
+Runs in the SEPARATE ~/exl3/unsloth-venv (unsloth pulls its own torch/
+transformers/trl/peft pins) so it cannot disturb the pinned torch/EXL3
+extension in qlora-venv. Point --model at the bf16/fp16 HF safetensors
+(quantized to NF4 on load). Single-GPU only (unsloth OSS).
 
-Single GPU:
-    ~/exl3/bnb-venv/bin/python training/qlora_train_bnb.py \
-        --model /path/to/Llama-3.2-3B-Instruct-bf16 \
-        --out /mnt/two/adapters/yoda_bnb --dataset /mnt/two/data/yoda_refined.jsonl \
-        --r 64 --alpha 64 --batch 16 --grad-accum 2 --steps 500 --val-frac 0.05 \
-        --eval-every 25 --gen-out /mnt/two/data/yoda_bnb_samples.jsonl
-
-Multi-GPU (DDP; --batch is PER-GPU, effective = batch * nproc * grad-accum):
-    ~/exl3/bnb-venv/bin/torchrun --standalone --nproc_per_node=2 \
-        training/qlora_train_bnb.py --model ... --out ... --dataset ... \
-        --r 64 --alpha 64 --batch 16 --steps 500 --val-frac 0.05 --eval-every 25
+    ~/exl3/unsloth-venv/bin/python training/qlora_train_unsloth.py \
+        --model /mnt/two/weights/meta-llama-Llama-3.2-3B-Instruct \
+        --out out/vs_unsloth_llama3b_unsloth \
+        --dataset UnstableLlama/semancy --messages-key messages \
+        --eval-split test --eval-every 10 --save-best \
+        --lora-r 32 --alpha 32 --use-rslora --init-lora pissa \
+        --lr 5e-5 --scheduler cosine --warmup-ratio 0.03 \
+        --batch 4 --epochs 1 --seq-len 1024 --shuffle
 """
+
+# unsloth must be imported before transformers/peft/trl so its patches land.
+from unsloth import FastLanguageModel
 
 import argparse
 import csv
@@ -433,6 +436,12 @@ def _run_main():
     # torchrun's own --rdzv-*/--role options. dest stays "r".
     ap.add_argument("--lora-r", dest="r", type=int, default=64)
     ap.add_argument("--alpha", type=float, default=64.0)
+    ap.add_argument("--use-rslora", action="store_true",
+                    help="rsLoRA scaling (alpha/sqrt(r)); matches the EXL3 arm's "
+                         "standing recipe.")
+    ap.add_argument("--init-lora", choices=["default", "pissa"], default="default",
+                    help="LoRA init; pissa maps to PEFT init_lora_weights='pissa' "
+                         "(SVD of the dequantized base weight).")
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--weight-decay", type=float, default=0.01,
                     help="AdamW weight decay on the LoRA params (default 0.01, "
@@ -513,27 +522,12 @@ def _run_main():
                          "is the old mean-of-means.")
     args = ap.parse_args()
 
-    from transformers import (AutoModelForCausalLM, AutoTokenizer,
-                              BitsAndBytesConfig)
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-
-    # DDP: same manual pattern as qlora_train_native_ddp.py (replicate the small
-    # NF4 model per GPU, shard the batch, all-reduce only the LoRA grads). No
-    # torch-DDP wrapper, so bitsandbytes' 4-bit params don't trip its bucketing.
-    ddp = "RANK" in os.environ
-    if ddp:
-        rank = int(os.environ["RANK"])
-        local_rank = int(os.environ["LOCAL_RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        torch.cuda.set_device(local_rank)
-        # device_id so NCCL barriers/collectives use this rank's GPU (without it
-        # barrier() warns and can hang at teardown).
-        dist.init_process_group(backend="nccl",
-                                device_id=torch.device("cuda", local_rank))
-    else:
-        rank, local_rank, world_size = 0, 0, 1
-    is_main = rank == 0
-    device = f"cuda:{local_rank}"
+    # Single-GPU only (unsloth OSS has no multi-GPU); keep the bnb arm's ddp
+    # plumbing as dead branches so the loop code stays diffable against it.
+    ddp = False
+    rank, local_rank, world_size = 0, 0, 1
+    is_main = True
+    device = "cuda:0"
 
     # Failure logger context (rank 0 only; other ranks keep run_log=None).
     if is_main:
@@ -541,18 +535,19 @@ def _run_main():
         _FAIL_CTX["phase"] = "startup"
         _FAIL_CTX["record"] = {
             "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
-            "arm": "bnb-nf4", "model": args.model, "out": args.out,
+            "arm": "unsloth-nf4", "model": args.model, "out": args.out,
             "dataset": args.dataset, "eval_split": args.eval_split or "",
             "eval_dataset": args.eval_dataset or "",
             "eval2_dataset": args.eval2_dataset or "",
             "r": args.r, "alpha": args.alpha, "lr": args.lr,
+            "use_rslora": int(bool(args.use_rslora)), "init_lora": args.init_lora,
             "scheduler": args.scheduler, "weight_decay": args.weight_decay,
             "batch": args.batch, "grad_accum": args.grad_accum,
             "world_size": world_size,
             "eff_batch": args.batch * world_size * args.grad_accum,
             "epochs": args.epochs, "steps_planned": args.steps,
             "seq_len": args.seq_len, "compute_dtype": "bfloat16",
-            "attn_impl": "hf-sdpa", "parallel": "ddp" if ddp else "single",
+            "attn_impl": "unsloth", "parallel": "ddp" if ddp else "single",
             "shuffle": int(bool(args.shuffle)), "pack": 0,
             "pack_algo": "", "ga_loss": args.ga_loss,
             "max_samples": args.max_samples, "train_embeddings": 0,
@@ -563,27 +558,23 @@ def _run_main():
     random.seed(args.seed)
 
     _FAIL_CTX["phase"] = "load_model"
-    tok = AutoTokenizer.from_pretrained(args.model)
+    model, tok = FastLanguageModel.from_pretrained(
+        model_name=args.model, max_seq_length=args.seq_len,
+        dtype=torch.bfloat16, load_in_4bit=True,
+    )
     pad_id = tok.pad_token_id
     if pad_id is None:
         pad_id = tok.eos_token_id
 
-    bnb = BitsAndBytesConfig(
-        load_in_4bit=True, bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16,
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, quantization_config=bnb, torch_dtype=torch.bfloat16,
-        device_map={"": local_rank},
-    )
     model.config.use_cache = False
-    model = prepare_model_for_kbit_training(
-        model, use_gradient_checkpointing=not args.no_grad_ckpt)
-    lcfg = LoraConfig(
-        r=args.r, lora_alpha=args.alpha, target_modules=TARGET_MODULES,
-        lora_dropout=0.0, bias="none", task_type="CAUSAL_LM",
+    init_lora_weights = "pissa" if args.init_lora == "pissa" else True
+    model = FastLanguageModel.get_peft_model(
+        model, r=args.r, lora_alpha=args.alpha, target_modules=TARGET_MODULES,
+        lora_dropout=0.0, bias="none",
+        use_gradient_checkpointing=False if args.no_grad_ckpt else "unsloth",
+        random_state=args.seed, max_seq_length=args.seq_len,
+        use_rslora=args.use_rslora, init_lora_weights=init_lora_weights,
     )
-    model = get_peft_model(model, lcfg)
     if is_main:
         model.print_trainable_parameters()
 
@@ -811,7 +802,7 @@ def _run_main():
     if is_main:
         if val_loss is not None:
             tag = f" (best kept: {best_val:.4f})" if args.save_best else ""
-            print(f"\n[EVAL] held-out loss (BNB-NF4 arm): {val_loss:.4f}{tag} "
+            print(f"\n[EVAL] held-out loss (unsloth arm): {val_loss:.4f}{tag} "
                   f"over {len(val_examples)} examples")
         if val2_loss is not None:
             print(f"[EVAL] eval2 ({eval2_label}) loss: {val2_loss:.4f} "
@@ -828,18 +819,19 @@ def _run_main():
         rnd = lambda x, n=6: round(x, n) if isinstance(x, (int, float)) else ""
         archs = getattr(model.config, "architectures", None) or [""]
         append_run_log(args.run_log, {
-            "timestamp": run_started, "arm": "bnb-nf4", "status": status,
+            "timestamp": run_started, "arm": "unsloth-nf4", "status": status,
             "model": args.model, "arch": archs[0], "out": args.out,
             "dataset": args.dataset, "eval_split": args.eval_split or "",
             "eval_dataset": args.eval_dataset or "", "eval2_dataset": args.eval2_dataset or "",
             "r": args.r, "alpha": args.alpha, "lr": args.lr,
+            "use_rslora": int(bool(args.use_rslora)), "init_lora": args.init_lora,
             "scheduler": args.scheduler, "warmup_steps": warmup_steps,
             "weight_decay": args.weight_decay, "batch": args.batch,
             "grad_accum": args.grad_accum, "world_size": world_size,
             "eff_batch": eff_batch, "epochs": args.epochs,
             "steps_planned": args.steps, "steps_done": step, "seq_len": args.seq_len,
             "targets": " ".join(TARGET_MODULES), "compute_dtype": "bfloat16",
-            "attn_impl": "hf-sdpa", "parallel": "ddp" if ddp else "single",
+            "attn_impl": "unsloth", "parallel": "ddp" if ddp else "single",
             "shuffle": int(bool(args.shuffle)), "pack": 0,
             "pack_algo": "", "ga_loss": args.ga_loss,
             "max_samples": args.max_samples,
