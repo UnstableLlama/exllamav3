@@ -53,6 +53,9 @@
    the fused MoE expert path — is fully CLOSED: fixed in code (Session 26)
    AND box-demoed end-to-end on both MoE arches (Session 28,
    `training/expert_demo.py` — adapters steer generation at runtime,
+   **AFMoE (Trinity-Nano) added Session 31: dots sigmoid router + full-width
+   attention gate + NoPE layers, box-validated with a fast-vs-legacy A/B —
+   see the Session 31 notes,**
    `unload()` restores base). Remaining here: the **full-curve Qwen3.6
    attention-only vs +experts A/B** — the 20-step matched read (Session 28)
    says experts ≈ tie (2.243 vs 2.260, baseline 2.616) and exonerates them
@@ -3556,6 +3559,101 @@ tracker); consider CUDA-event-based dequant profiling to fix the sync
 inflation; audit item A2 (skip checkpointing under VRAM headroom) would now
 cut the remaining recompute reconstruct (2 → 1 per step) AND the recompute
 matmuls themselves — its value went up now that dequant is cheap.
+
+### Session 31 — AFMoE (Trinity-Nano) training support: dots sigmoid router, full-width attention gate, NoPE layers — built + box-validated
+
+> Built and box-gated 2026-07-13 on `alpindale/Trinity-Nano-Preview-exl3-4.0bpw`
+> (Arcee AFMoE: 56 layers, hidden 1024, 128 experts top-8 + 1 shared, first 2
+> layers dense, sliding 2048 on 3/4 layers, muP). Downloaded to
+> `/mnt/two/weights/alpindale-Trinity-Nano-Preview/4.0` (~3.6 GB). The
+> inference side already had `architecture/afmoe.py`; this session made the
+> TRAINING forward cover it. Great small-MoE test vehicle (10-step smokes run
+> in ~3 min on one 3090 at 7.5 GB).
+
+**What AFMoE needed (all read-from-modules, per the backbone seam):**
+
+1. **"dots" sigmoid router** (`_moe_out`, mirrors `ext.routing_ds3_nogroup`
+   exactly — verified against the CUDA kernel source): sigmoid scores;
+   `e_score_correction_bias` (checkpoint `expert_bias`) added for top-k
+   SELECTION only; selected experts weighted by their UNBIASED scores
+   normalized over the selected set (+1e-20) × `routed_scaling_factor`
+   (2.826 here). Differentiable through sigmoid/gather/normalize; selection
+   is piecewise-constant as ever. `_assert_moe_supported` now accepts
+   `router_type in ("std", "dots")` (grouped ds3 still rejected); metadata
+   carries `router_type` / `routed_scaling_factor` / laundered
+   `e_score_bias`.
+2. **Full-width attention output gate**: a separate `self_attn.gate_proj`
+   linear ([hidden, nq·hd]); `o *= sigmoid(g)` on the flattened context
+   before o_proj — the same multiply as Qwen3.5's interleaved gate, just
+   sourced from its own linear (`backbone.attn_gate_linear`). HEADWISE
+   gating stays rejected. The gate wrapper answers to the `gate_proj`
+   target (PEFT-suffix behavior: AFMoE keys it gate_proj, so the default
+   list adapts it — 8 target types hit vs the usual 7) and to
+   `attn_gate_proj` to adapt it alone.
+3. **NoPE layers**: AFMoE full-attention layers carry NO RoPE
+   (`rope_settings=None`); metadata `inv_freq=None` skips the rotation,
+   mirroring inference's `if self.rope:`. `assert_block_supported`
+   distinguishes intended NoPE from a missing table.
+4. Already-covered features it rides for free: muP embedding multiplier
+   (`embed.multiplier`), 4-norm sandwich blocks (Gemma path), q/k norms,
+   sliding/full mix, ungated shared expert, dense-first-N layers, 200k-vocab
+   6-bit head.
+
+Also: `chatml` prompt-format alias (= plain `qwen3.5`; Trinity's own Jinja
+template is exact ChatML), `default_chat_prompt` on `AfmoeModel` so `auto`
+works, and a **`turn_end_token` fix**: Trinity's Llama-derived tokenizer
+REGISTERS `<|eot_id|>` but ends turns with `<|im_end|>` (its EOS) — a ChatML
+EOS now wins over a merely-registered `<|eot_id|>`. Plus
+`qlora_infer_native.py`: filter `None` out of `config.eos_token_id_list`
+(Trinity's generation_config defines no eos → `[None]` crashed the Job
+constructor).
+
+**Container tests** (all green): `test_moe.py` grew a dots reference test
+(independent transcription of the HF/kernel math), a bias-selects-but-
+never-weights semantics test, and a dots fp64 gradcheck;
+`test_native_llama.py` grew an AFMoE block test (full gate + NoPE + sliding
+variants vs an independent reference, plus gate-adapter grad flow).
+
+**Box gates (single 3090, bf16, r32 rsLoRA+PiSSA α=r, semancy, chatml):**
+
+- **Forward parity vs native inference: healthy.** Next-token matches on all
+  validate prompts, last-token cos ≈0.999, per-position argmax 85–100% — the
+  established MoE routing-tie signature, not a defect.
+- **Dequant-parity gate: FAIL, and that is EXPECTED on MoE** — new finding.
+  The gate compares fast-vs-legacy adapter grads, but fp noise between the
+  arms flips per-token expert SELECTION (worst on a 128-expert sigmoid
+  router), so the arms genuinely compute different downstream values; ~60%
+  of adapters landed off-tolerance with correct math. The gate now prints an
+  interpretive NOTE on MoE models pointing at the real gate:
+- **Fast-vs-legacy training A/B — PASS.** Step-1 loss (pure forward,
+  identical init) 3.0210 vs 3.0208; step-1 |dB| identical (0.153). At lr
+  5e-5 (spike-recovery regime, grad norms to 1000) per-step losses diverge
+  visibly — routing chaos amplification; at lr 1e-5 (stable) losses match to
+  ~0.01–0.02/step and **|dB| to 3 decimals at every step** (0.116 vs 0.116
+  at step 10). Decisive extra evidence: same-arm run-to-run loss variation
+  (legacy vs legacy across rounds) is ALSO ~0.01 — MoE routing ties are
+  nondeterministic run-to-run, so fast-vs-legacy sits INSIDE run noise.
+  **Fast (the default) is safe on AFMoE**, and worth it: +8–10% tok/s
+  (83 vs 77 tok/s at 5e-5, 75 vs 68 at 1e-5) at identical 7.46 GB peak.
+- **10-step SFT smoke: clean.** pissa init on 448 adapters (8 target types
+  incl. the attention gate) in 5s; loss falls, |dB| grows smoothly, ~15 s/step
+  at seq 1024 batch 4. NOTE the 5e-5 first-step kick (grad 1026, loss spike
+  7.7 recovering by step 10): Trinity likely wants **lr 1e-5** with
+  rsLoRA+PiSSA, like Gemma in the semancer suite — untuned, single-datapoint
+  read.
+- **Inference smoke: PASS, visibly.** `qlora_infer_native.py --prompt-format
+  chatml` on the 10-step 5e-5 adapter: loads clean (896 tensors = 448
+  adapters × 2, PiSSA 2r loader line `r=64, alpha=64, scaling=1.0` as
+  expected for r32 pissa), and the generations VISIBLY steer — base Trinity
+  answers as a helpful assistant, the adapted model adopts semancy's
+  abstract semantic-analysis register on every prompt. The strongest
+  end-to-end demo yet at 10 steps (contrast the invisible DPO/KTO deltas of
+  Sessions 29–30 — dense every-token style SFT surfaces fast).
+
+**Not covered:** routed-expert (`expert_*`) adapter training on AFMoE (wired
+via the same aliases, untested — same status as other MoE arches' expert
+smokes); router LoRA (frozen by design); the DDP/pref arms on AFMoE (shared
+code, not box-smoked).
 
 ---
 

@@ -393,7 +393,8 @@ def check_dequant_parity(model, tokenizer, prompt, device, cdt, attn_impl="auto"
         del net
         return logits, loss.item(), grads
 
-    def compare(label, pissa, agree_min, cos_min, rel_max, med_rel_max):
+    def compare(label, pissa, agree_min, cos_min, rel_max, med_rel_max,
+                is_moe=False):
         prev_mode = _bb.dequant_mode()
         try:
             logits_f, loss_f, g_f = run("fast", cache=True, pissa=pissa)
@@ -436,6 +437,15 @@ def check_dequant_parity(model, tokenizer, prompt, device, cdt, attn_impl="auto"
             for c, r, k in by_cos[:3]:
                 print(f"      {c:.6f}  rel {r:.2e}  {k}")
         print(f"    {label}:", "PASS" if ok else "FAIL")
+        if not ok and is_moe:
+            print("    NOTE (MoE): fast-vs-legacy fp noise can flip top-k "
+                  "EXPERT SELECTION per token, so the two arms genuinely "
+                  "compute different downstream values and grad parity is "
+                  "expected to fail here even with correct math (the same "
+                  "routing-tie phenomenon as the argmax gate; worst on "
+                  "many-expert sigmoid routers). Read the forward gate + a "
+                  "short fast-vs-legacy training A/B (loss + |dB| curves) "
+                  "as the real gate on MoE models.")
         return ok
 
     # Round 1: default-init adapters (B=0 -- the pure base + LoRA-grad path).
@@ -454,12 +464,14 @@ def check_dequant_parity(model, tokenizer, prompt, device, cdt, attn_impl="auto"
     # AGREE IN DIRECTION (cos) and the median amplitude error stays small,
     # while individual amplitude outliers pass. A formula bug (offset sign /
     # scale / orientation) breaks cos and the medians by orders of magnitude.
+    _is_moe = any(_bb.is_block_sparse_mlp(getattr(m, "mlp", None))
+                  for m in model.modules)
     all_ok = compare("default init", pissa=False,
                      agree_min=0.98, cos_min=0.98, rel_max=0.25,
-                     med_rel_max=0.10)
+                     med_rel_max=0.10, is_moe=_is_moe)
     all_ok &= compare("pissa init + offset", pissa=True,
                       agree_min=0.93, cos_min=0.90, rel_max=1.0,
-                      med_rel_max=0.25)
+                      med_rel_max=0.25, is_moe=_is_moe)
 
     print("  dequant parity:", "PASS" if all_ok else
           "FAIL -- do NOT train with --dequant-mode fast")

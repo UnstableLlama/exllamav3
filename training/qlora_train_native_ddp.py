@@ -141,7 +141,7 @@ def _run_main():
                          "response; the flat instruction/response keys are ignored.")
     ap.add_argument("--prompt-format",
                     choices=["auto", "mistral", "metharme", "gemma4-nothink",
-                             "llama3", "qwen3.5", "qwen3.5-nothink"],
+                             "llama3", "qwen3.5", "qwen3.5-nothink", "chatml"],
                     default="auto",
                     help="Chat format. auto: the model's native template "
                          "(Llama-3, Mistral [INST], mistral3 [SYSTEM_PROMPT]/[INST]). "

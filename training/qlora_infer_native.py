@@ -93,7 +93,11 @@ def main():
 
     # Stop at end-of-turn so the demo shows one clean answer instead of running
     # past <|eot_id|> into hallucinated new assistant turns.
-    stop = list(getattr(config, "eos_token_id_list", None) or [])
+    # Filter Nones: a checkpoint whose generation_config.json defines no
+    # eos_token_id (Trinity-Nano) yields eos_token_id_list == [None], which
+    # the Job constructor rejects.
+    stop = [t for t in (getattr(config, "eos_token_id_list", None) or [])
+            if t is not None]
     if tokenizer.eos_token_id is not None and tokenizer.eos_token_id not in stop:
         stop.append(tokenizer.eos_token_id)
     stop += ["<|eot_id|>", "<|start_header_id|>", "</s>", "<|im_end|>"]

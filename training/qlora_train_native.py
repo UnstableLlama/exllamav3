@@ -332,9 +332,15 @@ def turn_end_token(tokenizer):
     family ends a turn with ``<|eot_id|>``; Mistral/Tekken and most others use
     their EOS (``</s>``). We pick ``<|eot_id|>`` only when it actually exists as
     a special token (preserving the proven Llama path), otherwise the tokenizer's
-    EOS. Encoded with ``encode_special_tokens=True`` it maps to the single
-    special id, matching the generator's stop condition.
+    EOS. Exception: a ChatML EOS (``<|im_end|>``) wins over a merely-registered
+    ``<|eot_id|>`` -- AFMoE/Trinity ships a Llama-derived tokenizer that still
+    REGISTERS ``<|eot_id|>`` but ends turns with ``<|im_end|>`` (its EOS and
+    what its own chat template emits). Encoded with
+    ``encode_special_tokens=True`` it maps to the single special id, matching
+    the generator's stop condition.
     """
+    if tokenizer.eos_token == "<|im_end|>":
+        return tokenizer.eos_token
     if "<|eot_id|>" in tokenizer.extended_piece_to_id:
         return "<|eot_id|>"
     if tokenizer.eos_token:
@@ -433,7 +439,10 @@ def format_prompt_and_eot(model, tokenizer, prompt_format):
                     f"<|start_header_id|>user<|end_header_id|>\n\n{user}<|eot_id|>"
                     f"<|start_header_id|>assistant<|end_header_id|>\n\n")
         return build, "<|eot_id|>"
-    if prompt_format in ("qwen3.5", "qwen3.5-nothink"):
+    if prompt_format in ("qwen3.5", "qwen3.5-nothink", "chatml"):
+        # "chatml" is an alias for the plain (non-nothink) ChatML template --
+        # the same format Qwen uses, and what AFMoE / Trinity checkpoints ship
+        # as their Jinja template (no think block).
         nothink = "<think>\n\n</think>\n\n" if prompt_format.endswith("-nothink") else ""
         def build(user, system=None):
             sys_part = f"<|im_start|>system\n{system}<|im_end|>\n" if system else ""
@@ -445,7 +454,7 @@ def format_prompt_and_eot(model, tokenizer, prompt_format):
                 turn_end_token(tokenizer))
     raise ValueError(f"unknown prompt-format '{prompt_format}' "
                       f"(expected auto/mistral/metharme/gemma4-nothink/llama3/"
-                      f"qwen3.5/qwen3.5-nothink)")
+                      f"qwen3.5/qwen3.5-nothink/chatml)")
 
 
 # Stage directions / inline actions, e.g. "[as CAMBIO]", "[TRINCULO grabs ...]",
@@ -1138,7 +1147,7 @@ def _run_main():
                          "are ignored.")
     ap.add_argument("--prompt-format",
                     choices=["auto", "mistral", "metharme", "gemma4-nothink",
-                             "llama3", "qwen3.5", "qwen3.5-nothink"],
+                             "llama3", "qwen3.5", "qwen3.5-nothink", "chatml"],
                     default="auto",
                     help="Chat format. auto: the model's native template "
                          "(Llama-3, Mistral [INST], mistral3 [SYSTEM_PROMPT]/[INST]). "

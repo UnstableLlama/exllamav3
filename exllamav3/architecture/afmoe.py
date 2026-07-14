@@ -262,3 +262,14 @@ class AfmoeModel(Model):
             prepare_for_recurrence(input_ids, params, self)
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
+
+    def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
+        # ChatML, matching the checkpoint's own Jinja template (Trinity).
+        p = ""
+        if system_prompt:
+            p += f"<|im_start|>system\n"
+            p += f"{system_prompt}<|im_end|>\n"
+        p += f"<|im_start|>user\n"
+        p += f"{prompt}<|im_end|>\n"
+        p += f"<|im_start|>assistant\n"
+        return p

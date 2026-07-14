@@ -60,6 +60,40 @@ optim: paged_adamw8bit
 - **Correctness gates, not vibes**: `qlora_validate_native.py` checks the differentiable forward against the native inference forward, the Liger backward against plain torch, packing isolation, and each adapter init's step-0 math — before you spend GPU-days. A CPU test suite covers the gradient path end-to-end.
 - **Standard outputs**: adapters save as PEFT-format safetensors, loadable by exllamav3's native LoRA loader (TabbyAPI), PEFT, or merge scripts. Runtime adapters apply correctly on every inference path; note that decode is slower **while an adapter is loaded** (the graph-fused decode paths can't run under one — `unload()` restores full speed), and deploying via merge-and-requantize has no hit at all.
 
+### Supported architectures (training)
+
+The differentiable forward reads every norm/activation/scale from the loaded modules and is validated against the native inference forward per architecture. Unsupported layouts are **rejected loudly at construction** — nothing silently mistrains.
+
+| Architecture family | Examples | Status |
+|---|---|---|
+| Llama (plain pre-norm dense) | Llama 3.x, DeciLM-lite | **Box-proven** (SFT, DPO/KTO, packing, DDP, split) |
+| Mistral dense | Mistral 7B v0.3, Mistral-Nemo (Rocinante-XL-16B), Mistral Small/Medium 3.x (`mistral3`) | **Box-proven** (16B metharme SFT; Medium-3.5-128B) |
+| Qwen2 dense | Qwen2/2.5 | Accepted (same plain path as Llama) |
+| Qwen3 dense | Qwen3 4B/8B/14B | **Box-proven** (q/k-norm path) |
+| Qwen3-MoE / Qwen3.5-MoE | Qwen3-30B-A3B, Qwen3.6-35B-A3B | **Box-proven** (std softmax router; shared expert + sigmoid shared gate; routed-expert adapters opt-in via `expert_*` targets) |
+| Qwen3.5/3.6 hybrids | Qwen3.5 0.8B–4B, Qwen3.6-27B | **Box-proven** (differentiable Gated DeltaNet + gated attention; no sample packing on GDN models) |
+| Gemma 3/4 | Gemma3, Gemma4-12B, Gemma4 MoE (MeroMero-26B) | **Box-proven** (sandwich norms, GeGLU, sliding/full, softcap, big-head, Gemma4 MoE alt-residual layout) |
+| AFMoE | **Trinity-Nano** (Arcee), dots.llm1-style sigmoid routers | **Box-proven** (10-step SFT + fast-vs-legacy A/B + adapter steering generation at inference) — dots sigmoid router (selection bias, normalize-over-selected, route scale), full-width attention output gate, NoPE full-attention layers, muP embedding, ungated shared expert, dense-first-N layers |
+| Mixtral | Mixtral 8x7B | Accepted (std router, no shared expert) — not yet box-tested |
+| Qwen-VL text towers | Qwen2.5/3-VL | **Box-proven**, text-only (mRoPE collapses to 1D RoPE; vision tower not trained) |
+| Rejected loudly | Qwen3-Next (fused-qkvz GDN), grouped ds3-router MoE (DeepSeek-V3), headwise attention gating, non-NeoX RoPE | — |
+
+MoE note: the plain `gate_proj`/`up_proj`/`down_proj` targets adapt dense MLPs and the always-active shared expert; routed experts are opt-in (`expert_gate_proj` etc., with `--expert-r` for rank). Routers stay frozen. On AFMoE the *attention* gate is keyed `self_attn.gate_proj` in the checkpoint and rides the `gate_proj` target (or `attn_gate_proj` to adapt it alone).
+
+### Prompt formats (`--prompt-format` / `prompt_format:`)
+
+| Format | Template | Use with |
+|---|---|---|
+| `auto` (default) | The model's own architecture template (`default_chat_prompt`) + arch-correct turn-end token | Any supported base |
+| `llama3` | `<\|start_header_id\|>…<\|eot_id\|>` headers | Llama-3 family (explicit / cross-arch) |
+| `mistral` | `<s>[SYSTEM_PROMPT]…[/SYSTEM_PROMPT][INST]…[/INST]` (V7+/V13, no spaces) | Mistral instruct family |
+| `chatml` (= `qwen3.5`) | `<\|im_start\|>role\n…<\|im_end\|>` | Qwen, **Trinity/AFMoE**, any ChatML base |
+| `qwen3.5-nothink` | ChatML with the `<think>` block pre-closed empty | Qwen3.5/3.6 reasoning bases, trained to answer directly |
+| `gemma4-nothink` | Gemma4 turns with the thought channel pre-closed | Gemma4 |
+| `metharme` | `<\|system\|>/<\|user\|>/<\|model\|>` markers | Pygmalion-style tunes on any base |
+
+All formats do exact prompt/response boundary masking (prompt and response are tokenized separately) and single-BOS normalization; verify any new base with `--inspect 3` before training.
+
 ### Modern PEFT: SVD adapter initializations
 
 Short SFT runs spend a large fraction of their steps just growing the adapter off the ground (the default zero-init of B). This fork implements the current crop of SVD-based initializations, adapted to an immutable quantized base — select with one config key, `init_lora`:
@@ -77,7 +111,7 @@ The DPO/KTO preference-training implementation follows the loss semantics of **[
 
 ### Project status
 
-Research fork under active development. The core mechanism is proven end-to-end: validated forward parity on the quantized weights, healthy trainings from 1B to 16B models on 1–2× RTX 3090 (including 8k-context packed runs on a 12B), adapters that load and steer generation on the native inference path. Training-side architecture support currently covers **Llama-family, Gemma 3/4 (incl. Gemma4 MoE), Qwen3-dense, Qwen3-MoE, Qwen3.5/3.6 hybrids (differentiable Gated DeltaNet + gated attention) incl. Qwen3.5-MoE, and Mistral(-Nemo) dense models** (MoE box validation pending; no sample packing on Gated DeltaNet models); unsupported features are rejected loudly rather than silently mistrained. Interfaces may still move between sessions — the full engineering log with per-session results and rationale lives in [`doc/qlora_handoff.md`](doc/qlora_handoff.md), and experiment-specific tooling is quarantined in [`training/experiments/`](training/experiments/). Some inference-side fixes made here are candidates for upstreaming.
+Research fork under active development. The core mechanism is proven end-to-end: validated forward parity on the quantized weights, healthy trainings from 1B to 16B models on 1–2× RTX 3090 (including 8k-context packed runs on a 12B), adapters that load and steer generation on the native inference path. Training-side architecture support currently covers **Llama-family, Gemma 3/4 (incl. Gemma4 MoE), Qwen3-dense, Qwen3-MoE, Qwen3.5/3.6 hybrids (differentiable Gated DeltaNet + gated attention) incl. Qwen3.5-MoE, AFMoE (Trinity-Nano — dots sigmoid router, gated attention, NoPE), and Mistral(-Nemo) dense models** (see the supported-architectures table above; no sample packing on Gated DeltaNet models); unsupported features are rejected loudly rather than silently mistrained. Interfaces may still move between sessions — the full engineering log with per-session results and rationale lives in [`doc/qlora_handoff.md`](doc/qlora_handoff.md), and experiment-specific tooling is quarantined in [`training/experiments/`](training/experiments/). Some inference-side fixes made here are candidates for upstreaming.
 
 ---
 
