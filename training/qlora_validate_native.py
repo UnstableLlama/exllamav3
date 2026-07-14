@@ -260,6 +260,17 @@ def check_init_lora(model, tokenizer, prompt, device, cdt, mode,
     """
     print("\n" + "-" * 78)
     print(f"init-lora gate ({mode}): step-0 model vs frozen base")
+    # This gate certifies the INIT's bookkeeping (offset sign, scale folding,
+    # orientation), so it runs on the legacy dequant path, where the forward
+    # is fp32-linear and the near-exact fp32 bound is meaningful. The fast
+    # path rounds activations through fp16 at every base matmul, which
+    # amplifies the (correct) cancellation residue to fp16-noise scale --
+    # box-measured 1.7e-4 vs the same init's 5.5e-7 under legacy on the 1B.
+    # The fast path's own offset handling is certified fast-vs-legacy by the
+    # dequant-parity gate's pissa round.
+    print("  (runs on the legacy dequant path; fast-path offset parity is "
+          "covered by the dequant-parity gate)")
+    from exllamav3.training import backbone as _bb
 
     ids = tokenizer.encode(prompt, add_bos=True).to(device)
 
@@ -275,8 +286,13 @@ def check_init_lora(model, tokenizer, prompt, device, cdt, mode,
             net.apply_init_lora(
                 mode, ref_model_dir=ref_model_dir, svd_niter=svd_niter,
                 eva_batches=([{"input_ids": ids}] if mode == "eva" else None))
-        with torch.no_grad():
-            loss = net.compute_loss(ids, ids.clone()).item()
+        prev = _bb.dequant_mode()
+        _bb.set_dequant_mode("legacy")
+        try:
+            with torch.no_grad():
+                loss = net.compute_loss(ids, ids.clone()).item()
+        finally:
+            _bb.set_dequant_mode(prev)
         del net
         return loss
 
@@ -318,6 +334,135 @@ def check_init_lora(model, tokenizer, prompt, device, cdt, mode,
 
     print(f"  init-lora {mode} gate:", "PASS" if all_ok else
           f"FAIL -- do NOT train with --init-lora {mode}")
+    return all_ok
+
+
+def check_dequant_parity(model, tokenizer, prompt, device, cdt, attn_impl="auto"):
+    """
+    Gate the fast dequant path (audit A1): EXL3LoRAHadFunction reconstructs
+    only the inner trellis weight and applies the Hadamard/sign transforms to
+    the ACTIVATIONS (the inference reconstruct_hgemm math, fp16 base matmul),
+    where the legacy path materializes the fully-transformed weight per call.
+    Same function, different arithmetic path -- so one seeded adapter net,
+    forwarded and backwarded under each mode, must agree on logits and adapter
+    gradients to within half-precision reassociation noise. A formula error
+    (transform order, adjoint, pissa-offset sign) lands orders of magnitude
+    outside these bounds. The fast backward also runs under the recompute->
+    backward weight cache, so a cache-corruption bug would surface here too.
+    """
+    print("\n" + "-" * 78)
+    print("dequant parity: fast (activation-side transforms) vs legacy closures")
+    from exllamav3.training import backbone as _bb
+
+    ids = tokenizer.encode(prompt, add_bos=True).to(device)
+
+    def build(pissa):
+        torch.manual_seed(0)
+        try:
+            net = NativeLlamaQLoRA(
+                model, r=8, alpha=16.0,
+                target_modules=["q_proj", "gate_proj", "up_proj", "down_proj"],
+                compute_dtype=cdt, gradient_checkpointing=True,
+                attn_impl=attn_impl)
+        except ValueError:
+            torch.manual_seed(0)
+            net = NativeLlamaQLoRA(
+                model, r=8, alpha=16.0, target_modules=["q_proj"],
+                compute_dtype=cdt, gradient_checkpointing=True,
+                attn_impl=attn_impl)
+        if pissa:
+            # Same seed both modes -> identical randomized-SVD factors (the
+            # init reads weights through the mode-independent legacy closure).
+            torch.manual_seed(1)
+            net.apply_init_lora("pissa")
+        return net
+
+    def run(mode, cache, pissa):
+        _bb.set_dequant_mode(mode)
+        net = build(pissa)
+        net.train()
+        with torch.no_grad():
+            logits = net.logits(ids).float().cpu()
+        loss = net.compute_loss(ids, ids.clone())
+        with _bb.backward_dequant_cache(enable=cache):
+            loss.backward()
+        grads = {f"{w.key}.{n}": p.grad.detach().float().cpu()
+                 for w in net._wrappers if w.r > 0
+                 for n, p in (("a", w.lora_a), ("b", w.lora_b))
+                 if p.grad is not None}
+        del net
+        return logits, loss.item(), grads
+
+    def compare(label, pissa, agree_min, cos_min, rel_max, med_rel_max):
+        prev_mode = _bb.dequant_mode()
+        try:
+            logits_f, loss_f, g_f = run("fast", cache=True, pissa=pissa)
+            logits_l, loss_l, g_l = run("legacy", cache=False, pissa=pissa)
+        finally:
+            _bb.set_dequant_mode(prev_mode)
+
+        agree = (logits_f.argmax(-1) == logits_l.argmax(-1)).float().mean().item()
+        cos_last = torch.cosine_similarity(
+            logits_f[0, -1], logits_l[0, -1], dim=0).item()
+        loss_rel = abs(loss_f - loss_l) / max(abs(loss_f), 1e-9)
+        ok = agree >= agree_min and cos_last >= 0.999 and loss_rel < 2e-2
+
+        stats = []
+        for key in sorted(set(g_f) & set(g_l)):
+            gf, gl = g_f[key], g_l[key]
+            nf, nl = gf.norm().item(), gl.norm().item()
+            if nf == 0.0 and nl == 0.0:
+                continue                   # lora_a at step 1 (B==0, no pissa)
+            cos = torch.cosine_similarity(
+                gf.flatten(), gl.flatten(), dim=0).item()
+            rel = (gf - gl).norm().item() / max(nf, 1e-12)
+            stats.append((cos, rel, key))
+        fails = [s for s in stats if not (s[0] > cos_min and s[1] < rel_max)]
+        med_rel = sorted(s[1] for s in stats)[len(stats) // 2] if stats else 1.0
+        ok &= not fails and len(stats) > 0 and med_rel < med_rel_max
+
+        print(f"  [{label}]")
+        print(f"    logits: per-position argmax agreement {agree*100:.1f}%, "
+              f"last-token cos {cos_last:.6f}")
+        print(f"    loss: fast {loss_f:.6f} vs legacy {loss_l:.6f} "
+              f"(rel {loss_rel:.2e})")
+        by_cos = sorted(stats)
+        print(f"    {len(stats)} adapter grads compared, {len(fails)} outside "
+              f"tolerance (cos > {cos_min}, rel < {rel_max}); "
+              f"median rel {med_rel:.3f} (bound {med_rel_max})")
+        if by_cos:
+            med = by_cos[len(by_cos) // 2]
+            print(f"    median cosine: {med[0]:.6f}   rel {med[1]:.2e}")
+            for c, r, k in by_cos[:3]:
+                print(f"      {c:.6f}  rel {r:.2e}  {k}")
+        print(f"    {label}:", "PASS" if ok else "FAIL")
+        return ok
+
+    # Round 1: default-init adapters (B=0 -- the pure base + LoRA-grad path).
+    # Round 2: pissa-initialized adapters -- exercises the fast path's
+    # activation-side offset term (and nonzero-A/B grads) against the legacy
+    # folded-into-the-weight offset. Its bounds are LOOSER and shaped
+    # direction-strict / amplitude-tolerant, calibrated on Gemma4-12B (48
+    # layers, fp32, Session 30): the pissa cancellation residue is re-rounded
+    # by every fp16 base matmul, and in an amplitude-sensitive band of layers
+    # (10-14, softcapped attention) that shifts grad MAGNITUDE up to ~1.5x
+    # while direction stays intact (offenders all cos >= 0.94) -- the same
+    # shift legacy-bf16 shows vs legacy-fp32, i.e. inside the noise band bf16
+    # training already accepts (Adam's per-param normalization absorbs
+    # amplitude noise; an 8-step 12B training A/B at the recipe matched loss
+    # to 2-3 decimals and |dB| to 3 decimals every step). So: every grad must
+    # AGREE IN DIRECTION (cos) and the median amplitude error stays small,
+    # while individual amplitude outliers pass. A formula bug (offset sign /
+    # scale / orientation) breaks cos and the medians by orders of magnitude.
+    all_ok = compare("default init", pissa=False,
+                     agree_min=0.98, cos_min=0.98, rel_max=0.25,
+                     med_rel_max=0.10)
+    all_ok &= compare("pissa init + offset", pissa=True,
+                      agree_min=0.93, cos_min=0.90, rel_max=1.0,
+                      med_rel_max=0.25)
+
+    print("  dequant parity:", "PASS" if all_ok else
+          "FAIL -- do NOT train with --dequant-mode fast")
     return all_ok
 
 
@@ -456,7 +601,16 @@ def main():
     ap.add_argument("--skip-head-slice-check", action="store_true",
                     help="skip the chunked-vocab head equality check (it gates "
                          "--head-vocab-chunk; runs by default when the head can slice)")
+    ap.add_argument("--dequant-mode", choices=["fast", "legacy"], default="fast",
+                    help="Dequant path for the main forward compare (matches the "
+                         "trainer flag). The fast-vs-legacy parity gate below runs "
+                         "regardless (skip with --skip-dequant-parity).")
+    ap.add_argument("--skip-dequant-parity", action="store_true",
+                    help="skip the fast-vs-legacy dequant parity gate (forward + "
+                         "adapter-grad compare under both modes)")
     args = ap.parse_args()
+
+    backbone.set_dequant_mode(args.dequant_mode)
 
     cdt = {"float32": torch.float32, "float16": torch.float16,
            "bfloat16": torch.bfloat16}[args.compute_dtype]
@@ -547,6 +701,11 @@ def main():
 
     if not args.skip_head_slice_check:
         all_ok &= check_head_slice(net)
+
+    if not args.skip_dequant_parity:
+        all_ok &= check_dequant_parity(model, tokenizer, " ".join(prompts),
+                                       args.device, cdt,
+                                       attn_impl=args.attn_impl)
 
     if args.check_backward:
         all_ok &= check_backward(model, tokenizer, prompts[0], args.device, cdt,

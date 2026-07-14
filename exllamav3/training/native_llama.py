@@ -66,7 +66,7 @@ import torch.nn.functional as F
 
 from . import backbone
 from . import quant_aware as _qa
-from .qlora_linear import EXL3LoRAFunction
+from .qlora_linear import EXL3LoRAFunction, EXL3LoRAHadFunction
 from .fused_ce import (
     fused_linear_cross_entropy, fused_linear_cross_entropy_vocab_chunked,
     DEFAULT_CHUNK, DEFAULT_VOCAB_CHUNK, IGNORE_INDEX,
@@ -232,6 +232,10 @@ class DiffLinear(nn.Module):
     # pre-toggle checkpoints behave as before.
     adapter_enabled = True
 
+    # Class default for the same reason: a headless instance has no wrapped
+    # linear to take trellis parts from, so it uses the legacy closure path.
+    _trellis_parts = None
+
     # Quantization-aware training mode (training.quant_aware): "" = off (the
     # default; eval/validate paths and pre-feature checkpoints are exact).
     # configure_quant_aware() sets these per adapted wrapper; nothing here is
@@ -295,6 +299,13 @@ class DiffLinear(nn.Module):
         # holds its weights as plain tensors / buffers, never nn.Parameters, so
         # there is nothing to freeze: no gradient can ever reach the base.
 
+        # Activation-side-transform pieces (audit A1): (inner_fn, suh, svh)
+        # for a standard trellis linear, None for fp16/nonstandard inners.
+        # When present (and quant-aware is off / mode isn't "legacy") the
+        # forward takes EXL3LoRAHadFunction, which skips the four full-weight
+        # transform passes + cast of get_weight_tensor on every dequant.
+        self._trellis_parts = backbone.frozen_trellis_parts(linear)
+
     @torch.no_grad()
     def set_init_offset(self, a0: torch.Tensor, b0: torch.Tensor) -> None:
         """Install the frozen PiSSA offset factors (fp32, adapter shapes)."""
@@ -335,8 +346,33 @@ class DiffLinear(nn.Module):
         plain closure otherwise (off / eval -- exact weights always)."""
         return _qa.wrap_weight_closure(self, self._weight_closure())
 
+    def _qa_active(self) -> bool:
+        return bool(self.qa_mode) and self.qa_sigma is not None and self.training
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         xc = x.to(self.compute_dtype)
+
+        # Fast path (audit A1): trellis inner + activation-side transforms.
+        # Quant-aware runs need the full-weight closure to perturb, so they
+        # (and --dequant-mode legacy) fall through to the original path.
+        parts = self._trellis_parts
+        if parts is not None and not self._qa_active() \
+                and backbone.dequant_mode() == "fast":
+            inner_fn, suh, svh = parts
+            had = backbone.hadamard_128(suh.device, suh.dtype)
+            bias = backbone.frozen_bias(self.linear, self.compute_dtype)
+            if not self.adapter_enabled:
+                # Reference view: pure frozen base -- no LoRA, no pissa offset.
+                return EXL3LoRAHadFunction.apply(
+                    xc, None, None, bias, 1.0,
+                    inner_fn, suh, svh, had, None, None, 1.0)
+            return EXL3LoRAHadFunction.apply(
+                xc, self.lora_a, self.lora_b, bias, self.scale,
+                inner_fn, suh, svh, had,
+                # PiSSA residual base as a low-rank activation term instead of
+                # the per-reconstruction full-weight addmm of _weight_closure.
+                self.init_a0, self.init_b0, self.scale)
+
         if not self.adapter_enabled:
             # Reference view: pure frozen base -- no LoRA term, no pissa offset
             # (backbone.frozen_weight_closure directly, bypassing the residual).

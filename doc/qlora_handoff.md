@@ -88,8 +88,16 @@
    scheduled short runs, adapter hot-reload via `LoRA.from_directory`).
 3. **Trainable-head chunked CE** with a head/LoRA-B gradient (Session 10
    next-work #1's remaining half; supersedes Session 9 #7).
-4. **Audit item A1 — dequant 3×→1× per linear per step** (~13% wall at the
-   measured 19% dequant share; worth doing opportunistically).
+4. **Audit item A1 — dequant 3×→1× per linear per step — DONE (Session 30).**
+   Landed as the fast dequant path (activation-side transforms, inference
+   math; default ON, `--dequant-mode legacy` for A/B): reconstructions stay
+   at 3/step but each is ~3–30× cheaper. Box-measured +28% tok/s (1B), +6%
+   (12B 6bpw), +32% (MoE 26B) at ~unchanged VRAM. The 3→2 recompute→backward
+   weight cache was ALSO built but shipped **opt-in `--dequant-cache`** — the
+   box A/B showed it's a net loss under the fast path (−1–4% tok/s, +0.5–1.5
+   GB); it can only pay in legacy mode. Full write-up + gate findings in the
+   Session 30 notes. Audit A2 (conditional checkpointing) remains the lever
+   for the duplicate recompute.
 5. **Liger GeGLU + 4D per-head q/k/v norm wiring** (promoted by the measured
    Session-12 liger win: +8.8% tok/s, −1.1 GB/GPU from RMSNorm alone).
 6. **qerr low-bpw retest** (2.5–3 bpw, where the quantization error is large)
@@ -3286,6 +3294,119 @@ the launcher does NOT propagate and the log block-buffers for ~30 min at a
 time. `--no-clean-text` is now deprecated (cleaning is off by default; the
 flag is a harmless no-op). Graceful stop mid-run = SIGINT *after* an `[eval]`
 line prints (the best-adapter write completes before that line).
+
+---
+
+### Session 30 — audit A1 CLOSED: fast dequant path (activation-side transforms) + recompute→backward weight cache, box-validated
+
+> Built, container-tested and box-gated in one session (2026-07-13). Both A1
+> halves landed and were measured; the fast path (cheaper reconstructions) is
+> **default ON**, the cache (fewer reconstructions) shipped **opt-in
+> `--dequant-cache`** after the box A/B showed it's a net loss under the fast
+> path. `--dequant-mode legacy` reproduces old behavior exactly.
+
+**The corrected premise (matters for reading the old audit item):** the audit's
+"use the fused trellis matmul kernel in forward, 3→1 reconstructions" doesn't
+exist at training shapes — the no-reconstruct fused kernel (`bc.run_alloc`) is
+the ≤144-row decode path; at prefill/training batch sizes exllamav3's own
+inference forward ALSO reconstructs every call (`reconstruct_hgemm`), because
+reconstruct-then-cuBLAS wins there. What inference does differently is
+reconstruct only the INNER weight and apply the Hadamard/sign transforms to
+the **activations**. `get_weight_tensor()` instead does 4 full-weight-size
+transform passes (`preapply_had_l`, `·suh`, `preapply_had_r`, `·svh`) + a
+dtype cast, three times per linear per step. So the real fix was:
+
+1. **Fast path** — `EXL3LoRAHadFunction` (qlora_linear.py): base
+   `y = had(had(x·suh) @ W_inner)·svh` in the weight's native fp16 (the
+   inference math), backward adjoint in the grad dtype (one weight cast — fp16
+   grads would risk overflow, so backward pays the cast forward avoids). The
+   frozen **PiSSA offset moved from the weight closure** (a full-weight addmm
+   per reconstruction!) **to a low-rank activation term** `−s·(x@a0)@b0`.
+   Seam: `backbone.frozen_trellis_parts(linear)` → `(inner_fn, suh, svh)`
+   (None for fp16/nonstandard inners → legacy fallback), `backbone.
+   hadamard_128`. Dispatch in `DiffLinear.forward`; quant-aware runs and
+   `--dequant-mode legacy` fall through to the original closure path, which
+   is unchanged (and the float64 gradchecks keep using it).
+2. **Cache (opt-in `--dequant-cache`)** — `backbone.backward_dequant_cache()`
+   around `loss.backward()` (all three arms): under checkpointing, the
+   recompute-forward and the Function backward run back-to-back per block, so
+   an evict-on-hit cache keyed by `id(inner)` reuses each weight exactly
+   once: **3 → 2 reconstructs per linear per step** (box-confirmed by exact
+   profile counts: 338→226/step on the 1B, 986→658 on the 12B; numerics
+   bit-identical — the second call returns the same tensor). **Measured
+   verdict: a net loss under the fast path**, so it defaults OFF. With
+   inner-only reconstructions at 0.06–0.23 ms, the cache's bookkeeping and
+   +0.5–1.5 GB peak VRAM (one block's frozen weights; worst on many-expert
+   MoE) cost more than the skipped reconstruct saves: fast+cache vs fast
+   measured 72 vs 75 tok/s & 10.44 vs 8.94 GB (MoE), 437 vs 442 & ~17.2 vs
+   16.8 GB (12B), 1,926 vs 1,947 (1B). It can only pay under
+   `--dequant-mode legacy` (5–7 ms per avoided full reconstruction).
+   Auto-disabled with `--no-grad-ckpt`, where there's no second use to serve.
+
+**Box-measured wall-clock (6–12-step smokes, semancy data, r32 rsLoRA;
+fast = the shipped default, no cache):**
+
+| model | legacy → fast tok/s | gain | peak VRAM (legacy → fast) |
+|---|---|---|---|
+| Llama-3.2-1B 4bpw (single GPU) | 1,520 → 1,947 | **+28%** | 3.85 → 3.85 GB |
+| Gemma4-12B 6bpw (split [8,23], packed 2048) | 417 → 442 | **+6%** | 16.54 → 16.82 GB |
+| MeroMero MoE 26B 4.45bpw (split [8,23]) | 57 → 75 | **+32%** | 8.96 → 8.94 GB (cuda:0) |
+
+Where the win comes from differs by model class: small matrices (1B, MoE
+experts) were dominated by per-reconstruction transform/launch overhead → the
+fast path cuts per-call cost 3–10×; the 6bpw 12B's big-matrix inner decode
+was measured (microbench) at only 0.06–0.23 ms vs 4.6–6.2 ms for the full
+`get_weight_tensor`, but its true dequant share of wall was smaller than the
+old profiler suggested, so the wall win is modest. **Profiler caveat
+discovered:** `--profile-dequant`'s per-call syncs drain the async GPU queue,
+attributing surrounding matmul time to dequant — the shares it prints
+(including Session-12's 19% and Session-23's 37%) are inflated; judge A/B by
+wall-clock/tok-s, use the profiler for reconstruction COUNTS (those are
+exact). The LM head was checked as a suspect on the 12B and acquitted: full
+head reconstruct is 80 ms (×2/step, <1% of wall), not worth chasing.
+
+**Numerics — gates all green, two findings worth knowing:**
+- Container tests (`tests/test_dequant_fast.py`): f64 gradcheck, EXACT
+  (≤1e-10) equivalence vs the composed-`W_eff` reference ± pissa offset,
+  mixed-dtype path, cache semantics. GPU tier: fast forward vs
+  `get_weight_tensor()` on real quant layers, rel ~7e-4 (fp16 rounding, same
+  as the established kernel-vs-closure agreement).
+- `qlora_validate_native.py` grew a **dequant-parity gate** (fast vs legacy,
+  two rounds: default init and pissa+offset, logits + all adapter grads) that
+  runs by default, plus `--dequant-mode`/`--skip-dequant-parity`. PASS on
+  Llama-1B (median grad cos 0.999982) and Gemma4-12B.
+- **Finding 1 — the pissa init gate now runs pinned to the legacy path.** Its
+  fp32 near-exact bound (1e-4) presumes an fp32-linear forward; under the
+  fast path the (correct) cancellation residue is re-rounded by every fp16
+  base matmul and lands at fp16-noise scale (1B: 1.7e-4 fast vs 5.5e-7
+  legacy). The gate certifies INIT bookkeeping, so it uses legacy; the fast
+  path's offset handling is certified by the parity gate's pissa round.
+- **Finding 2 — Gemma has an amplitude-sensitive layer band (10–14).** Under
+  ANY precision perturbation (fast-fp16 path OR plain bf16 compute), those
+  layers' first-step pissa grads shift in MAGNITUDE up to ~1.5× with
+  direction intact (all offender cos ≥ 0.94). Box-measured: fast-fp32
+  deviates from fp32 truth by the SAME magnitude as legacy-bf16 does (grad
+  cos med 0.9947 vs 0.9937) — i.e. inside the noise band bf16 training
+  already accepts. The parity gate's pissa round is therefore shaped
+  direction-strict / amplitude-tolerant (per-grad cos > 0.9, median rel <
+  0.25, amplitude outliers pass). The decisive evidence for training quality:
+  an 8-step 12B A/B at the exact semancer recipe (pissa, rsLoRA, lr 1e-5) —
+  **losses match to 2–3 decimals and |dB| to 3 decimals at every step**. On
+  the 1B, arm losses match to the 3rd decimal step-for-step; on the MoE the
+  small per-step loss differences are the known routing-tie noise (|dB|
+  curves identical to 3 decimals).
+
+**Wired but not box-smoked:** the DDP and preference arms carry the same
+flags + cache hooks (shared `DiffLinear`/backbone code does the actual work);
+MoE routed-expert ADAPTERS on the fast path weren't in the A/B (the expert
+dequant cost was — adapters ride the same `DiffLinear` code the 1B/12B grads
+certified). Run log schema unchanged (A/B smokes used `--run-log ""`).
+
+**Follow-ups parked:** `lora_dropout` (user request, task #7 in the session
+tracker); consider CUDA-event-based dequant profiling to fix the sync
+inflation; audit item A2 (skip checkpointing under VRAM headroom) would now
+cut the remaining recompute reconstruct (2 → 1 per step) AND the recompute
+matmuls themselves — its value went up now that dequant is cheap.
 
 ---
 
