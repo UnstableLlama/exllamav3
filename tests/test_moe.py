@@ -122,7 +122,8 @@ def _spec(weight, eps=1e-5, bias=0.0, scale=1.0):
 
 def _build_moe(d, inter, num_experts, top_k, shared_inter=0, shared_gate=True,
                per_expert_scale=None, r=0, expert_r=None, dtype=torch.float32,
-               router_scale=0.5, activation="silu", gemma4=False):
+               router_scale=0.5, activation="silu", gemma4=False,
+               router_type="std", e_score_bias=None, routed_scaling=1.0):
     expert_r = r if expert_r is None else expert_r
     lins = {"router": MockLinear(d, num_experts, "blk.mlp.gate",
                                  scale=router_scale, dtype=dtype)}
@@ -174,9 +175,12 @@ def _build_moe(d, inter, num_experts, top_k, shared_inter=0, shared_gate=True,
 
     meta = {
         "mlp_kind": "moe",
+        "router_type": router_type,
         "num_experts": num_experts,
         "num_experts_per_tok": top_k,
         "per_expert_scale": per_expert_scale,
+        "routed_scaling_factor": routed_scaling,
+        "e_score_bias": e_score_bias,
         "activation": activation,
         "shared_activation": activation if shared_inter else None,
         "alt_residual_channel": bool(gemma4),
@@ -306,6 +310,120 @@ def test_moe_qwen3_shape_with_scale():
     assert err < 1e-5, f"MoE (no shared, per-expert scale) mismatch: max|Δ|={err}"
     print(f"[moe] no-shared-expert MoE + per-expert scale matches reference "
           f"(max|Δ|={err:.2e}) PASSED")
+
+
+def _ref_moe_dots(meta, lins, x):
+    """Independent reference for the "dots" sigmoid router (AFMoE /
+    dots.llm1), transcribed from the HF AfmoeMoE routing math (== the
+    inference ``routing_dots`` / ``ext.routing_ds3_nogroup`` kernel):
+    sigmoid scores; e_score_correction_bias added for the top-k SELECTION
+    only; selected experts weighted by their UNBIASED scores normalized over
+    the selected set (+1e-20) times routed_scaling_factor. Optional ungated
+    shared expert added on top (AFMoE has no shared gate). Shares no code
+    with _moe_out."""
+    b, t, d = x.shape
+    y = x.reshape(-1, d)
+    E, k = meta["num_experts"], meta["num_experts_per_tok"]
+
+    logits = (y @ lins["router"].frozen_weight).float()
+    scores = torch.sigmoid(logits)
+    sel = scores if meta.get("e_score_bias") is None \
+        else scores + meta["e_score_bias"].float()
+    _, topi = torch.topk(sel, k, dim=-1)
+    topw = scores.gather(1, topi)
+    topw = topw / (topw.sum(dim=-1, keepdim=True) + 1e-20)
+    topw = topw * meta["routed_scaling_factor"]
+
+    out = torch.zeros_like(y, dtype=torch.float32)
+    expert_mask = F.one_hot(topi, num_classes=E)                 # [nt, k, E]
+    for e in range(E):
+        tok, kth = torch.where(expert_mask[..., e] > 0)
+        if tok.numel() == 0:
+            continue
+        xe = y[tok]
+        h = F.silu(xe @ lins[f"g{e}"].frozen_weight) * (xe @ lins[f"u{e}"].frozen_weight)
+        de = (h @ lins[f"d{e}"].frozen_weight).float()
+        out[tok] += de * topw[tok, kth].unsqueeze(-1)
+
+    if "sg" in lins:
+        sh = F.silu(y @ lins["sg"].frozen_weight) * (y @ lins["su"].frozen_weight)
+        sh = (sh @ lins["sd"].frozen_weight).float()
+        if "shg" in lins:
+            sh = sh * torch.sigmoid((y @ lins["shg"].frozen_weight).float())
+        out = out + sh
+    return out.view(b, t, d).to(x.dtype)
+
+
+def test_moe_dots_matches_reference():
+    # AFMoE shape: dots router with selection bias + routed scaling, ungated
+    # shared expert.
+    torch.manual_seed(5)
+    d, inter, E, k = 16, 8, 8, 3
+    e_bias = 0.5 * torch.randn(E)
+    entry, meta, lins = _build_moe(d, inter, E, k, shared_inter=12,
+                                   shared_gate=False, router_type="dots",
+                                   e_score_bias=e_bias, routed_scaling=2.826)
+    net = _headless_net()
+
+    x = torch.randn(2, 7, d)
+    out = net._mlp_out(meta, entry, x)
+    ref = _ref_moe_dots(meta, lins, x)
+    err = (out - ref).abs().max().item()
+    assert err < 1e-5, f"dots-router MoE mismatch vs reference: max|Δ|={err}"
+    print(f"[moe] dots-router (AFMoE) MoE matches reference (max|Δ|={err:.2e}) PASSED")
+
+
+def test_moe_dots_bias_selects_but_never_weights():
+    # A large positive bias on one expert must FORCE its selection for every
+    # token, while its routing weight stays the plain (unbiased) sigmoid
+    # score -- the defining split of the dots router.
+    torch.manual_seed(6)
+    d, inter, E, k = 12, 6, 6, 2
+    e_bias = torch.zeros(E)
+    e_bias[3] = 100.0                    # always selected, never up-weighted
+    entry, meta, lins = _build_moe(d, inter, E, k, router_type="dots",
+                                   e_score_bias=e_bias, routed_scaling=1.0)
+    net = _headless_net()
+    x = torch.randn(1, 9, d)
+
+    out = net._mlp_out(meta, entry, x)
+    ref = _ref_moe_dots(meta, lins, x)
+    err = (out - ref).abs().max().item()
+    assert err < 1e-5, f"dots bias-selection mismatch: max|Δ|={err}"
+
+    # Confirm the bias actually changed selection: expert 3 must appear in
+    # every token's top-k of the BIASED scores, and (with these logits) not
+    # in every token's top-k of the unbiased ones.
+    logits = (x.reshape(-1, d) @ lins["router"].frozen_weight).float()
+    scores = torch.sigmoid(logits)
+    _, topi_b = torch.topk(scores + e_bias, k, dim=-1)
+    assert bool((topi_b == 3).any(dim=-1).all()), "bias failed to force selection"
+    _, topi_u = torch.topk(scores, k, dim=-1)
+    assert not bool((topi_u == 3).any(dim=-1).all()), \
+        "test vacuous: expert 3 was already always selected unbiased"
+    print("[moe] dots e_score bias forces selection, never enters weights PASSED")
+
+
+def test_moe_dots_gradcheck():
+    torch.manual_seed(7)
+    d, inter, E, k = 6, 4, 4, 2
+    entry, meta, _ = _build_moe(d, inter, E, k, shared_inter=4,
+                                shared_gate=False, dtype=torch.float64,
+                                router_type="dots",
+                                e_score_bias=0.3 * torch.randn(E, dtype=torch.float64),
+                                routed_scaling=2.0)
+    net = _headless_net()
+    net.compute_dtype = torch.float64
+
+    x = torch.randn(1, 5, d, dtype=torch.float64, requires_grad=True)
+
+    def fn(inp):
+        return net._mlp_out(meta, entry, inp)
+
+    # topk is piecewise-constant in the input; random fp64 scores are nowhere
+    # near a selection tie, so the local gradient is well-defined.
+    assert torch.autograd.gradcheck(fn, (x,), eps=1e-6, atol=1e-4)
+    print("[moe] fp64 gradcheck through dots routing + experts PASSED")
 
 
 # ----------------------------------------------------------------------------
@@ -613,6 +731,9 @@ if __name__ == "__main__":
     run_timed([
         test_moe_matches_hf_reference,
         test_moe_qwen3_shape_with_scale,
+        test_moe_dots_matches_reference,
+        test_moe_dots_bias_selects_but_never_weights,
+        test_moe_dots_gradcheck,
         test_moe_gradcheck,
         test_moe_backward_reaches_adapters,
         test_moe_unrouted_expert_gets_no_grad,

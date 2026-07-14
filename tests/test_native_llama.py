@@ -172,8 +172,9 @@ def _ref_block_gemma(meta, weights, hidden, positions, feats):
         k = _ref_rmsnorm_b(k, weights["k_norm"], eps_a, bias)
     if feats.get("v_norm"):
         v = _ref_rmsnorm_b(v, None, eps_a, 0.0)
-    q = _ref_rope(q, inv_freq, positions)
-    k = _ref_rope(k, inv_freq, positions)
+    if inv_freq is not None:                     # None = NoPE layer (AFMoE)
+        q = _ref_rope(q, inv_freq, positions)
+        k = _ref_rope(k, inv_freq, positions)
     q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
     rep = nq // nkv
     k = k.repeat_interleave(rep, 1)
@@ -188,6 +189,10 @@ def _ref_block_gemma(meta, weights, hidden, positions, feats):
     scores = scores + mask
     ctx = torch.softmax(scores, -1) @ v
     ctx = ctx.transpose(1, 2).reshape(b, t, nq * hd)
+    if feats.get("full_gate"):
+        # AFMoE full-width output gate: sigmoid(g_proj(normed)) on the
+        # flattened context, before o_proj.
+        ctx = ctx * torch.sigmoid((normed @ weights["g"]).float())
     attn_out = ctx @ weights["o"]
     if feats.get("post_norm"):
         hidden = hidden + _ref_rmsnorm_b(attn_out, weights["attn_post"], eps_a, bias)
@@ -211,7 +216,7 @@ def _ref_block_gemma(meta, weights, hidden, positions, feats):
 def _build_block(d, nq, nkv, hd, inter, dtype=torch.float64, r=0, *,
                  qk_norm=False, v_norm=False, post_norm=False,
                  activation="silu", window=-1, softcap=0.0, norm_bias=0.0,
-                 layer_scalar=None):
+                 layer_scalar=None, full_gate=False, nope=False):
     """Build a synthetic block + matching reference weights. Flags toggle the
     Gemma/Qwen3 features so one builder covers the plain and extended paths."""
     norm_a = _ns_norm(d, dtype)
@@ -246,14 +251,23 @@ def _build_block(d, nq, nkv, hd, inter, dtype=torch.float64, r=0, *,
     entry.gates = [DiffLinear(lins["gate"], r=r, compute_dtype=dtype)]
     entry.ups = [DiffLinear(lins["up"], r=r, compute_dtype=dtype)]
     entry.downs = [DiffLinear(lins["down"], r=r, compute_dtype=dtype)]
+    # AFMoE full-width attention output gate (its own linear on the block
+    # input; the checkpoint keys it self_attn.gate_proj).
+    if full_gate:
+        lins["g"] = MockLinear(d, nq * hd, "blk.self_attn.gate_proj", dtype=dtype)
+        entry.g_proj = DiffLinear(lins["g"], r=r, compute_dtype=dtype)
+    else:
+        entry.g_proj = None
 
-    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, hd, 2, dtype=dtype) / hd))
+    inv_freq = None if nope else \
+        1.0 / (10000.0 ** (torch.arange(0, hd, 2, dtype=dtype) / hd))
     meta = {
         "num_q_heads": nq, "num_kv_heads": nkv, "head_dim": hd,
         "sm_scale": hd ** -0.5, "attn_eps": 1e-5, "mlp_eps": 1e-5,
         "inv_freq": inv_freq, "attn_factor": 1.0,
         "sliding_window": window, "softcap": softcap, "activation": activation,
         "use_k_as_v": False, "layer_scalar": layer_scalar,
+        "full_gate": full_gate,
     }
     ref_weights = {
         "attn_norm": norm_a.weight, "mlp_norm": norm_m.weight,
@@ -264,6 +278,8 @@ def _build_block(d, nq, nkv, hd, inter, dtype=torch.float64, r=0, *,
         "q_norm": qn, "k_norm": kn, "attn_post": pa.weight, "mlp_post": pm.weight,
         "norm_bias": norm_bias,
     }
+    if full_gate:
+        ref_weights["g"] = lins["g"].frozen_weight
     return entry, meta, ref_weights, lins
 
 
@@ -348,6 +364,61 @@ def test_gemma_block_matches_reference():
     assert err < 1e-4, f"gemma block forward mismatch vs reference: max|Δ|={err}"
     print(f"[block-gemma] q/k/v-norm + sandwich + GeGLU + sliding + softcap "
           f"matches reference (max|Δ|={err:.2e}) PASSED")
+
+
+def test_afmoe_block_matches_reference():
+    # The AFMoE (Trinity) attention features: a separate full-width output
+    # gate (self_attn.gate_proj, sigmoid on the flattened context before
+    # o_proj), NoPE (no RoPE at all -- the full-attention layers), q/k norms
+    # and sandwich post-norms. The MoE half is covered by test_moe's dots
+    # tests; here the block runs a dense MLP (AFMoE's first
+    # num_dense_layers), so this also exercises the mixed dense/MoE layout.
+    torch.manual_seed(5)
+    d, nq, nkv, hd, inter = 16, 4, 2, 8, 32
+    feats = {"qk_norm": True, "post_norm": True, "full_gate": True}
+    entry, meta, refw, lins = _build_block(
+        d, nq, nkv, hd, inter, dtype=torch.float32, r=0,
+        qk_norm=True, post_norm=True, full_gate=True, nope=True,
+    )
+    net = _headless_net()
+
+    b, t = 2, 7
+    hidden = torch.randn(b, t, d, dtype=torch.float32)
+    positions = torch.arange(t).unsqueeze(0).expand(b, t)
+    attn_bias = net._attn_bias(None, t, hidden.device, torch.float32)
+
+    out = net._block_forward(meta, entry, hidden, positions, attn_bias)
+    ref = _ref_block_gemma(meta, refw, hidden, positions, feats)
+    err = (out - ref).abs().max().item()
+    assert err < 1e-4, f"afmoe block forward mismatch vs reference: max|Δ|={err}"
+
+    # Sliding variant: RoPE present, window mask, gate still on.
+    entry2, meta2, refw2, _ = _build_block(
+        d, nq, nkv, hd, inter, dtype=torch.float32, r=0,
+        qk_norm=True, post_norm=True, full_gate=True, window=3,
+    )
+    bias2 = net._attn_bias(None, t, hidden.device, torch.float32, window=3)
+    out2 = net._block_forward(meta2, entry2, hidden, positions, bias2)
+    ref2 = _ref_block_gemma(meta2, refw2, hidden, positions, feats)
+    err2 = (out2 - ref2).abs().max().item()
+    assert err2 < 1e-4, f"afmoe sliding block mismatch vs reference: max|Δ|={err2}"
+
+    # The gate adapter must be trainable: grads flow into g_proj's LoRA.
+    entry3, meta3, _, _ = _build_block(
+        d, nq, nkv, hd, inter, dtype=torch.float32, r=4,
+        full_gate=True, nope=True,
+    )
+    with torch.no_grad():
+        entry3.g_proj.lora_b.copy_(torch.randn_like(entry3.g_proj.lora_b) * 0.1)
+    h3 = torch.randn(b, t, d, dtype=torch.float32, requires_grad=True)
+    out3 = net._block_forward(meta3, entry3, h3, positions, attn_bias)
+    out3.square().mean().backward()
+    assert entry3.g_proj.lora_a.grad is not None \
+        and entry3.g_proj.lora_a.grad.abs().sum() > 0, \
+        "no gradient reached the attention gate adapter"
+    print(f"[block-afmoe] full-width output gate + NoPE/sliding + q/k-norm + "
+          f"sandwich matches reference (max|Δ|={max(err, err2):.2e}); gate "
+          f"adapter receives grad PASSED")
 
 
 def test_block_backward_reaches_adapters_only():
@@ -489,6 +560,7 @@ def main():
         test_difflinear_matches_reference_and_gradchecks,
         test_block_matches_reference,
         test_gemma_block_matches_reference,
+        test_afmoe_block_matches_reference,
         test_block_backward_reaches_adapters_only,
         test_packing_block_isolation,
         test_packing_pad_no_nan,

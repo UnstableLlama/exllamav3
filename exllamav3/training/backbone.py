@@ -64,37 +64,47 @@ def is_block_sparse_mlp(mlp) -> bool:
 
 def _assert_moe_supported(key: str, mlp) -> None:
     """
-    The differentiable MoE forward covers the "std" softmax router
-    (top-k over the router logits, softmax over the selected k -- identical
-    to HF's softmax-all + renormalize with ``norm_topk_prob=True``, which the
-    Qwen3/3.5-MoE configs assert) with optional per-expert scale, plus the
-    optional shared expert behind a sigmoid shared gate (Qwen3.5-MoE), plus
-    the Gemma4 MoE layout: ``alt_residual_channel`` (routing and the routed
-    experts read the RAW post-attention residual through their own pre-norms
-    while the shared expert reads the block's normed input) and the four
-    extra RMSNorms (router pre / routed pre / routed post / shared post --
-    each must be an ``RMSNorm``; ``norm_spec`` rejects anything else at
-    construction). Everything else -- sigmoid/grouped routers (ds3/dots) and
-    expert-parallel TP splits -- is rejected loudly here.
+    The differentiable MoE forward covers two router types. "std": the
+    softmax router (top-k over the router logits, softmax over the selected
+    k -- identical to HF's softmax-all + renormalize with
+    ``norm_topk_prob=True``, which the Qwen3/3.5-MoE configs assert) with
+    optional per-expert scale. "dots": the ungrouped sigmoid router (AFMoE /
+    dots.llm1): sigmoid scores, ``e_score_correction_bias`` added for the
+    top-k *selection* only, the selected experts weighted by their unbiased
+    scores normalized over the selected set, then multiplied by
+    ``routed_scaling_factor`` (``routing_dots`` in the inference module).
+    Both cover the optional shared expert behind a sigmoid shared gate
+    (Qwen3.5-MoE) or ungated (AFMoE), plus the Gemma4 MoE layout:
+    ``alt_residual_channel`` (routing and the routed experts read the RAW
+    post-attention residual through their own pre-norms while the shared
+    expert reads the block's normed input) and the four extra RMSNorms
+    (router pre / routed pre / routed post / shared post -- each must be an
+    ``RMSNorm``; ``norm_spec`` rejects anything else at construction).
+    Everything else -- the grouped ds3 router and expert-parallel TP splits
+    -- is rejected loudly here.
     """
     from ..modules import GatedMLP
-    assert mlp.router_type == "std", \
-        f"{key}: only the 'std' softmax top-k router is supported, got " \
-        f"router_type {mlp.router_type!r} (ds3/dots MoE routing not wired up)"
+    assert mlp.router_type in ("std", "dots"), \
+        f"{key}: only the 'std' softmax and 'dots' sigmoid top-k routers are " \
+        f"supported, got router_type {mlp.router_type!r} (grouped ds3 MoE " \
+        f"routing not wired up)"
     assert mlp.routing_gate is not None, f"{key}: MoE block has no routing gate"
     assert mlp.num_local_experts == mlp.num_experts, \
         f"{key}: expert/tensor-parallel MoE split ({mlp.num_local_experts} of " \
         f"{mlp.num_experts} experts local) is not supported for training"
     assert len(mlp.gates) == len(mlp.ups) == len(mlp.downs) == mlp.num_experts, \
         f"{key}: expected one gate/up/down linear per expert"
-    assert mlp.routed_scaling_factor in (None, 1.0), \
-        f"{key}: routed_scaling_factor is a ds3-router feature, unsupported here"
     assert mlp.n_group is None and mlp.topk_group is None, \
         f"{key}: grouped expert routing (n_group/topk_group) is not supported"
-    # e_score_correction_bias is a ds3/dots-router input; the std routing path
-    # ignores it, so a loaded one would silently change nothing -- reject.
-    assert mlp.e_score_correction_bias is None, \
-        f"{key}: e_score_correction_bias is not consumed by the std router"
+    if mlp.router_type == "std":
+        assert mlp.routed_scaling_factor in (None, 1.0), \
+            f"{key}: routed_scaling_factor is a sigmoid-router feature, " \
+            f"unsupported on the std router"
+        # e_score_correction_bias is a ds3/dots-router input; the std routing
+        # path ignores it, so a loaded one would silently change nothing --
+        # reject.
+        assert mlp.e_score_correction_bias is None, \
+            f"{key}: e_score_correction_bias is not consumed by the std router"
     if mlp.shared_experts is not None:
         assert isinstance(mlp.shared_experts, GatedMLP), \
             f"{key}: only a GatedMLP shared expert is supported, got " \
@@ -120,14 +130,17 @@ def assert_block_supported(block):
     sandwich post-norms + GeGLU + sliding/full window + per-layer head dims),
     the Qwen3.5/3.6 hybrid layers: GatedDeltaNet (linear/recurrent
     attention, split in_proj_qkv/z/b/a projection layout) and gated softmax
-    attention (interleaved output gate), and BlockSparseMLP mixtures of
-    experts with the "std" softmax top-k router incl. the optional shared
-    expert + sigmoid shared gate (Qwen3-MoE, Qwen3.5-MoE) and the Gemma4 MoE
-    layout (alt residual channel + router/routed/shared extra norms). What it
-    still cannot do is rejected here: fused-qkvz GatedDeltaNet (the Qwen3-Next
-    layout), ds3/dots-router MoE, headwise attention gating (g_proj),
-    and non-NeoX RoPE. mRoPE and partial rotary (Qwen-VL text towers) are
-    ACCEPTED for text-only training -- see the notes at the assertions below.
+    attention (interleaved output gate OR a separate full-width g_proj --
+    AFMoE), NoPE layers (AFMoE full-attention layers carry no RoPE at all),
+    and BlockSparseMLP mixtures of experts with the "std" softmax or "dots"
+    sigmoid top-k router incl. the optional shared expert + sigmoid shared
+    gate (Qwen3-MoE, Qwen3.5-MoE), the ungated shared expert (AFMoE) and the
+    Gemma4 MoE layout (alt residual channel + router/routed/shared extra
+    norms). What it still cannot do is rejected here: fused-qkvz
+    GatedDeltaNet (the Qwen3-Next layout), grouped ds3-router MoE, HEADWISE
+    attention gating (per-head scalar g_proj), and non-NeoX RoPE. mRoPE and
+    partial rotary (Qwen-VL text towers) are ACCEPTED for text-only training
+    -- see the notes at the assertions below.
     """
     from ..modules import GatedMLP, Attention, SlidingAttention
     key = getattr(block, "key", "?")
@@ -166,11 +179,22 @@ def assert_block_supported(block):
     assert isinstance(attn, (Attention, SlidingAttention)), \
         f"{key}: only softmax Attention/SlidingAttention or GatedDeltaNet is " \
         f"supported, got {type(attn).__name__}"
-    # q/k/v norms and the interleaved output gate (Qwen3.5 full-attn layers) ARE
-    # supported (read from the modules); only the separate headwise gate
-    # projection (g_proj) is not.
-    assert getattr(attn, "g_proj", None) is None, \
-        f"{key}: headwise attention gating (g_proj) is not supported"
+    # q/k/v norms and output gating ARE supported (read from the modules):
+    # the interleaved gate (Qwen3.5 full-attn layers, folded into q_proj) and
+    # the separate FULL-width g_proj (AFMoE: sigmoid over the whole flattened
+    # context, applied before o_proj). Only the headwise variant (a scalar
+    # gate per head, broadcast over head_dim) is not wired up.
+    if getattr(attn, "g_proj", None) is not None:
+        assert not getattr(attn, "headwise_gate", False), \
+            f"{key}: headwise attention gating (per-head scalar g_proj) is " \
+            f"not supported; only the full-width gate is"
+    # NoPE layers (AFMoE full-attention layers) are built with no rope_settings
+    # and skip RoPE entirely -- accepted (block_metadata carries inv_freq=None
+    # and the native forward skips the rotation, mirroring the inference
+    # forward's `if self.rope:`). A MISSING table on a layer that should have
+    # one (rope_settings set but rope not built) is still a loading error.
+    if attn.rope_settings is None:
+        return
     assert attn.rope is not None and attn.rope.inv_freq is not None, \
         f"{key}: model loaded without a RoPE table; cannot build positional encoding"
     # mRoPE (Qwen2/3-VL text towers) is ACCEPTED for text-only training. mRoPE
@@ -221,11 +245,21 @@ def _mlp_metadata(block) -> dict:
         return meta
     meta.update({
         "mlp_kind": "moe",
+        # "std" (softmax top-k) or "dots" (sigmoid + selection bias +
+        # normalize-over-selected * routed_scaling_factor -- AFMoE).
+        "router_type": mlp.router_type,
         "num_experts": mlp.num_experts,
         "num_experts_per_tok": mlp.num_experts_per_tok,
         # Post-softmax per-expert scale (bf16 tensor or None); multiplied onto
         # the selected routing weights exactly as routing_std does.
         "per_expert_scale": mlp.per_expert_scale,
+        # dots-router inputs (None / unused on the std router). The bias
+        # enters expert SELECTION only, never the weights; laundered out of
+        # inference-mode since it reaches autograd ops raw (see
+        # _frozen_normal).
+        "routed_scaling_factor": (float(mlp.routed_scaling_factor)
+                                  if mlp.routed_scaling_factor is not None else 1.0),
+        "e_score_bias": _frozen_normal(mlp.e_score_correction_bias),
         "shared_activation": (mlp.shared_experts.activation_fn
                               if mlp.shared_experts is not None else None),
         # Gemma4 layout: routing and the routed experts read the RAW
@@ -303,8 +337,10 @@ def block_metadata(block) -> dict:
         "head_dim": attn.head_dim,
         "sm_scale": attn.sm_scale,
         # RoPE: the llama3-scaled inv_freq lives on the loaded RoPE object.
-        "inv_freq": attn.rope.inv_freq,
-        "attn_factor": attn.rope.attn_factor,
+        # None on a NoPE layer (AFMoE full-attention layers) -- the native
+        # forward then skips the rotation, mirroring inference.
+        "inv_freq": attn.rope.inv_freq if attn.rope is not None else None,
+        "attn_factor": attn.rope.attn_factor if attn.rope is not None else 1.0,
         # Per-layer attention window: >0 means sliding (band) attention, else full
         # causal (Gemma alternates local-sliding / global-full layers).
         "sliding_window": int(sw) if sw not in (None, 0) else -1,
@@ -318,6 +354,12 @@ def block_metadata(block) -> dict:
         # per head (out_features = 2*nq*hd); the attention output is multiplied
         # by sigmoid(gate) before o_proj.
         "interleaved_gate": bool(getattr(attn, "interleaved_gate", False)),
+        # AFMoE: a separate full-width gate projection ([hidden, nq*hd]) on the
+        # block input; same sigmoid multiply on the flattened context before
+        # o_proj as the interleaved gate, just sourced from its own linear
+        # (attn_gate_linear).
+        "full_gate": bool(getattr(attn, "full_gate", False)
+                          and getattr(attn, "g_proj", None) is not None),
         # Gemma applies a learned per-layer scalar to the whole residual stream at
         # block end (TransformerBlock.forward: x *= layer_scalar_f). None elsewhere.
         "layer_scalar": getattr(block, "layer_scalar_f", None),
@@ -404,6 +446,20 @@ def attn_projections(block):
     """Return the ``(q_proj, k_proj, v_proj, o_proj)`` linears of one block."""
     a = block.attn
     return a.q_proj, a.k_proj, a.v_proj, a.o_proj
+
+
+def attn_gate_linear(block):
+    """The separate full-width attention output gate ``Linear`` (AFMoE:
+    ``self_attn.gate_proj``, ``[hidden, nq*hd]``), or ``None``. The inference
+    forward multiplies the flattened attention context by ``sigmoid(g)``
+    before ``o_proj`` (``ext.mul_sigmoid_``); only returned when the module
+    gates full-width (the headwise variant is rejected at
+    ``assert_block_supported``)."""
+    a = block.attn
+    g = getattr(a, "g_proj", None)
+    if g is None or not getattr(a, "full_gate", False):
+        return None
+    return g
 
 
 def gdn_projections(block):

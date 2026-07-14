@@ -33,16 +33,24 @@ logit softcapping), the Qwen3.5/3.6 hybrid: GatedDeltaNet layers (a
 differentiable gated delta rule -- see ``training.gdn``; the fla
 ``chunk_gated_delta_rule`` Triton kernel on CUDA fp16/bf16, the sequential
 fp32 reference elsewhere) and gated full-attention layers (interleaved output
-gate), and BlockSparseMLP mixtures of experts with the std softmax top-k
+gate), AFMoE / Trinity blocks (a separate full-width attention output gate
+keyed ``self_attn.gate_proj``, NoPE full-attention layers -- RoPE only on
+the sliding layers -- muP embedding multiplier, four-norm sandwich blocks,
+dense-first-N-layers), and BlockSparseMLP mixtures of experts with the std
+softmax top-k
 router (Qwen3-MoE, Qwen3.5-MoE incl. the shared expert + sigmoid shared
 gate, and the Gemma4 MoE layout: routing + routed experts fed from the raw
 post-attention residual through their own pre-norms, routed/shared post
-norms, per-expert scale) -- see ``_moe_out``. It reduces bit-identically to
+norms, per-expert scale) or the "dots" sigmoid router (AFMoE: selection
+bias, normalize-over-selected weights, routed scaling factor, ungated
+shared expert) -- see ``_moe_out``. It reduces bit-identically to
 the original Llama
 path when those features are absent. Still rejected loudly
 (``assert_block_supported``): fused-qkvz GatedDeltaNet (Qwen3-Next layout),
-ds3/dots-router MoE, headwise attention gating (g_proj), mRoPE, partial
-rotary and non-NeoX RoPE. Sample packing is not supported on GatedDeltaNet
+grouped ds3-router MoE, HEADWISE attention gating (per-head scalar g_proj),
+and non-NeoX RoPE (mRoPE and partial
+rotary are accepted for text-only training). Sample packing is not
+supported on GatedDeltaNet
 models (the recurrence would carry state across packed document boundaries);
 train them unpacked.
 
@@ -627,6 +635,15 @@ class NativeLlamaQLoRA(nn.Module):
                 # takes V from the raw K projection.
                 entry.v_proj = wrap(v_proj, "v_proj") if v_proj is not None else None
                 entry.o_proj = wrap(o_proj, "o_proj")
+                # AFMoE full-width attention output gate (a separate linear the
+                # checkpoint keys as self_attn.gate_proj). It answers to the
+                # plain gate_proj target -- PEFT's suffix matching would adapt
+                # it under that name too -- and to attn_gate_proj for
+                # adapting it alone.
+                g_lin = backbone.attn_gate_linear(blk)
+                entry.g_proj = (wrap(g_lin, "gate_proj",
+                                     ("gate_proj", "attn_gate_proj"))
+                                if g_lin is not None else None)
             entry.gates = nn.ModuleList(gates)
             entry.ups = nn.ModuleList(ups)
             entry.downs = nn.ModuleList(downs)
@@ -939,6 +956,13 @@ class NativeLlamaQLoRA(nn.Module):
             qg = entry.q_proj(normed).view(bsz, t, nq, 2 * hd)
             q, out_gate = torch.chunk(qg, 2, dim=-1)             # [b,t,nq,hd] each
             out_gate = out_gate.reshape(bsz, t, nq * hd)
+        elif meta.get("full_gate"):
+            # AFMoE gated attention: the gate comes from its own full-width
+            # linear on the block input; the sigmoid multiply below is the
+            # same as the interleaved case (inference: g = g_proj(x), then
+            # ext.mul_sigmoid_(o, g) on the flattened context before o_proj).
+            q = entry.q_proj(normed).view(bsz, t, nq, hd)
+            out_gate = entry.g_proj(normed)                      # [b,t,nq*hd]
         else:
             q = entry.q_proj(normed).view(bsz, t, nq, hd)
             out_gate = None
@@ -955,8 +979,11 @@ class NativeLlamaQLoRA(nn.Module):
         if entry.v_norm_spec is not None:
             v = self._norm(v, entry.v_norm_spec)
 
-        q = self._apply_rope(q, meta["inv_freq"], meta["attn_factor"], position_ids)
-        k = self._apply_rope(k, meta["inv_freq"], meta["attn_factor"], position_ids)
+        # NoPE layers (AFMoE full-attention layers) carry no RoPE table at all
+        # -- skip the rotation exactly as the inference forward's `if self.rope:`.
+        if meta["inv_freq"] is not None:
+            q = self._apply_rope(q, meta["inv_freq"], meta["attn_factor"], position_ids)
+            k = self._apply_rope(k, meta["inv_freq"], meta["attn_factor"], position_ids)
 
         if attn_mode == "flash":
             # FlashAttention-2 (autograd-capable upstream flash_attn): O(t) memory,
@@ -1070,9 +1097,10 @@ class NativeLlamaQLoRA(nn.Module):
             probs = torch.softmax(scores, dim=-1)
             ctx = torch.matmul(probs, v)                        # [b,nq,t,hd]
             ctx = ctx.transpose(1, 2).reshape(bsz, t, nq * hd)  # fp32 reference result
-        # Interleaved output gate (Qwen3.5 full-attn layers): o *= sigmoid(gate),
-        # applied to the flattened context exactly as the inference mul_sigmoid_
-        # does, before o_proj. sigmoid in fp32 for fidelity, back to ctx dtype.
+        # Output gate (Qwen3.5 interleaved / AFMoE full-width g_proj):
+        # o *= sigmoid(gate), applied to the flattened context exactly as the
+        # inference mul_sigmoid_ does, before o_proj. sigmoid in fp32 for
+        # fidelity, back to ctx dtype.
         if out_gate is not None:
             ctx = ctx * torch.sigmoid(out_gate.float()).to(ctx.dtype)
         # o_proj re-casts its input to compute_dtype and outputs in it, so attn_out is
@@ -1147,16 +1175,20 @@ class NativeLlamaQLoRA(nn.Module):
         return mlp_out
 
     def _moe_out(self, meta, entry, normed2, residual=None):
-        """Block-sparse mixture of experts (BlockSparseMLP, std softmax top-k
-        router -- Qwen3-MoE / Qwen3.5-MoE / Gemma4 MoE) over the
-        already-normed input.
+        """Block-sparse mixture of experts (BlockSparseMLP -- Qwen3-MoE /
+        Qwen3.5-MoE / Gemma4 MoE / AFMoE) over the already-normed input.
 
-        Routing reproduces the inference kernel (``ext.routing_std``): logits
-        from the frozen router gate, top-k over the logits, softmax over the
-        selected k in fp32 -- mathematically identical to HF's softmax-over-all
-        + renormalize-top-k with ``norm_topk_prob=True`` (which the Qwen MoE
-        configs assert), since restricting a softmax to a subset and
-        renormalizing equals the softmax over that subset's logits. The
+        Routing reproduces the inference kernels. "std" (``ext.routing_std``):
+        logits from the frozen router gate, top-k over the logits, softmax
+        over the selected k in fp32 -- mathematically identical to HF's
+        softmax-over-all + renormalize-top-k with ``norm_topk_prob=True``
+        (which the Qwen MoE configs assert), since restricting a softmax to a
+        subset and renormalizing equals the softmax over that subset's
+        logits. "dots" (``ext.routing_ds3_nogroup`` -- AFMoE): sigmoid
+        scores, the frozen ``e_score_correction_bias`` added for top-k
+        SELECTION only, the selected experts weighted by their unbiased
+        scores normalized over the selected set and scaled by
+        ``routed_scaling_factor``. The
         routing weights stay differentiable w.r.t. the hidden state (gradients
         flow through the weighted sum into the softmax and router matmul; the
         arg-top-k selection itself is piecewise-constant, exactly as in HF /
@@ -1212,11 +1244,30 @@ class NativeLlamaQLoRA(nn.Module):
         ye = self._norm(yr, routed_pre) if routed_pre is not None else yr
 
         logits = entry.router(z).to(acc)                        # [nt, E]
-        top_logits, top_idx = torch.topk(logits, top_k, dim=-1)
-        weights = torch.softmax(top_logits, dim=-1)             # [nt, k] >=fp32
-        pes = meta.get("per_expert_scale")
-        if pes is not None:
-            weights = weights * pes.to(acc).to(weights.device)[top_idx]
+        if meta.get("router_type", "std") == "dots":
+            # Ungrouped sigmoid router (AFMoE / dots.llm1), mirroring the
+            # inference routing_dots / ext.routing_ds3_nogroup: sigmoid
+            # scores; e_score_correction_bias added for the top-k SELECTION
+            # only; the selected experts weighted by their UNBIASED scores,
+            # normalized over the selected set (+1e-20, the kernel's guard),
+            # scaled by routed_scaling_factor. Differentiable w.r.t. the
+            # hidden state through sigmoid/gather/normalize; the arg-top-k
+            # selection (and the bias, which only shifts it) is
+            # piecewise-constant, exactly as in the HF reference.
+            scores = torch.sigmoid(logits)                      # [nt, E] >=fp32
+            e_bias = meta.get("e_score_bias")
+            sel_scores = scores if e_bias is None \
+                else scores + e_bias.to(acc).to(scores.device)
+            _, top_idx = torch.topk(sel_scores, top_k, dim=-1)
+            weights = scores.gather(1, top_idx)                 # [nt, k]
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+            weights = weights * meta.get("routed_scaling_factor", 1.0)
+        else:
+            top_logits, top_idx = torch.topk(logits, top_k, dim=-1)
+            weights = torch.softmax(top_logits, dim=-1)         # [nt, k] >=fp32
+            pes = meta.get("per_expert_scale")
+            if pes is not None:
+                weights = weights * pes.to(acc).to(weights.device)[top_idx]
 
         act = F.silu if meta["activation"] == "silu" \
             else (lambda z: F.gelu(z, approximate="tanh"))
