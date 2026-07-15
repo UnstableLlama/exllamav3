@@ -3797,6 +3797,75 @@ TIMESTAMPED (a rotation can never overwrite the previous backup), and
 `qlora_runs.csv` is now **git-tracked** (un-ignored). Lessons: keep
 `RUN_LOG_FIELDS` byte-identical across arms; commit the CSV after runs.
 
+### Session 33 — reviewed unsloth PR #7115 ("Add EXL3 quantization backend") — independent shim, no new kernels, our fast path is ahead of it
+
+> Reviewed 2026-07-14: https://github.com/unslothai/unsloth/pull/7115
+> (author `Sweaterdog`, opened 2026-07-13, +4,532/−51, 19 files; OPEN,
+> bot-only reviews at review time — no human maintainer yet). Adds an EXL3
+> backend to unsloth as an opt-in alternative to bitsandbytes, incl. MoE.
+> Full diff reviewed against our implementation.
+
+**No code lineage either direction.** Our fork is public, but their diff
+contains none of our machinery (no `EXL3LoRAHadFunction`/`DiffLinear`/
+`frozen_trellis_parts`/activation-side transforms/PiSSA offset handling);
+the only shared vocabulary is upstream's checkpoint format (`suh`/`svh`/
+`trellis`). They build purely on upstream public API: `LinearEXL3.
+get_weight_tensor()` + the upstream `Exl3HfLinear` transformers
+integration. Different design class entirely: theirs is a COMPATIBILITY
+SHIM (fake `nn.Linear` with a `[out,1]` placeholder weight carrying a
+bnb-shaped `quant_state`, so unsloth's existing PEFT/LoRA kernels treat
+EXL3 like NF4); ours is a native trainer.
+
+**"Fused kernels" claim doesn't survive the diff.** They add ZERO new
+kernels — the EXL3 path feeds unsloth's existing NF4-era fused LoRA
+machinery via full `get_weight_tensor()` reconstruction per dequant call
+(+ a transpose + `.contiguous()` copy), and they explicitly DISABLED
+exllamav3's fused trellis matmul ("produced wrong logits"), doing
+reconstruct-then-`F.linear`. That per-linear cost is our `--dequant-mode
+legacy` plus extra copies — exactly what Session 30's activation-side fast
+path replaced (+28% tok/s 1B, +32% MoE). High-confidence read from the
+code (not benchmarked): EXL3-inside-unsloth via this PR runs meaningfully
+SLOWER per token than our native trainer; the 1.9× unsloth edge we
+measured (S32) came from cheap NF4 dequant + their kernels, and this PR
+re-imports the expensive dequant into their stack.
+
+**MoE:** converges on our quantized-experts-on-24GB thesis
+(`Exl3QuantizedExperts` reconstructs routed top-k on the fly, cross-step
+LRU cache of dense experts, default 64) — but experts are FROZEN with **no
+LoRA on experts at all** (adapters on attention only). Our routed-expert
+adapters (S20–S28) have no counterpart there.
+
+**Multi-GPU: not like ours.** Accelerate `device_map` pass-through plus
+defensive `W.to(x.device)` copies inside every forward (per-call cross-GPU
+weight traffic on placement mismatch); off-tree expert lists pinned to the
+load device. No DDP, no deliberate placement; unsloth's trainer is
+single-process. Ours: box-tested `parallel: split` with per-device budgets
++ a real DDP arm.
+
+**Quality flags:** PR body claims "dequant cosine 1.007" (cosine can't
+exceed 1 — sloppy validation somewhere); their `fast_dequantize` wrapper is
+`@torch.inference_mode` → inference tensors, the exact bug class that bit
+our Liger integration (S9) — training presumably survives only because
+unsloth re-dequantizes in backward rather than saving those tensors.
+
+**Borrow-list verdicts (user-reviewed):**
+1. Quantize-on-load: **REJECTED** — EXL3 quantization is compute-intensive
+   enough that it only makes sense as a separate explicit step, not a load
+   path.
+2. Cross-step LRU dense-expert cache for hot MoE experts: **parked on the
+   try-later list** — plausibly different economics from our within-step
+   `--dequant-cache` (measured net loss, S30) under skewed routing, but an
+   edge case; low priority.
+3. Their bnb-`quant_state` shim as a PEFT/unsloth distribution seam for
+   EXL3: noted for strategic awareness only (relevant if the PR merges);
+   no action.
+
+**Net read for the S32 competitiveness plan:** upstream unsloth's
+about-to-land EXL3 story is BEHIND our fast path on per-token cost, lacks
+expert adapters, and has no real multi-GPU. Our S32 plan (profile →
+Tier-1 flags → resident dequant / fused LoRA backward) remains the right
+track and would extend the lead.
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)
