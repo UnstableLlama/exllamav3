@@ -200,9 +200,13 @@ class LinearEXL3:
         """Reconstruct ONLY output columns ``[n_start : n_start+n_features]`` of the
         dequantized weight, shape ``[in_features, n_features]`` (half).
 
-        This is exact (bit-identical to the matching slice of ``get_weight_tensor``)
-        because every transform restricts cleanly to a column slice that is aligned
-        to ``RECONSTRUCT_SLICE_GRANULARITY_N``:
+        This matches the corresponding slice of ``get_weight_tensor`` to within
+        1 fp16 ulp -- element-for-element the same math, but the Hadamard
+        pre-applies are fp32 GEMMs whose width differs between the two paths
+        (full ``out_features`` vs one slice), so cuBLAS kernel selection can
+        shift the accumulation order and flip the final fp16 rounding. Every
+        transform restricts cleanly to a column slice that is aligned to
+        ``RECONSTRUCT_SLICE_GRANULARITY_N``:
           * ``reconstruct_slice`` dequantizes the inner weight for those columns;
           * ``preapply_had_l`` / ``su`` mix only the *input* (row) dimension, so they
             act per-output-column -- unaffected by slicing columns;

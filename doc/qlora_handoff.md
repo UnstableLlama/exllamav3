@@ -1118,9 +1118,11 @@ top of the grad graph. (Eval survived because it ran under `no_grad`.)
   **run on the box** (no torch in the container). The EXL3 slice reconstruction is
   GPU-only and is now gated automatically: **`qlora_validate_native.py` runs a
   head-slice check** (`get_weight_tensor()[:, a:b]` vs `get_weight_tensor_slice(a, b)`
-  at the first/middle/last aligned chunk; expects bit-identical, folds into the
-  PASS/FAIL and the non-zero exit, SKIPs for an unsliceable head, `--skip-head-slice-check`
-  to opt out). So the standard pre-run gate already covers it; then run
+  at the first/middle/last aligned chunk; expects agreement to ≤1 fp16 ulp — not
+  bit-identical, because the fp32 Hadamard GEMMs differ in width between the two
+  paths and cuBLAS kernel selection can flip the last rounding bit (seen as
+  max|Δ|=2⁻¹⁶ on a 248k-vocab head); folds into the PASS/FAIL and the non-zero
+  exit, SKIPs for an unsliceable head, `--skip-head-slice-check` to opt out). So the standard pre-run gate already covers it; then run
   `python tests/test_fused_ce.py` for the autograd gradcheck and a 1-step train
   smoke with `--head-vocab-chunk 32768` (watch cuda:1 peak drop and the loss match
   an off run). Once trusted it should let you **drop the `--use-per-device` juggling

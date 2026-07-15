@@ -527,14 +527,25 @@ def check_packing(net, tokenizer, prompts, device):
     return ok
 
 
+def _fp16_ulp_key(t):
+    """Map fp16 bit patterns to a monotonically ordered int32 key (sign-magnitude
+    -> lexicographic), so adjacent representable values differ by exactly 1."""
+    u = t.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
+    return torch.where(u >= 0x8000, 0xFFFF - u, u + 0x8000)
+
+
 def check_head_slice(net):
     """
     Gate the chunked-vocab head (--head-vocab-chunk): assert the column-sliced head
-    reconstruction equals the matching slice of the full reconstruction, bit-for-bit.
-    This is the GPU-only half the CPU gradcheck (tests/test_fused_ce.py) can't cover
-    -- if reconstruct_slice or the per-slice Hadamard/scale were wrong, a chunked
-    run would train against a subtly different head. Uses the same backbone seam the
-    trainer uses. SKIPs when the head can't slice (e.g. an unquantized head).
+    reconstruction equals the matching slice of the full reconstruction to within
+    1 fp16 ulp. Not bit-for-bit: the Hadamard pre-applies are fp32 GEMMs whose
+    width differs between the paths (full vocab vs one chunk), so cuBLAS kernel
+    selection can shift the accumulation order and flip the final fp16 rounding by
+    one ulp. A real slicing bug (wrong had_n block, misindexed sv column) is on
+    the order of the weights themselves -- thousands of ulps -- so the 1-ulp gate
+    still catches it loudly. This is the GPU-only half the CPU gradcheck
+    (tests/test_fused_ce.py) can't cover. Uses the same backbone seam the trainer
+    uses. SKIPs when the head can't slice (e.g. an unquantized head).
     """
     print("\n" + "-" * 78)
     print("head-slice check: get_weight_tensor_slice == full reconstruction")
@@ -551,18 +562,28 @@ def check_head_slice(net):
     starts = sorted({0,
                      max(0, ((vocab // 2) // gran) * gran),
                      max(0, vocab - chunk)})
-    max_d = 0.0
+    max_d, max_ulp = 0.0, 0
     for a in starts:
         a = min(a, vocab - chunk)
         b = a + chunk
         s = slice_fn(a, b - a).to(full.dtype).to(full.device)
-        max_d = max(max_d, (full[:, a:b] - s).abs().max().item())
+        ref = full[:, a:b]
+        max_d = max(max_d, (ref - s).abs().max().item())
+        if full.dtype == torch.float16:
+            ulp = (_fp16_ulp_key(ref) - _fp16_ulp_key(s)).abs().max().item()
+        else:
+            # Non-fp16 heads reach here via the generic fallback, which indexes
+            # the one resident weight tensor -- exact equality is fair there.
+            ulp = 0 if torch.equal(ref, s) else 2
+        max_ulp = max(max_ulp, ulp)
     del full
-    ok = max_d == 0.0
+    ok = max_ulp <= 1
     print(f"  vocab={vocab}, granularity={gran}, chunk={chunk}, "
           f"slices@{starts}")
-    print(f"  max|full[:, a:b] - slice(a, b)| = {max_d:.3e}")
-    print("  head-slice check:", "PASS" if ok else "FAIL (sliced head != full head)")
+    print(f"  max|full[:, a:b] - slice(a, b)| = {max_d:.3e}  "
+          f"(max {max_ulp} ulp, tolerance 1)")
+    print("  head-slice check:",
+          "PASS" if ok else "FAIL (sliced head != full head beyond 1 fp16 ulp)")
     return ok
 
 
