@@ -84,6 +84,8 @@ lora_embed: false         # single/split only
 lora_head: false          # single/split only
 offload_embed_head_optim: false  # single/split only, requires torchao + train_embeddings/train_head
 offload_activations: false       # single/split only
+offload_mode: async              # async = overlapped side-stream copies (S36);
+                                 # sync = torch save_on_cpu (blocking, pre-S36)
 use_liger: false                 # single/split only
 use_rslora: false                # single/split only; scale = alpha/sqrt(r) (rank-sweep stable)
 init_lora: default               # single/split only; default | pissa | qerr | eva (SVD adapter inits;

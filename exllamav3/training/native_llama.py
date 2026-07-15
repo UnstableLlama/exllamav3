@@ -444,6 +444,8 @@ class NativeLlamaQLoRA(nn.Module):
     # it from nn.Module's __getattr__, so those are read via getattr() in the accessor.
     use_liger = False
     offload_activations = False
+    offload_mode = "async"
+    _offloader = None
     init_lora = "default"
     # Quant-aware training (training.quant_aware): shared {"tick", "seed"}
     # state when a mode is enabled via set_quant_aware(), else None (exact
@@ -475,17 +477,23 @@ class NativeLlamaQLoRA(nn.Module):
         lora_embed: bool = False,
         lora_head: bool = False,
         offload_activations: bool = False,
+        offload_mode: str = "async",
         use_liger: bool = False,
         expert_r: Optional[int] = None,
     ):
         super().__init__()
-        # Offload the (grad-checkpointed) saved activations to CPU via torch's
-        # built-in save_on_cpu, and/or route RMSNorm + SwiGLU through Liger Triton
-        # kernels. Both are CUDA + fp16/bf16 memory levers; eager fp32 / CPU / the
-        # validate path ignore them (so the correctness gate is unaffected). Liger
-        # changes numerics slightly -- run qlora_validate_native.py with --use-liger
-        # before trusting a Liger run.
+        # Offload the (grad-checkpointed) saved activations to CPU, and/or route
+        # RMSNorm + SwiGLU through Liger Triton kernels. Both are CUDA + fp16/bf16
+        # memory levers; eager fp32 / CPU / the validate path ignore them (so the
+        # correctness gate is unaffected). Liger changes numerics slightly -- run
+        # qlora_validate_native.py with --use-liger before trusting a Liger run.
+        # offload_mode: "async" (S36: double-buffered side-stream copies,
+        # value-exact, overlaps compute) or "sync" (torch save_on_cpu, the S9
+        # behavior, kept for A/B and as the retain_graph-safe fallback).
         self.offload_activations = bool(offload_activations)
+        assert offload_mode in ("async", "sync"), f"bad offload_mode {offload_mode!r}"
+        self.offload_mode = offload_mode
+        self._offloader = None  # lazy AsyncActivationOffload (holds pinned pool)
         self.use_liger = bool(use_liger)
         if self.use_liger and _liger_ops() is None:
             raise SystemExit(
@@ -1602,14 +1610,21 @@ class NativeLlamaQLoRA(nn.Module):
                                                               and mem_eff) else None
 
         # Activation offload: park the (grad-checkpointed) block-boundary activations
-        # saved for backward in CPU RAM via torch's built-in save_on_cpu, trading
-        # CPU<->GPU copies for GPU memory. Only meaningful with checkpointing on CUDA;
-        # wraps just the block loop (the final norm/head stay GPU-resident). pin_memory
-        # speeds the transfer. Synchronous (no CUDA-stream double-buffering yet), so it
-        # costs more wall-clock than unsloth's async variant but is correct + built-in.
+        # saved for backward in CPU RAM, trading CPU<->GPU copies for GPU memory.
+        # Only meaningful with checkpointing on CUDA; wraps just the block loop (the
+        # final norm/head stay GPU-resident). "async" (default) double-buffers the
+        # copies on a side stream so they overlap compute (training.offload);
+        # "sync" is torch's blocking save_on_cpu, kept for A/B + retain_graph.
         offload = (self.offload_activations and ckpt and "cuda" in str(first_device))
-        save_ctx = (torch.autograd.graph.save_on_cpu(pin_memory=True)
-                    if offload else contextlib.nullcontext())
+        if not offload:
+            save_ctx = contextlib.nullcontext()
+        elif self.offload_mode == "async":
+            if self._offloader is None:
+                from .offload import AsyncActivationOffload
+                self._offloader = AsyncActivationOffload()
+            save_ctx = self._offloader
+        else:
+            save_ctx = torch.autograd.graph.save_on_cpu(pin_memory=True)
         cur_device = first_device
         with save_ctx:
             for meta, entry, dev in zip(self._block_meta, self.blocks, self._block_devices):

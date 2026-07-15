@@ -59,7 +59,8 @@ COMMON_KEYS = {
 SINGLE_ONLY_KEYS = {
     "device", "parallel", "reserve_per_device", "use_per_device", "optim",
     "inspect", "lora_embed", "lora_head", "offload_embed_head_optim",
-    "offload_activations", "use_liger", "sample_every", "sample_prompt",
+    "offload_activations", "offload_mode", "use_liger",
+    "sample_every", "sample_prompt",
     "use_rslora", "init_lora", "init_svd_niter", "init_ref_model",
     "init_eva_tokens",
     "quant_aware", "quant_aware_scale", "quant_aware_ref_model",
@@ -78,6 +79,7 @@ SINGLE_ONLY_DEFAULTS = {
     "lora_head": False,
     "offload_embed_head_optim": False,
     "offload_activations": False,
+    "offload_mode": "async",
     "use_liger": False,
     "sample_every": 25,
     "sample_prompt": "Tell me about your day.",

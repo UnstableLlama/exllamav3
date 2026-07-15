@@ -4124,6 +4124,70 @@ pending. Box note: fans — ALL FOUR fan controllers (fan:0/1 = GPU0,
 fan:2/3 = GPU1) need `GPUTargetFanSpeed=66` with `GPUFanControlState=1`
 per GPU, `DISPLAY=:0` from a non-X shell; verify with nvidia-smi.
 
+### Session 36 (cont.) — Tier-2 item 2 BUILT + A/B'd: async double-buffered offload — step 1.42→1.23s (items 1+2 = 1.145×), VRAM flat, bit-exact
+
+**Built:** `exllamav3/training/offload.py` — `AsyncActivationOffload`,
+a reusable `saved_tensors_hooks` context replacing `save_on_cpu` around
+the block loop. Per-device side CUDA stream; pack copies the saved
+activation to a POOLED pinned host buffer async (compute never waits;
+`record_stream` keeps the source block's memory alive for the DMA
+read); unpack copies back on the same stream and PREFETCHES the next
+records in reverse pack order, so block i−1's activation is on device
+while block i recomputes — the compute stream only `wait_event`s.
+Pinned buffers pooled by (shape, dtype) across steps (`cudaHostAlloc`
+is itself synchronizing — save_on_cpu's per-call pinned alloc was part
+of the stall; steady pool ≈ 700 MB host RAM on this config, what
+save_on_cpu allocated transiently). Tensors < 1 MB stay on GPU.
+Knob: `offload_mode: async|sync` (trainer + pref trainer + YAML),
+default **async**; `sync` = the old save_on_cpu, kept for A/B and as
+the fallback for retain_graph/double-backward (async raises clearly on
+a second unpack; one pass per context entry, no nesting).
+
+**The bug worth remembering:** first version produced NaN/1e11 garbage
+grads, nondeterministic run-to-run — a caching-allocator stream race:
+`rec.gpu = torch.empty(...)` allocates on the COMPUTE stream, and the
+allocator only orders reuse within one stream, so the side-stream HtoD
+write raced whatever compute work last used that memory. Fix: the side
+stream `wait_stream`s the compute stream at the allocation point
+(comment in `_start_htod`). Moral: any allocate-on-A/write-on-B needs
+explicit ordering, even when the READER is already event-synced.
+
+**Verification gate (same-process, same net, same batch, eager attn
+for strict determinism; 3 iterations to exercise pool reuse):** loss
+AND all 392 adapter grads bit-identical sync vs async, async
+deterministic run-to-run. Copies don't round — value-exact, unlike
+liger. All CPU suites still pass (offload is CUDA-only, untouched).
+
+**Profile (same 20-step config):** GPU-busy ~unchanged (1,137 →
+1,141 ms/step — the copies still run, they just overlap), but
+launch/stall idle fell ~220 → ~90 ms: step wall 1.36 → **1.23 s**.
+Micro-bench had shown async peak VRAM +0.55 GB (block-input reuse
+deferred until the PCIe queue drains); on the real config (flash,
+seq 1024, expandable_segments) peak stayed **6.33 GB — no regression**.
+Watch it on the 8k long-context regime before relying on it there.
+
+**A/B (109-step, matched config, CSV row):**
+
+| arm | wall | sup tok/s | peak VRAM | held-out |
+|---|---|---|---|---|
+| S32 baseline (sync offload, fp16 decode) | 314s | 397 | 6.34 GB | 2.729 |
+| + bf16 decode (item 1) | 315s | 394 | 6.34 GB | 2.738 |
+| + async offload (items 1+2) | **300s** | **415** | 6.34 GB | 2.739 |
+| unsloth NF4 (S32) | 168s | 741 | 4.28 GB | 2.809 |
+
+Steady-state step 1.42 → 1.23 s = **1.145× from items 1+2 combined**,
+free in VRAM and exact in values (held-out spread is per-run init
+randomness — runs are unseeded — plus item 1's bf16 rounding; async
+itself is bit-exact vs sync by the gate above). Wall gain is diluted
+at 109 steps because load + evals + save are ~half the wall. Gap to
+unsloth: 1.79× wall at matched quality-per-run-class; the remaining
+ladder is unchanged (no-ckpt 1.54× where VRAM allows, fused-LoRA
+launch play, residency bottom).
+
+**Still open:** Session-34 GPU fused-path LoRA smoke on the merged
+tree; re-validate async offload on the 8k/12B long-context class
+(VRAM watch) before making it the documented default there.
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)

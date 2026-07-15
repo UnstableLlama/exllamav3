@@ -459,6 +459,7 @@ def _run_main():
     ap.add_argument("--ce-chunk", type=int, default=1024)
     ap.add_argument("--head-vocab-chunk", type=int, default=0)
     ap.add_argument("--offload-activations", action="store_true")
+    ap.add_argument("--offload-mode", choices=["async", "sync"], default="async")
     ap.add_argument("--use-liger", action="store_true")
     ap.add_argument("--dequant-mode", choices=["fast", "legacy"], default="fast",
                     help="Frozen-weight dequant path (audit A1); see the SFT arm.")
@@ -526,7 +527,8 @@ def _run_main():
         use_rslora=args.use_rslora, compute_dtype=cdt,
         gradient_checkpointing=not args.no_grad_ckpt,
         attn_impl=args.attn_impl, head_vocab_chunk=args.head_vocab_chunk,
-        offload_activations=args.offload_activations, use_liger=args.use_liger,
+        offload_activations=args.offload_activations,
+        offload_mode=args.offload_mode, use_liger=args.use_liger,
         expert_r=args.expert_r,
     )
     net.train()

@@ -1262,10 +1262,14 @@ def _run_main():
                          "and follow the same LR schedule as the LoRA group.")
     ap.add_argument("--offload-activations", action="store_true",
                     help="Offload the grad-checkpointed block activations to CPU RAM "
-                         "(torch save_on_cpu, pinned) to free GPU memory for longer "
-                         "context / bigger batch. Needs gradient checkpointing (on by "
-                         "default) + CUDA. Synchronous copies, so a modest wall-clock "
-                         "cost; wraps only the decoder block loop.")
+                         "(pinned) to free GPU memory for longer context / bigger "
+                         "batch. Needs gradient checkpointing (on by default) + CUDA. "
+                         "Wraps only the decoder block loop.")
+    ap.add_argument("--offload-mode", choices=["async", "sync"], default="async",
+                    help="How --offload-activations moves the data: async (default; "
+                         "double-buffered side-stream copies that overlap compute, "
+                         "value-exact) or sync (torch save_on_cpu, the pre-S36 "
+                         "behavior -- blocking copies; keep for A/B or retain_graph).")
     ap.add_argument("--use-liger", action="store_true",
                     help="Route RMSNorm (2D/3D norms) and SwiGLU (silu only) through "
                          "Liger Triton kernels for lower activation memory + speed. "
@@ -1519,7 +1523,8 @@ def _run_main():
         attn_impl=args.attn_impl, head_vocab_chunk=args.head_vocab_chunk,
         modules_to_save_dtype=ms_dtype,
         lora_embed=args.lora_embed, lora_head=args.lora_head,
-        offload_activations=args.offload_activations, use_liger=args.use_liger,
+        offload_activations=args.offload_activations,
+        offload_mode=args.offload_mode, use_liger=args.use_liger,
         expert_r=args.expert_r,
     )
     net.train()
