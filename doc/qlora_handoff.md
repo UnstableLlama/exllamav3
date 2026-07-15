@@ -4188,6 +4188,17 @@ launch play, residency bottom).
 tree; re-validate async offload on the 8k/12B long-context class
 (VRAM watch) before making it the documented default there.
 
+**NEXT SESSION (user-set, 2026-07-15):** the user has just completed a
+new dataset and wants to TRAIN MODELS on it. Perf ladder work pauses
+here (items 1+2 landed: 1.145× stepping, zero VRAM, value-exact; the
+remaining rungs all spend VRAM and are opt-in). Ask which models /
+which box arrangement; the trainers now default to `offload_mode:
+async` and the S36 bf16 decode, so new runs get both for free. Local
+dataset files (.jsonl/.json/.parquet/.csv) load directly via the
+`dataset:` key (S36 `load_dataset_split()`; local files come in as
+split "train" — keep `dataset_split: train` and carve eval with
+`val_frac`). Fans to 66% (all four controllers) before any run.
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)
