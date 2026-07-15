@@ -12,7 +12,7 @@ from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 import os
-from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_attn
+from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_attn, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
 
 
 def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):
@@ -442,7 +442,8 @@ class Attention(Module):
             )
         ):
             self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
-            self.prealloc_kvh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "kvh_1")
+            # Staging buffers span the padded K, not hidden_size (e.g. NemotronH 3136 -> 3200)
+            self.prealloc_kvh_1 = g_tensor_cache.get(device, (2, 1, self.k_proj.in_features), torch.half, "kvh_1")
             self.prealloc_kv_1 = g_tensor_cache.get(device, (2, 1, self.num_kv_heads * self.head_dim), torch.half, "kv_1")
 
         # Test if Q and G proj can be fused
@@ -462,7 +463,7 @@ class Attention(Module):
             )
         ):
             self.multi_qg = MultiLinear(self. device, [self.q_proj, self.g_proj])
-            self.prealloc_qgh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "qgh_1")
+            self.prealloc_qgh_1 = g_tensor_cache.get(device, (2, 1, self.q_proj.in_features), torch.half, "qgh_1")
             self.prealloc_qg_1 = g_tensor_cache.get(device, (2, 1, self.num_q_heads * self.head_dim), torch.half, "qg_1")
 
         # Head norm
@@ -568,12 +569,16 @@ class Attention(Module):
                 g = None
 
         else:
-            x = x.view(1, bsz * q_len, dim)
+            # Unlike Linear.forward, the fused path doesn't zero-extend the input for padded
+            # in_features, so do it here (K is the padded width the mgemm kernel reads)
+            if x.shape[-1] < self.q_proj.in_features:
+                x = torch.nn.functional.pad(x, (0, self.q_proj.in_features - x.shape[-1]))
+            x = x.view(1, bsz * q_len, self.q_proj.in_features)
             if bsz * q_len == 1:
                 qgh = self.prealloc_qgh_1
                 qg = self.prealloc_qg_1
             else:
-                qgh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+                qgh = torch.empty((2, bsz * q_len, self.q_proj.in_features), dtype = torch.half, device = x.device)
                 qg = torch.empty((2, bsz * q_len, self.num_q_heads * self.head_dim), dtype = torch.half, device = x.device)
             ext.exl3_mgemm(
                 x,
@@ -595,7 +600,12 @@ class Attention(Module):
             q = qg[0].view(bsz, q_len, self.num_q_heads * self.head_dim)
             g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
             if has_runtime_lora(self.q_proj, self.g_proj):
-                xf = x.view(bsz * q_len, dim)
+                # LoRA adapters are sized to the unpadded activation width, so
+                # strip the zero-extension the fused path added (no-op slice
+                # for aligned models)
+                xf = x.view(bsz * q_len, -1)
+                if xf.shape[-1] != dim:
+                    xf = xf[:, :dim].contiguous()
                 self.q_proj.apply_lora(xf, q.view(bsz * q_len, -1))
                 self.g_proj.apply_lora(xf, g.view(bsz * q_len, -1))
 
@@ -604,12 +614,14 @@ class Attention(Module):
             v = self.v_proj.forward(x, params) if not self.use_k_as_v else k
 
         else:
-            x = x.view(1, bsz * q_len, dim)
+            if x.shape[-1] < self.k_proj.in_features:
+                x = torch.nn.functional.pad(x, (0, self.k_proj.in_features - x.shape[-1]))
+            x = x.view(1, bsz * q_len, self.k_proj.in_features)
             if bsz * q_len == 1:
                 kvh = self.prealloc_kvh_1
                 kv = self.prealloc_kv_1
             else:
-                kvh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+                kvh = torch.empty((2, bsz * q_len, self.k_proj.in_features), dtype = torch.half, device = x.device)
                 kv = torch.empty((2, bsz * q_len, self.num_kv_heads * self.head_dim), dtype = torch.half, device = x.device)
             ext.exl3_mgemm(
                 x,
@@ -631,7 +643,9 @@ class Attention(Module):
             k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             if has_runtime_lora(self.k_proj, self.v_proj):
-                xf = x.view(bsz * q_len, dim)
+                xf = x.view(bsz * q_len, -1)
+                if xf.shape[-1] != dim:
+                    xf = xf[:, :dim].contiguous()
                 self.k_proj.apply_lora(xf, k.view(bsz * q_len, -1))
                 self.v_proj.apply_lora(xf, v.view(bsz * q_len, -1))
 
@@ -844,7 +858,7 @@ class Attention(Module):
         # call: the graph is cached and a LoRA can be attached/detached after build).
         if (
             _bc_attn_enable and non_causal_spans is None and
-            bsz <= 4 and seqlen <= 16 and
+            bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and
             not has_runtime_lora(self.q_proj, self.k_proj, self.v_proj,
                                  getattr(self, "kv_proj", None), self.o_proj, self.g_proj)
         ):

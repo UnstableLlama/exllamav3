@@ -93,9 +93,30 @@ def test_bc_attn_graph_dispatch_guarded(fname):
     # check for a runtime LoRA on every involved projection
     src = _src("exllamav3", "modules", fname)
     assert re.search(
-        r"bsz <= 4 and seqlen <= 16 and\s*"
+        r"bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and\s*"
         r"not has_runtime_lora\(self\.q_proj, self\.k_proj, self\.v_proj,",
         src), f"{fname}: graph-captured decode dispatch lost its runtime-LoRA guard"
+
+
+def test_plain_mlp_bsz1_graph_guarded():
+    # BC_MLP (v1.0.0, non-gated up/act/down for NemotronH-class models) runs
+    # the whole MLP in one graph-captured C++ call, reading the up/down
+    # trellis directly; it must yield to the per-linear path under a LoRA
+    src = _src("exllamav3", "modules", "mlp.py")
+    assert re.search(
+        r"self\.bc is not None and bsz == 1 and q_len == 1[^:]*?"
+        r"not has_runtime_lora\(\*self\.ups, \*self\.downs\)",
+        src, re.S), "MLP: BC bsz-1 branch lost its runtime-LoRA guard"
+
+
+def test_mamba2_bsz1_graph_guarded():
+    # BC_Mamba2 (v1.0.0) runs the whole layer (in_proj through o_proj) in one
+    # graph-captured call, reading both projection trellises directly
+    src = _src("exllamav3", "modules", "mamba2.py")
+    assert re.search(
+        r"self\.bc is not None and bsz == 1 and seqlen == 1[^:]*?"
+        r"not has_runtime_lora\(self\.in_proj, self\.o_proj\)",
+        src, re.S), "Mamba2: BC bsz-1 fused decode lost its runtime-LoRA guard"
 
 
 def test_gdn_split_bsz1_graph_guarded():

@@ -3866,6 +3866,64 @@ expert adapters, and has no real multi-GPU. Our S32 plan (profile →
 Tier-1 flags → resident dequant / fused LoRA backward) remains the right
 track and would extend the lead.
 
+### Session 34 — upstream v1.0.0 parity merge (branch `v1-parity`); two NEW fused paths guarded (plain-MLP graph, Mamba2)
+
+> Merged 2026-07-14: upstream tagged v1.0.0 (`0445820`, dev==master now).
+> Delta since our Session-26 sync point `1d44bd6`: 30 commits. Discovered
+> during prep: `dev-merge` was SUPERSEDED, not forgotten — PR #142/#143
+> squash-landed its whole content onto master, so master already had the
+> upstream refactor + all guards; the branch differs only by LACKING
+> Sessions 28-33. No dev-merge merge was needed (ancestry lies, content
+> doesn't — diff the trees, not the DAG).
+
+**Merge mechanics (repeatable for future upstream bumps):** because #142
+was squashed, `git merge upstream/master` sees base v0.0.43 and conflicts
+on ~30 files. Classifier: `git diff --quiet master 1d44bd6 -- <file>` —
+23/30 files were verbatim-1d44bd6 on our side → `checkout --theirs`; the
+6 guard-carrying files (attn, sliding_attn, mlp, block_sparse_mlp,
+gated_delta_net, linear) were resolved as *theirs + re-apply our delta*
+(`git diff 1d44bd6 master -- <file>` as the patch; 3 applied clean, 3
+hand-placed).
+
+**New in v1.0.0 that needed NEW guards (the Session-24 silent-no-op class):**
+1. **Plain (non-gated) `MLP` bsz-1 graph** (`BC_MLP`, NemotronH-class
+   up/act/down in one C++ call) — guarded with
+   `not has_runtime_lora(*self.ups, *self.downs)` in the dispatch.
+2. **`Mamba2` whole-layer bsz-1 graph** (`BC_Mamba2`, in_proj→o_proj) —
+   guarded with `not has_runtime_lora(self.in_proj, self.o_proj)`.
+   (NemotronH = Mamba2 + plain-MLP + attention hybrid; with these two
+   guards every adapter-visible path on it falls back correctly.)
+
+**Existing guards carried over, semantics unchanged:** attn/sliding_attn
+graph dispatch (upstream widened bsz≤4→≤8 via `_bc_max_bsz`/`_bc_max_qlen`
+— guard sits inside the same condition; tripwire regex updated to match),
+mgemm delta-on-top (attn.py now zero-pads x for padded in_features before
+mgemm — the LoRA input is sliced back to the unpadded width, no-op for
+aligned models), BlockSparseMLP expert guards (upstream's gate-optional
+refactor for gateless relu2 experts rewrote the surrounding code; all 5
+guard sites re-placed, empty `gates` list is harmless to
+`has_runtime_lora(*...)`). Trinity-Nano's new unquantized-g_proj BC/graph
+eligibility is already covered (g_proj was in the guard list since S26).
+afmoe.py auto-merged clean — S31 AFMoE training support intact.
+
+**Non-events verified:** `reconstruct_slice` signature unchanged (empty-
+tensor early-return only) — training dequant unaffected; the Hadamard
+int-overflow fix is in the inference CUDA kernels only (training uses the
+differentiable torch-matmul Hadamard from `get_hadamard_dt`); requirements/
+setup.py/lora.py/integration untouched by the delta; version now 1.0.0.
+
+**Verified:** tripwires 12/12 (+2 new tests: `test_plain_mlp_bsz1_graph_guarded`,
+`test_mamba2_bsz1_graph_guarded`); CPU training suite 52 passed (the 2
+`test_real_exl3_layer` fixture errors are PRE-EXISTING on master —
+opt-in tier-3 tests erroring instead of skipping without a model dir, not
+a regression); ext rebuilt clean from merged C++.
+
+**Still open:** GDN non-split `BC_GatedDeltaNet` run_bsz1 still has no
+Python dispatch (v1.0.0 added C++ only) — the S26 "re-audit when turbo
+wires it" watch item stays. GPU end-to-end fused-path LoRA smoke on the
+merged tree is on the box list (same recipe as S26: Llama-3.2-1B 4bpw +
+`/mnt/two/Weights/qlora_test/base`, bsz-1 decode).
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)

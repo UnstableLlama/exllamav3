@@ -327,6 +327,11 @@ class LinearEXL3:
 
     @staticmethod
     def tp_import_split_3(local_context, exported, plan, split_0, split_1, split_2, dbg = False):
+        return LinearEXL3.tp_import_split_n(local_context, exported, plan, [split_0, split_1, split_2], dbg)
+
+
+    @staticmethod
+    def tp_import_split_n(local_context, exported, plan, splits, dbg = False):
         consumer = local_context["consumer"]
         device = local_context["device"]
         id_suh = exported["suh"]
@@ -342,7 +347,7 @@ class LinearEXL3:
         in_features = 0
         out_features = 0
 
-        for split in [split_0, split_1, split_2]:
+        for split in splits:
             assert split is not None
             split_out, first, last = split
             assert split_out

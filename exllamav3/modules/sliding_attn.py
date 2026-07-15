@@ -8,7 +8,7 @@ from . import Module, Linear, RMSNorm, LayerNorm
 from .linear import has_runtime_lora
 from ..constants import PAGE_SIZE
 from .attention_fn.triton_paged import paged_attn_triton_decode, paged_attn_triton_prefill
-from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_swa
+from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_swa, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..cache import Cache
@@ -815,7 +815,7 @@ class SlidingAttention(Module):
         # graph is cached and a LoRA can be attached/detached after build).
         if (
             _bc_attn_enable and causal and non_causal_spans is None and
-            bsz <= 4 and seqlen <= 16 and
+            bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and
             not has_runtime_lora(self.q_proj, self.k_proj, self.v_proj,
                                  self.o_proj, self.g_proj)
         ):
