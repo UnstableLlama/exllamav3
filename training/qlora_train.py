@@ -63,6 +63,7 @@ SINGLE_ONLY_KEYS = {
     "use_rslora", "init_lora", "init_svd_niter", "init_ref_model",
     "init_eva_tokens",
     "quant_aware", "quant_aware_scale", "quant_aware_ref_model",
+    "torch_profile",   # torch.profiler window; DDP backend has no such flag
 }
 DDP_ONLY_KEYS = set()
 ALIASES = {"lora_r": "r"}  # DDP backend spells this --lora-r; config uses r.

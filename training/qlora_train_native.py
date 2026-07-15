@@ -1387,6 +1387,15 @@ def _run_main():
                          "wall time, then disable. Adds a device sync around every "
                          "reconstruction while active, so expect those N steps to "
                          "run slower; the reported %% is still representative.")
+    ap.add_argument("--torch-profile", type=int, default=0, metavar="N",
+                    help="Run torch.profiler (CPU+CUDA, python stacks, shapes) "
+                         "over N steady-state training steps (3 skipped + 2 "
+                         "warmup steps first) and write a chrome trace + "
+                         "key-averages tables to <out>/torch_profile/. The "
+                         "stack attribution separates trellis-reconstruct / "
+                         "Hadamard-transform / base-GEMM / LoRA-GEMM time "
+                         "(Session 32 forward-gap split). Profiling overhead "
+                         "is real; don't trust tok/s from a profiled run.")
     ap.add_argument("--ga-loss", choices=["token", "mean"], default="token",
                     help="Gradient-accumulation loss weighting. token (default): "
                          "weight each micro-batch by its supervised-token share, "
@@ -1951,6 +1960,39 @@ def _run_main():
         _backbone.profile_dequant(dq_profile)
         print(f" -- profiling dequant (trellis reconstruction) for the first "
               f"{args.profile_dequant} steps; adds sync overhead while active")
+
+    # Optional torch.profiler window (--torch-profile N): skip 3 steps, 2
+    # profiler-warmup steps, then N active steps. Stacks + shapes let the
+    # analysis attribute GEMM time to source lines (base matmul vs Hadamard
+    # transforms vs LoRA adapters vs trellis reconstruct) without touching
+    # the hot path when profiling is off.
+    prof = None
+    if args.torch_profile > 0:
+        from torch.profiler import profile, schedule, ProfilerActivity
+        prof_dir = os.path.join(args.out, "torch_profile")
+        os.makedirs(prof_dir, exist_ok=True)
+
+        def _prof_ready(p):
+            p.export_chrome_trace(os.path.join(prof_dir, "trace.json.gz"))
+            avg = p.key_averages()
+            for sort, name in (("self_cuda_time_total", "cuda"),
+                               ("self_cpu_time_total", "cpu")):
+                with open(os.path.join(prof_dir, f"key_averages_{name}.txt"), "w") as f:
+                    f.write(avg.table(sort_by=sort, row_limit=100))
+            with open(os.path.join(prof_dir, "key_averages_stacks.txt"), "w") as f:
+                f.write(p.key_averages(group_by_stack_n=12).table(
+                    sort_by="self_cuda_time_total", row_limit=150,
+                    max_src_column_width=200))
+            print(f"  [torch-profile] trace + key-averages tables -> {prof_dir}")
+
+        prof = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=schedule(skip_first=3, wait=0, warmup=2,
+                              active=args.torch_profile, repeat=1),
+            on_trace_ready=_prof_ready, with_stack=True, record_shapes=True)
+        prof.start()
+        print(f" -- torch.profiler armed: 3 skip + 2 warmup steps, then "
+              f"{args.torch_profile} profiled steps -> {prof_dir}")
     try:
         for step in range(resume_step + 1, args.steps + 1):
             _FAIL_CTX["phase"] = f"train step {step}"
@@ -2092,7 +2134,18 @@ def _run_main():
                                    ema=ema, offload_opt=offload_opt)
                 print(f"  [checkpoint] step {step} -> {cdir} (resumable)")
                 prune_checkpoints(args.out, args.keep_checkpoints)
+
+            if prof is not None:
+                prof.step()
+                # Release the profiler once the active window has been traced
+                # (on_trace_ready has fired) so the remaining steps run clean.
+                if (step - resume_step) >= 5 + args.torch_profile:
+                    prof.stop()
+                    prof = None
     except KeyboardInterrupt:
+        if prof is not None:   # window incomplete: no artifacts, just release
+            prof.stop()
+            prof = None
         # Stopping early at the loss plateau is a normal workflow; don't discard
         # the adapter trained so far -- unless --save-best already kept the
         # best-val checkpoint, in which case saving now would clobber it with
@@ -2105,6 +2158,10 @@ def _run_main():
                 save("[interrupted]")
         log_run("interrupted", time.time() - t0, None, None)
         raise SystemExit(0)
+
+    if prof is not None:       # run shorter than the profile window
+        prof.stop()
+        prof = None
 
     # 6. Save adapter (PEFT format; loadable by exllamav3.model.lora.LoRA).
     #    With --save-best we already kept the best-val checkpoint; don't clobber

@@ -30,6 +30,16 @@
 > notes below (which remain the detailed context for each item). Newest
 > priority first, per the 2026-07 direction.
 
+**NEXT UP (Session 35): unsloth-competitiveness Tier-2 — (1) bf16 decode
++ cached pre-cast transforms (zero VRAM), then (2) async double-buffered
+CPU offload.** The S32 plan's steps 1–2 are done (profiler pass + Tier-1
+A/B, Session 35 notes): reconstruct measured ~2.5% of GPU time (NOT the
+bottleneck); the real costs are dtype casts (11%) + Hadamard transforms
+(7%) + sync activation offload (~14%). liger is a null at 3B/short-seq
+(long-context lever only); `no_grad_ckpt` alone buys 1.54× at 2× VRAM.
+Residency demoted to the bottom by the user (2 bytes/param regardless of
+bpw; ~50 GB on a 27B). Numbering below unchanged.
+
 0. **MoE training (Qwen3.5 family + Gemma4 MoE) — BUILT (Sessions 18 + 20 +
    21) and FORWARD-GATED (Session 22): forward + backward box-verified on
    Qwen3.5-2B (GDN), Qwen3.6-35B-A3B (GDN+MoE) and a Gemma4-MoE finetune, plus
@@ -3925,6 +3935,126 @@ Python dispatch (v1.0.0 added C++ only) — the S26 "re-audit when turbo
 wires it" watch item stays. GPU end-to-end fused-path LoRA smoke on the
 merged tree is on the box list (same recipe as S26: Llama-3.2-1B 4bpw +
 `/mnt/two/Weights/qlora_test/base`, bsz-1 decode).
+
+### Session 35 — repo renamed `exl3-qlora`; S32 plan steps 1+2 done (profiler pass + Tier-1 A/B): reconstruct is NOT the tax, casts+offload are; liger null, no-ckpt 1.54×
+
+> Run 2026-07-14/15, GPU1 (3090), same Llama-3.2-3B semancy comparison
+> config as S32. Repo renamed from the exllamav3 fork to **exl3-qlora**
+> (no longer planning to PR upstream wholesale); the old path
+> `~/exl3/private/exllamav3` is a symlink to the new one, so the editable
+> install and older scripts still resolve. README stripped of the entire
+> upstream ExLlamaV3 README (fork-content only now, title `exl3-qlora`).
+> Box note: GPU fans MUST be set to 66% before any run —
+> `nvidia-settings -a "[gpu:N]/GPUFanControlState=1" -a
+> "[fan:N]/GPUTargetFanSpeed=66"` (the ControlState=1 is required or the
+> target is silently ignored); verify with `nvidia-smi` before launching.
+> The user had to intervene this session.
+
+**New tooling:** `--torch-profile N` on the single/split trainer
+(torch.profiler, CPU+CUDA, python stacks + shapes; schedule 3 skip + 2
+warmup + N active; writes `trace.json.gz` + key-averages tables to
+`<out>/torch_profile/`; YAML key `torch_profile`, single-only — the DDP
+backend has no such flag). Off = zero hot-path changes. Analysis:
+`training/experiments/profile_fwdgap_analyze.py` — correlates every CUDA
+kernel/memcpy to its launching runtime call, sweeps the python_function
+timeline for the enclosing stack, buckets GPU time per component (kernel
+names alone can't split base/LoRA/Hadamard GEMMs). Profile config:
+`training/experiments/profile_fwdgap_llama3b.yaml` (20 steps, run-log
+disabled so profiled tok/s stays out of the CSV). Profiler overhead on
+this run class measured ~nil (profiled steps 1.40–1.46s ≈ the S32
+steady state).
+
+**Profiler result — the S32 forward-gap split, MEASURED (10 steps,
+1395 ms/step = 1177 ms GPU-busy + ~218 ms launch-bound idle):**
+
+| component | ms/step | % GPU | reading |
+|---|---|---|---|
+| base GEMMs | 456 | 38.7% | irreducible; 196 linears × 3 calls; unsloth pays the same shapes |
+| fused CE (head+loss) | 151 | 12.8% | both frameworks pay ~this |
+| **dtype-cast copies** | **128** | **10.9%** | 6,272 kernels/step(!): fp16 inner × bf16 compute — full-weight `.to(bf16)` every backward, `suh`/`svh`/`had` re-cast EVERY call |
+| **Hadamard transforms** | **88** | **7.4%** | activation-side sandwich (fwd + adjoint) |
+| **activation offload** | **~162** | **~14%** | sync `save_on_cpu` PCIe: 86 HtoD + ~76 DtoH pinned |
+| LoRA GEMMs | 40 | 3.4% | GPU-cheap; its real cost is launches |
+| trellis reconstruct | 29 | 2.5% | **the S32 "structural cost" suspect — nearly free** |
+| attention (flash) | 16 | 1.3% | |
+| eager norms/glue | ~0 | ~0% | nothing for liger to win here |
+
+**The S32 estimates are overturned in an actionable way:** the trellis
+reconstruct everyone worried about is ~2.5%; the actual EXL3 tax is the
+**cast traffic + Hadamard transforms (245 ms/step, 21%)**, and the
+**synchronous activation offload (162 ms/step)** is bigger than all of it.
+The launch-bound idle (218 ms) tracks the absurd kernel counts (6k+ cast
+kernels/step) — thousands of tiny launches, our analog of unsloth's
+"few launches" edge.
+
+**Tier-1 A/B (109-step full runs, matched config, rows in the CSV):**
+
+| arm | wall | sup tok/s | peak VRAM | held-out |
+|---|---|---|---|---|
+| S32 baseline (ckpt+offload) | 314s | 397 | 6.34 GB | 2.729 |
+| + liger | 318s | 391 | 6.32 GB | 2.732 |
+| + liger + **no_grad_ckpt** | **261s** | **477** | 12.37 GB | 2.744 |
+| unsloth NF4 (S32) | 168s | 741 | 4.28 GB | 2.809 |
+
+- **liger: NULL on this run class** (engaged for sure — trainer raises
+  if unimportable; fwd share dropped 33→31%). Consistent with the
+  profile: norms/glue ≈ 0% at 3B/seq1024/batch4. The S12 +8.8% was the
+  12B/8k-packed regime — keep `use_liger` a long-context lever, not a
+  default expectation.
+- **no-ckpt: 1.54× steady-state** (0.92s vs 1.42s/step), a bit above the
+  ~1.45× A2 ceiling because dropping checkpointing also deletes the
+  162 ms offload. Cost: 12.37 vs 6.34 GB. Loss deltas are liger-numerics
+  noise. Remaining gap to unsloth: 1.55× wall at 2.9× VRAM.
+
+**Tier-2 build order (user-set, 2026-07-15 — VRAM-neutral fixes first,
+residency demoted to the bottom):**
+1. **bf16 decode + cached transforms (zero VRAM, all model sizes).**
+   Make the reconstruct kernel emit the COMPUTE dtype (bf16) directly —
+   kills the full-weight fp16→bf16 cast every backward — and cache the
+   per-linear pre-cast `suh`/`svh`/`had` instead of re-casting all three
+   on every call. Removes most of the 128 ms cast tax + a slice of the
+   218 ms launch-bound idle. Est. ~10–15% step speedup; A/B it.
+   This *completes* the S30 fast path rather than reversing it (asked
+   and answered: undoing S30 would re-inflate reconstruct from 29 ms
+   back into hundreds of ms of full-weight transform passes — the fast
+   path is vindicated by the profile; the casts are its accidental
+   residue. And since decode is now ~free, dequant-COUNT levers like
+   `--dequant-cache` have ~nothing to save — consistent with its
+   measured S30 net loss, stays off).
+2. **Async double-buffered CPU offload** (the unsloth-style variant) —
+   fixes the ~162 ms/step synchronous save_on_cpu PCIe stall in
+   checkpointed mode. Zero VRAM. (This is exactly why unsloth's
+   checkpointing looks free: they pay the recompute forward like
+   everyone — bwd/fwd 1.83 — but their offload overlaps compute.)
+3. **`no_grad_ckpt` as the documented speed dial** — already built,
+   measured 1.54×; use when VRAM allows.
+4. **Fused LoRA backward** — LoRA GPU time is only 40 ms; this is a
+   launch-count play. Revisit after 1–2 shrink the launch storm.
+5. **Residency (`--dequant-mode resident`) — BOTTOM of the list,
+   opt-in, small models only, if ever.** It's the only way to delete
+   the 88 ms Hadamard sandwich too, but it costs 2 bytes/param
+   REGARDLESS of quant bitrate (the trellis stays loaded): ~5.6 GB on
+   a 3B, ~50 GB on a 27B — doesn't fit the 2×3090 box beyond ~7B/card,
+   and the user doesn't like the trade.
+
+Expected ladder (bucket-subtraction estimates, each step to be A/B'd):
+item 1 ≈ 1.15×; +item 2 ≈ 1.25× checkpointed at today's VRAM; +no-ckpt
+where VRAM allows ≈ 1.7×; residency (small models) ≈ 2× ≈ unsloth wall
+parity at ~17 GB. True parity stays gated behind VRAM-spending levers;
+items 1–2 are pure wins. The VRAM axis is conceded at matched bpw (fp16
+embeds, decode transients); EXL3's win stays the low-bpw reach.
+
+**Liger takeaway (for the record):** liger does nothing *on this run
+class* — norms/glue ≈ 0% of GPU time at 3B/seq1024, so the null and the
+profile agree. It does NOT contradict S12 (+8.8% tok/s, −1.1 GB on the
+12B at 8k packed): norm/SwiGLU cost scales with batch×seq. Treat
+`use_liger` as a long-context/large-batch lever, not a default. It also
+kills the "just field the fused kernels" theory of the unsloth gap —
+the gap lives in casts/offload/launches, all fixable on our side.
+
+**Still open:** build Tier-2 item 1 (bf16 decode + transform cache),
+re-A/B vs the unsloth arm; then async offload. The Session-34 GPU
+fused-path LoRA smoke on the merged tree also still pending.
 
 ---
 
