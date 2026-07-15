@@ -1,4 +1,5 @@
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include "reconstruct.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -7,11 +8,28 @@
 #include "../ptx.cuh"
 #include "exl3_dq.cuh"
 
-template <int K, int cb>
+// Output-dtype conversion at the tile-write stage. The dequant math is
+// fp16 throughout; BF16_OUT applies one round-to-nearest fp16->bf16
+// conversion per element, bit-identical to reconstructing in half and
+// casting with .to(bf16) afterwards. Both types are 2 bytes, so the tile
+// layout and the vectorized int4 store are shared (tile holds raw bits).
+template <bool BF16_OUT>
+__device__ inline uint32_t out_pack(half2 v)
+{
+    if constexpr (BF16_OUT)
+    {
+        __nv_bfloat162 b = __float22bfloat162_rn(__half22float2(v));
+        return *reinterpret_cast<uint32_t*>(&b);
+    }
+    else
+        return *reinterpret_cast<uint32_t*>(&v);
+}
+
+template <int K, int cb, bool BF16_OUT>
 __global__ __launch_bounds__(256)
 void reconstruct_kernel
 (
-    half* __restrict__ g_unpacked,
+    void* __restrict__ g_unpacked,
     const uint16_t* __restrict__ g_packed,
     int packed_blocks_n,
     int packed_n_offset
@@ -38,9 +56,9 @@ void reconstruct_kernel
     register FragB frag[2];
     dq_dispatch<K, cb>(s_packed[warp_id], lane_id * 8, frag[0], frag[1]);
 
-    // Shuffle from tensor core layout to row major tile
-//    __shared__ half tile[16 * 8 * 16];
-    __shared__ half2 tile[16][8][8];
+    // Shuffle from tensor core layout to row major tile (raw 2x16-bit
+    // element pairs; half2 or bfloat162 bits depending on BF16_OUT)
+    __shared__ uint32_t tile[16][8][8];
 
     half2 n0 = __shfl_down_sync(0xFFFFFFFF, frag[0][0], 4, 32);
     half2 n1 = __shfl_down_sync(0xFFFFFFFF, frag[0][1], 4, 32);
@@ -63,14 +81,14 @@ void reconstruct_kernel
         int r3 = r0 + 9;
         int c0 = lane_id / 8;
         int c1 = c0 + 4;
-        tile[r0][warp_id][c0] = m0;
-        tile[r1][warp_id][c0] = m1;
-        tile[r2][warp_id][c0] = m2;
-        tile[r3][warp_id][c0] = m3;
-        tile[r0][warp_id][c1] = m4;
-        tile[r1][warp_id][c1] = m5;
-        tile[r2][warp_id][c1] = m6;
-        tile[r3][warp_id][c1] = m7;
+        tile[r0][warp_id][c0] = out_pack<BF16_OUT>(m0);
+        tile[r1][warp_id][c0] = out_pack<BF16_OUT>(m1);
+        tile[r2][warp_id][c0] = out_pack<BF16_OUT>(m2);
+        tile[r3][warp_id][c0] = out_pack<BF16_OUT>(m3);
+        tile[r0][warp_id][c1] = out_pack<BF16_OUT>(m4);
+        tile[r1][warp_id][c1] = out_pack<BF16_OUT>(m5);
+        tile[r2][warp_id][c1] = out_pack<BF16_OUT>(m6);
+        tile[r3][warp_id][c1] = out_pack<BF16_OUT>(m7);
     }
     __syncthreads();
 
@@ -82,12 +100,15 @@ void reconstruct_kernel
     *out_int4 = tile_int4[t];
 }
 
-#define __(i, cb) reconstruct_kernel<i, cb>
+#define __(i, cb, bf) reconstruct_kernel<i, cb, bf>
 constexpr auto reconstruct_kernel_instances = std::array
 {
-    __(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
-    __(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
-    __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2)
+    __(1, 0, false), __(2, 0, false), __(3, 0, false), __(4, 0, false), __(5, 0, false), __(6, 0, false), __(7, 0, false), __(8, 0, false),
+    __(1, 1, false), __(2, 1, false), __(3, 1, false), __(4, 1, false), __(5, 1, false), __(6, 1, false), __(7, 1, false), __(8, 1, false),
+    __(1, 2, false), __(2, 2, false), __(3, 2, false), __(4, 2, false), __(5, 2, false), __(6, 2, false), __(7, 2, false), __(8, 2, false),
+    __(1, 0, true),  __(2, 0, true),  __(3, 0, true),  __(4, 0, true),  __(5, 0, true),  __(6, 0, true),  __(7, 0, true),  __(8, 0, true),
+    __(1, 1, true),  __(2, 1, true),  __(3, 1, true),  __(4, 1, true),  __(5, 1, true),  __(6, 1, true),  __(7, 1, true),  __(8, 1, true),
+    __(1, 2, true),  __(2, 2, true),  __(3, 2, true),  __(4, 2, true),  __(5, 2, true),  __(6, 2, true),  __(7, 2, true),  __(8, 2, true)
 };
 #undef __
 
@@ -109,7 +130,9 @@ void reconstruct_slice
 
     TORCH_CHECK_SHAPES(unpacked, 0, packed, 0, 16);
     TORCH_CHECK_SIZE(packed, 2, 256 * K / 16);
-    TORCH_CHECK_DTYPE(unpacked, kHalf);
+    bool bf16_out = unpacked.dtype() == at::kBFloat16;
+    TORCH_CHECK(bf16_out || unpacked.dtype() == at::kHalf,
+        "unpacked is incorrect datatype, must be kHalf or kBFloat16");
 
     int rows = packed.size(0);
     int packed_cols = packed.size(1);
@@ -131,10 +154,11 @@ void reconstruct_slice
     int cbi = K - 1;
     if (mcg) cbi += 8;
     else if (mul1) cbi += 16;
+    if (bf16_out) cbi += 24;
 
     reconstruct_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>
     (
-        (half*) unpacked.data_ptr(),
+        unpacked.data_ptr(),
         (const uint16_t*) packed.data_ptr(),
         packed_cols,
         packed_n_offset

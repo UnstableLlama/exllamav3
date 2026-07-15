@@ -289,8 +289,29 @@ def test_real_exl3_layer(model_dir: str):
         y_ref = x @ w_eff
         rel = ((y_fast - y_ref).norm() / y_ref.norm()).item()
         assert rel < 5e-3, f"{lin.key}: fast vs get_weight_tensor rel {rel:.2e}"
+
+        # S36: the bf16-emitting reconstruct must match fp16-reconstruct +
+        # .to(bf16) bit-for-bit (same fp16 dequant math, one RN rounding at
+        # the store), and the bf16 fast path must stay in the bf16 error
+        # class vs an fp32 ground truth.
+        w16 = lin.inner.get_inner_weight_tensor()
+        wbf = lin.inner.get_inner_weight_tensor(out_dtype=torch.bfloat16)
+        assert (wbf == w16.to(torch.bfloat16)).all(), \
+            f"{lin.key}: bf16 reconstruct not bit-exact vs fp16 + cast"
+        pbf = backbone.frozen_trellis_parts(lin, torch.bfloat16)
+        ifn_bf, suh_bf, svh_bf = pbf
+        assert suh_bf.dtype == svh_bf.dtype == torch.bfloat16
+        had_bf = backbone.hadamard_128(suh_bf.device, suh_bf.dtype)
+        y_bf = EXL3LoRAHadFunction.apply(
+            x.to(torch.bfloat16), None, None, None, 1.0,
+            ifn_bf, suh_bf, svh_bf, had_bf, None, None, 1.0)
+        y_true = x.float() @ w_eff.float()
+        rel_bf = ((y_bf.float() - y_true).norm() / y_true.norm()).item()
+        assert rel_bf < 1e-2, f"{lin.key}: bf16 fast path rel {rel_bf:.2e}"
+
         checked += 1
-        print(f"  {lin.key}: fast vs W_eff rel_err {rel:.2e}  OK")
+        print(f"  {lin.key}: fast vs W_eff rel_err {rel:.2e} "
+              f"(bf16 path {rel_bf:.2e}, emission bit-exact)  OK")
     assert checked > 0, "no trellis linears found to check"
     print(f"  real-layer parity on {checked} linears: OK")
 

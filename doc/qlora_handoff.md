@@ -4056,6 +4056,74 @@ the gap lives in casts/offload/launches, all fixable on our side.
 re-A/B vs the unsloth arm; then async offload. The Session-34 GPU
 fused-path LoRA smoke on the merged tree also still pending.
 
+### Session 36 — Tier-2 item 1 BUILT + A/B'd: bf16 decode + cached transforms — casts killed, step −4%, wall NEUTRAL on this run class
+
+> Run 2026-07-15, GPU1 (3090), same Llama-3.2-3B semancy config.
+> Also committed (start of session): the shared `load_dataset_split()`
+> dataset-resolution helper left uncommitted at the end of S35.
+
+**Built (the S35 Tier-2 item 1, exactly as ordered):**
+- **Reconstruct kernel emits the compute dtype.** `reconstruct_kernel`
+  (exllamav3_ext/quant/reconstruct.cu) templated on output dtype
+  (fp16/bf16, 48 instances). Dequant math stays fp16 throughout; bf16
+  applies ONE round-to-nearest conversion at the shared-tile write —
+  **verified bit-identical** to `reconstruct-fp16 + .to(bf16)` on 21
+  real 4bpw linears. Host side dispatches on `unpacked.dtype`;
+  `LinearEXL3.get_inner_weight_tensor(out_dtype=...)` exposes it.
+- **`frozen_trellis_parts(linear, dtype)`**: inner closure reconstructs
+  straight into the compute dtype and `suh`/`svh` are pre-cast ONCE at
+  wrap time (cache key includes dtype). Non-fp16/bf16 compute (fp32
+  debug) keeps the old fp16-emission + per-call-cast behavior.
+- **`backbone.hadamard_128` now caches per (device, dtype)** —
+  `util.hadamard.get_hadamard_dt` copies CPU→GPU on EVERY call, which
+  the fast path was paying per linear per call. DiffLinear also grabs
+  `_had` once at init.
+- Net effect in the Had-Function: every per-call `.to()` (full-weight in
+  backward, activations both directions in forward, suh/svh/had
+  everywhere) is now a no-op. A fwd+bwd kernel trace of one linear shows
+  only the irreducible fp32-LoRA-master casts remain.
+- Tests: tier-5 real-layer test extended with the bf16 bit-exactness +
+  bf16-fast-path checks (tests/test_dequant_fast.py); all CPU suites and
+  tier-5 pass. fp16 path measurably unchanged (rel ~7e-4, as S30).
+
+**Profile (same 20-step config as S35, 10 profiled steps):**
+
+| bucket | S35 | S36 | Δ |
+|---|---|---|---|
+| cast_copy | 128 ms, 6,272 kern/step | 80.6 ms, 4,704 kern/step | −47 ms, −1,568 launches |
+| reconstruct | 29 ms | 29.1 ms (`<4,1,true>` = bf16) | unchanged, by design |
+| had_transform | 88 ms | 87.8 ms | unchanged (item-5 lever) |
+| total GPU-busy | 1,177 ms | 1,136.8 ms | −40 ms (−3.4%) |
+
+**A/B (109-step full run, matched config, row in the CSV):**
+
+| arm | wall | sup tok/s | peak VRAM | held-out |
+|---|---|---|---|---|
+| S32 baseline (fp16 decode) | 314s | 397 | 6.34 GB | 2.729 |
+| bf16 decode + cached transforms | 315s | 394 | 6.34 GB | 2.738 |
+
+**Honest verdict:** steady-state step 1.42 → ~1.36 s (−4%), but wall is
+a WASH — stepping is only ~half the wall at 109 steps (load + evals +
+save are the rest), so the ~7 s saved drowns in run-to-run noise. The
+S35 ~10–15% estimate over-attributed the cast bucket: most of it was
+(and remains) fp32-LoRA-master casts + the LoRA-combine elementwise ops
+the analyzer buckets there, not the full-weight cast. Held-out +0.009
+is bf16-rounding noise (same scale as the S35 liger delta; the base
+matmul now runs bf16×bf16 instead of fp16×fp16 — layer outputs were
+already rounded to bf16 at every boundary before this change).
+Keep it: it's free VRAM-wise, strictly fewer launches, composes with
+every later item, and the win grows where steps dominate wall (longer
+runs, bigger models).
+
+**Still open (Tier-2 order unchanged):** item 2 async double-buffered
+CPU offload (the ~162 ms sync save_on_cpu stall — now the single
+biggest fixable bucket); then the documented `no_grad_ckpt` speed dial;
+fused LoRA backward as a launch-count play; residency at the bottom.
+The Session-34 GPU fused-path LoRA smoke on the merged tree also still
+pending. Box note: fans — ALL FOUR fan controllers (fan:0/1 = GPU0,
+fan:2/3 = GPU1) need `GPUTargetFanSpeed=66` with `GPUFanControlState=1`
+per GPU, `DISPLAY=:0` from a non-X shell; verify with nvidia-smi.
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)

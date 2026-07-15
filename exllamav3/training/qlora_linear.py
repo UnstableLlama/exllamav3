@@ -183,15 +183,17 @@ class EXL3LoRAHadFunction(torch.autograd.Function):
         y_base = had(had(x * suh) @ W_inner) * svh
 
     -- the same math exllamav3's own ``reconstruct_hgemm`` inference path uses.
-    The base matmul runs in the inner weight's native dtype (fp16 on a real
-    quant; whatever the mock closure returns under tests), with the result cast
-    to the compute dtype. The backward adjoint uses the transforms' self-
+    The base matmul runs in the inner weight's dtype (the COMPUTE dtype when
+    ``frozen_trellis_parts`` was built with one -- the reconstruct kernel
+    emits it directly, so every ``.to()`` below is a no-op; whatever the mock
+    closure returns under tests otherwise), with the result cast to the
+    compute dtype. The backward adjoint uses the transforms' self-
     transposedness (H^T = H, diagonals symmetric):
 
         grad_x_base = had(had(grad_y * svh) @ W_inner^T) * suh
 
-    computed in the GRAD dtype (one weight cast; fp16 grads would risk
-    overflow, so the backward pays the cast the forward avoids).
+    computed in the GRAD dtype (a full-weight cast only when the inner dtype
+    differs, e.g. an fp16 inner under fp32 debug compute).
 
     The frozen PiSSA offset, folded into the weight closure on the legacy path
     (``W_eff - offs_scale*(a0@b0)``, a full-weight addmm per reconstruction),

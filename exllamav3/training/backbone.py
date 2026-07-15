@@ -732,25 +732,43 @@ def dequant_mode() -> str:
     return _DEQUANT_MODE
 
 
+_HAD_128_CACHE: dict = {}
+
+
 def hadamard_128(device, dtype: torch.dtype) -> torch.Tensor:
     """The normalized 128x128 Hadamard matrix used by the EXL3 transforms
-    (orthogonal and symmetric: H^-1 = H^T = H), cached per device/dtype."""
-    from ..util.hadamard import get_hadamard_dt
-    return get_hadamard_dt(128, device, dtype, 128 ** -0.5)
+    (orthogonal and symmetric: H^-1 = H^T = H), cached per device/dtype.
+    (util.hadamard.get_hadamard_dt copies to device on EVERY call -- fine for
+    one-off inference preapplies, a per-linear-per-step alloc+cast here.)"""
+    key = (str(device), dtype)
+    had = _HAD_128_CACHE.get(key)
+    if had is None:
+        from ..util.hadamard import get_hadamard_dt
+        had = get_hadamard_dt(128, device, dtype, 128 ** -0.5)
+        _HAD_128_CACHE[key] = had
+    return had
 
 
-def frozen_trellis_parts(linear):
+def frozen_trellis_parts(linear, dtype: Optional[torch.dtype] = None):
     """
     The pieces of a standard trellis linear needed for activation-side
     transforms: ``(inner_fn, suh, svh)`` where ``inner_fn()`` reconstructs the
-    INNER ``[in, out]`` fp16 weight (no Hadamard/sign transforms, no cast) and
-    ``suh``/``svh`` are the input/output sign vectors, such that
+    INNER ``[in, out]`` weight (no Hadamard/sign transforms) and ``suh``/
+    ``svh`` are the input/output sign vectors, such that
 
         get_weight_tensor() == diag(suh) @ H_128 @ inner @ H_128 @ diag(svh)
 
     (H block-diagonal at 128). Returns ``None`` when the layer can't take the
     activation-side path (fp16 inner, or feature dims not 128-aligned) --
     callers fall back to ``frozen_weight_closure``.
+
+    ``dtype`` (fp16/bf16) is the dtype the reconstruct kernel EMITS and the
+    sign vectors are returned in -- pass the compute dtype so the training
+    Function's per-call ``.to()`` casts (full-weight in backward, activations
+    both ways in forward) all become no-ops. The kernel dequantizes in fp16
+    regardless and rounds once at the output store, bit-identical to
+    reconstructing in half and casting. ``None`` keeps the stored fp16.
+    ``suh``/``svh`` are cast ONCE here (call at setup time, not per step).
     """
     inner = getattr(linear, "inner", None)
     if getattr(inner, "quant_type", None) != "exl3":
@@ -760,9 +778,14 @@ def frozen_trellis_parts(linear):
     suh, svh = inner.suh, inner.svh
     if suh is None or svh is None:
         return None
+    # Only fp16/bf16 can be emitted by the kernel; for any other compute
+    # dtype (fp32 debug runs) keep the fp16 inner and let the Function's
+    # per-call casts handle it, exactly the pre-S36 behavior.
+    wdtype = dtype if dtype in (torch.half, torch.bfloat16) else torch.half
+    suh, svh = suh.to(wdtype), svh.to(wdtype)
     inner_fn = _cached_weight(
-        (id(inner), "inner"),
-        _timed_reconstruct(lambda: inner.get_inner_weight_tensor()),
+        (id(inner), "inner", wdtype),
+        _timed_reconstruct(lambda: inner.get_inner_weight_tensor(out_dtype = wdtype)),
     )
     return inner_fn, suh, svh
 

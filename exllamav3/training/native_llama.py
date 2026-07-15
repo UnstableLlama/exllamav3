@@ -243,6 +243,7 @@ class DiffLinear(nn.Module):
     # Class default for the same reason: a headless instance has no wrapped
     # linear to take trellis parts from, so it uses the legacy closure path.
     _trellis_parts = None
+    _had = None
 
     # Quantization-aware training mode (training.quant_aware): "" = off (the
     # default; eval/validate paths and pre-feature checkpoints are exact).
@@ -312,7 +313,14 @@ class DiffLinear(nn.Module):
         # When present (and quant-aware is off / mode isn't "legacy") the
         # forward takes EXL3LoRAHadFunction, which skips the four full-weight
         # transform passes + cast of get_weight_tensor on every dequant.
-        self._trellis_parts = backbone.frozen_trellis_parts(linear)
+        # Everything lives in the compute dtype (S35 Tier-2 item 1): the
+        # reconstruct kernel emits it directly and suh/svh/had are pre-cast
+        # once, so the Function's per-call .to() casts are all no-ops.
+        self._trellis_parts = backbone.frozen_trellis_parts(linear, compute_dtype)
+        self._had = None
+        if self._trellis_parts is not None:
+            suh = self._trellis_parts[1]
+            self._had = backbone.hadamard_128(suh.device, suh.dtype)
 
     @torch.no_grad()
     def set_init_offset(self, a0: torch.Tensor, b0: torch.Tensor) -> None:
@@ -367,7 +375,8 @@ class DiffLinear(nn.Module):
         if parts is not None and not self._qa_active() \
                 and backbone.dequant_mode() == "fast":
             inner_fn, suh, svh = parts
-            had = backbone.hadamard_128(suh.device, suh.dtype)
+            had = self._had if self._had is not None \
+                else backbone.hadamard_128(suh.device, suh.dtype)
             bias = backbone.frozen_bias(self.linear, self.compute_dtype)
             if not self.adapter_enabled:
                 # Reference view: pure frozen base -- no LoRA, no pissa offset.

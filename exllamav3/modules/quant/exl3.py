@@ -177,8 +177,11 @@ class LinearEXL3:
         return y
 
 
-    def get_inner_weight_tensor(self, n_offset: int = 0, n_features: int | None = None):
-        w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
+    def get_inner_weight_tensor(self, n_offset: int = 0, n_features: int | None = None, out_dtype: torch.dtype = torch.half):
+        # out_dtype may be torch.half or torch.bfloat16; the reconstruct kernel
+        # dequantizes in fp16 either way and rounds to bf16 at the output store,
+        # bit-identical to reconstructing in half and casting afterwards.
+        w = torch.empty((self.in_features, self.out_features), dtype = out_dtype, device = self.trellis.device)
         ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
         return w
 
