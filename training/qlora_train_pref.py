@@ -64,6 +64,7 @@ from qlora_train_native import (  # noqa: E402
     save_trainer_state, load_trainer_state, restore_optimizer_state,
     format_prompt_and_eot, extract_single_turn, encode_prompt_response,
     build_optimizer, make_lr_scheduler, resolve_steps_and_warmup,
+    load_dataset_split,
     _FAIL_CTX, _log_failure,
 )
 
@@ -80,16 +81,8 @@ from exllamav3.training.preference import (  # noqa: E402
 
 def _load_rows(dataset_name, split, config_name=None):
     """HF hub id or local json/jsonl/parquet/csv path -> datasets split.
-    Same resolution logic as build_sft_examples."""
-    from datasets import load_dataset
-    if os.path.exists(dataset_name):
-        ext = os.path.splitext(dataset_name)[1].lower()
-        builder = {".json": "json", ".jsonl": "json",
-                   ".parquet": "parquet", ".csv": "csv"}.get(ext, "json")
-        return load_dataset(builder, data_files=dataset_name, split=split)
-    if config_name:
-        return load_dataset(dataset_name, config_name, split=split)
-    return load_dataset(dataset_name, split=split)
+    Same resolution logic as build_sft_examples (shared helper)."""
+    return load_dataset_split(dataset_name, split, config_name)
 
 
 def _prompt_text(value):

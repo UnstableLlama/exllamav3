@@ -666,6 +666,34 @@ def resolve_steps_and_warmup(args, num_train_examples, effective_batch):
     return args.steps, max(0, warmup)
 
 
+_LOCAL_DATA_BUILDERS = {".json": "json", ".jsonl": "json",
+                        ".parquet": "parquet", ".csv": "csv"}
+
+
+def load_dataset_split(dataset_name, split, config_name=None):
+    """Resolve a --dataset-style argument to a ``datasets`` split.
+
+    Accepts a HF Hub id or a local data file (.json / .jsonl / .parquet /
+    .csv; ``~`` expands). load_dataset() can't sniff a bare local path, so
+    the builder is picked from the extension. An argument that has a local
+    data-file extension but doesn't exist on disk is almost certainly a
+    typo'd path -- fail with that, not the Hub lookup's confusing 404.
+    """
+    from datasets import load_dataset
+    path = os.path.expanduser(dataset_name)
+    ext = os.path.splitext(path)[1].lower()
+    if os.path.exists(path):
+        builder = _LOCAL_DATA_BUILDERS.get(ext, "json")
+        return load_dataset(builder, data_files=path, split=split)
+    if ext in _LOCAL_DATA_BUILDERS:
+        raise FileNotFoundError(
+            f"dataset {dataset_name!r} looks like a local {ext} file but "
+            f"does not exist (cwd: {os.getcwd()})")
+    if config_name:
+        return load_dataset(dataset_name, config_name, split=split)
+    return load_dataset(dataset_name, split=split)
+
+
 def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
                        instruction_key="instruction", context_key="context",
                        response_key="response", split="train",
@@ -705,21 +733,9 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
 
     Returns a list of dicts with python int lists: input_ids / labels.
     """
-    import os
-    from datasets import load_dataset
-
     # Accept either a Hub dataset id or a local file (e.g. a styled set produced
-    # by training/experiments/make_style_dataset.py). load_dataset() can't sniff a bare local
-    # path, so pick the builder from the extension when the path exists.
-    if os.path.exists(dataset_name):
-        ext = os.path.splitext(dataset_name)[1].lower()
-        builder = {".json": "json", ".jsonl": "json",
-                   ".parquet": "parquet", ".csv": "csv"}.get(ext, "json")
-        ds = load_dataset(builder, data_files=dataset_name, split=split)
-    elif config_name:
-        ds = load_dataset(dataset_name, config_name, split=split)
-    else:
-        ds = load_dataset(dataset_name, split=split)
+    # by training/experiments/make_style_dataset.py).
+    ds = load_dataset_split(dataset_name, split, config_name)
     # Shuffle the full set when asked, or (as before) when capping rows so the
     # subset is random rather than the first max_samples. shuffle_seed defaults to
     # 0, matching the prior cap behavior exactly when --shuffle is off.
@@ -790,19 +806,8 @@ def build_lm_examples(tokenizer, dataset_name, split, seq_len,
     Returns a list of dicts (input_ids / labels), same shape as
     :func:`build_sft_examples`, so the same eval loop consumes it.
     """
-    import os
-    from datasets import load_dataset
-
-    if os.path.exists(dataset_name):
-        ext = os.path.splitext(dataset_name)[1].lower()
-        builder = {".json": "json", ".jsonl": "json",
-                   ".parquet": "parquet", ".csv": "csv"}.get(ext, "json")
-        ds = load_dataset(builder, data_files=dataset_name, split=split)
-    elif config_name:
-        # Many text corpora need a config (e.g. wikitext -> "wikitext-2-raw-v1").
-        ds = load_dataset(dataset_name, config_name, split=split)
-    else:
-        ds = load_dataset(dataset_name, split=split)
+    # Many text corpora need a config (e.g. wikitext -> "wikitext-2-raw-v1").
+    ds = load_dataset_split(dataset_name, split, config_name)
     if max_samples and max_samples < len(ds):
         ds = ds.select(range(max_samples))
 

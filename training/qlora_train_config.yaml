@@ -47,6 +47,9 @@ grad_accum: 1
 max_grad_norm: 1.0
 
 # Data
+# `dataset` (and eval_dataset / eval2_dataset) accepts a HF Hub id or a local
+# .jsonl / .json / .parquet / .csv file path (~ expands). Local files load as
+# split "train", so leave dataset_split at train and carve eval via val_frac.
 dataset: superdrew100/UwU_Alpaca_data
 dataset_split: train
 instruction_key: instruction
