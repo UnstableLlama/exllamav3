@@ -1261,6 +1261,16 @@ def _run_main():
                          "context / bigger batch. Needs gradient checkpointing (on by "
                          "default) + CUDA. Synchronous copies, so a modest wall-clock "
                          "cost; wraps only the decoder block loop.")
+    ap.add_argument("--vram-spillover", action="store_true",
+                    help="Linux only: allocate all CUDA tensors as unified memory "
+                         "(cudaMallocManaged) so a run that slightly exceeds VRAM "
+                         "spills cold pages to host RAM instead of insta-OOMing -- "
+                         "the behavior Windows' driver sysmem fallback provides by "
+                         "default. Slowdown is proportional to the spill (a few %% "
+                         "over VRAM is usable; big oversubscription crawls). Peak-"
+                         "VRAM reporting is unavailable in this mode, and --parallel "
+                         "split is rejected (its capacity probing is meaningless "
+                         "when allocations never fail). See training/uvm_allocator.py.")
     ap.add_argument("--use-liger", action="store_true",
                     help="Route RMSNorm (2D/3D norms) and SwiGLU (silu only) through "
                          "Liger Triton kernels for lower activation memory + speed. "
@@ -1412,6 +1422,19 @@ def _run_main():
                          "MoE). Only worth trying with --dequant-mode legacy, "
                          "where each avoided reconstruction is 5-7 ms.")
     args = ap.parse_args()
+
+    # UVM spillover must be installed before the first CUDA tensor exists, so
+    # this runs before anything touches a device (model load is the first).
+    if args.vram_spillover:
+        if args.parallel == "split":
+            raise SystemExit(
+                "--vram-spillover is not compatible with --parallel split: the "
+                "autosplit loader probes real device capacity (memory fractions "
+                "+ OOM boundaries), which is meaningless when managed-memory "
+                "allocations never fail. Use --parallel single, or split "
+                "without spillover.")
+        import uvm_allocator
+        uvm_allocator.enable()
 
     from exllamav3.training import backbone as _backbone_cfg
     _backbone_cfg.set_dequant_mode(args.dequant_mode)
@@ -1872,12 +1895,15 @@ def _run_main():
     # Start the training timer + VRAM peak AFTER the baseline eval so neither is
     # counted against training throughput.
     t0 = time.time()
-    if torch.cuda.is_available():
+    # The UVM spillover allocator (a torch pluggable allocator) doesn't support
+    # memory stats -- reset/max_memory_allocated raise -- so peak VRAM is
+    # reported as unavailable in that mode.
+    if torch.cuda.is_available() and not args.vram_spillover:
         for d in active_devices:
             torch.cuda.reset_peak_memory_stats(d)
 
     def peak_vram_gb():
-        if not torch.cuda.is_available():
+        if not torch.cuda.is_available() or args.vram_spillover:
             return 0.0
         return max((torch.cuda.max_memory_allocated(d) / 1e9 for d in active_devices),
                    default=0.0)
@@ -2131,7 +2157,9 @@ def _run_main():
     if final_eval2 is not None:
         print(f"[EVAL] eval2 ({eval2_label}) loss: {final_eval2:.4f} "
               f"over {len(val2_examples)} examples")
-    if torch.cuda.is_available():
+    if args.vram_spillover:
+        peak_str = "n/a (uvm spillover)"
+    elif torch.cuda.is_available():
         peak_str = " / ".join(
             f"cuda:{d} {torch.cuda.max_memory_allocated(d) / 1e9:.2f}GB"
             for d in active_devices

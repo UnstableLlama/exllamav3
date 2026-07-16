@@ -81,6 +81,9 @@ lora_embed: false         # single/split only
 lora_head: false          # single/split only
 offload_embed_head_optim: false  # single/split only, requires torchao + train_embeddings/train_head
 offload_activations: false       # single/split only
+vram_spillover: false            # single only, Linux only: allocate via CUDA unified memory so a run
+                                 #   slightly over VRAM spills to host RAM (like Windows' driver sysmem
+                                 #   fallback) instead of OOMing. Slow when meaningfully oversubscribed.
 use_liger: false                 # single/split only
 use_rslora: false                # single/split only; scale = alpha/sqrt(r) (rank-sweep stable)
 init_lora: default               # single/split only; default | pissa | qerr | eva (SVD adapter inits;
