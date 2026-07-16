@@ -39,7 +39,7 @@ DDP_LAUNCH_KEYS = {
 # parallel=ddp. Keep this explicit so a typo or unsupported DDP knob fails early
 # instead of being silently ignored.
 COMMON_KEYS = {
-    "model", "out", "r", "alpha", "expert_r", "lr", "weight_decay", "scheduler",
+    "model", "out", "r", "alpha", "expert_r", "lora_dropout", "lr", "weight_decay", "scheduler",
     "warmup_ratio", "warmup_steps", "epochs", "steps", "batch", "grad_accum",
     "dataset", "dataset_split", "instruction_key", "context_key", "response_key",
     "messages_key", "prompt_format", "clean_text", "no_clean_text",
@@ -57,7 +57,7 @@ COMMON_KEYS = {
     "eval_every", "save_best", "run_log",
 }
 SINGLE_ONLY_KEYS = {
-    "device", "parallel", "reserve_per_device", "use_per_device", "optim",
+    "device", "parallel", "reserve_per_device", "use_per_device", "split_even", "optim",
     "inspect", "lora_embed", "lora_head", "offload_embed_head_optim",
     "offload_activations", "vram_spillover", "use_liger", "sample_every", "sample_prompt",
     "use_rslora", "init_lora", "init_svd_niter", "init_ref_model",
@@ -71,6 +71,7 @@ SINGLE_ONLY_DEFAULTS = {
     "device": "cuda:0",
     "reserve_per_device": None,
     "use_per_device": None,
+    "split_even": None,
     "optim": "adamw",
     "inspect": 0,
     "lora_embed": False,
@@ -262,7 +263,7 @@ def validate_config(cfg: dict[str, Any], parallel: str) -> None:
             )
 
     if parallel != "split":
-        for key in ("reserve_per_device", "use_per_device"):
+        for key in ("reserve_per_device", "use_per_device", "split_even"):
             if key in cfg and cfg[key]:
                 raise SystemExit(f"{key} only applies when parallel: split")
 

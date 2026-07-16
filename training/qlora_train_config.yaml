@@ -18,6 +18,9 @@ parallel: single
 device: cuda:0
 reserve_per_device: null   # split only, e.g. [1, 8] or [-1, 20]
 use_per_device: null       # split only, e.g. [1, 8] to force a boundary
+split_even: null           # split only: true (2 GB load margin) or a margin in GB. Balance the
+                           #   layer split evenly across GPUs instead of the default greedy
+                           #   fill-device-0-first; excludes reserve/use_per_device
 
 # DDP torchrun launch settings (used only when parallel: ddp)
 ddp:
@@ -34,6 +37,9 @@ ddp:
 # LoRA / optimization
 r: 32
 alpha: 64.0
+lora_dropout: 0.0         # PEFT-style dropout on the LoRA branch input (typical 0.05-0.1);
+                          #   train-time only, not applied to embed/head adapters,
+                          #   incompatible with quant_aware: ste
 lr: 0.0002
 weight_decay: 0.01
 optim: adamw              # single/split only: adamw, adamw8bit, paged_adamw8bit
