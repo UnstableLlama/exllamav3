@@ -1,31 +1,67 @@
-# EXL3 QLoRA training config. Launch with:
+# EXL3 QLoRA training config -- the fully-commented reference. Launch with:
 #   python training/qlora_train.py --config training/qlora_train_config.yaml
+#   python training/qlora_train.py --config my.yaml --dry-run   # print the command, don't run
 #
 # One file selects the execution mode:
 #   parallel: single  # one process, one GPU
-#   parallel: split   # one process, native layer-autosplit across visible GPUs
+#   parallel: split   # one process, layers split across all visible GPUs
 #   parallel: ddp     # launcher execs torchrun + training/qlora_train_native_ddp.py
+#                     # (full model copy per GPU, data-parallel -- fastest when it fits)
 #
-# Keys mirror the CLI flags in training/qlora_train_native.py. Use snake_case here;
-# the launcher converts to --kebab-case. DDP-only launch settings live under ddp:.
+# Keys mirror the CLI flags in training/qlora_train_native.py one-to-one. Use
+# snake_case here; the launcher converts to --kebab-case. Keys marked
+# "single/split only" are rejected under parallel: ddp (and vice versa) so a
+# typo or unsupported knob fails early instead of being ignored. DDP-only
+# torchrun launch settings live under ddp:.
+#
+# Every key below is shown at its default, so this file trains the same as a
+# bare CLI run; copy it and change what you need.
 
+# ---------------------------------------------------------------------------
 # Required
-model: /path/to/exl3_model
-out: out/exl3_qlora_adapter
+# ---------------------------------------------------------------------------
+model: /path/to/exl3_model      # directory of the EXL3-quantized model (config.json + safetensors)
+out: out/exl3_qlora_adapter     # adapter output dir (PEFT format; also Ctrl-C / --save-every target)
 
-# Execution mode
+# ---------------------------------------------------------------------------
+# Execution mode / GPU placement
+#
+# single: everything on `device`. split: the loader walks the module list
+# (embed -> blocks -> norm -> head) and places a contiguous run of layers on
+# each visible GPU; activations hop devices between runs. ddp: one full model
+# replica per GPU with gradient all-reduce -- needs the whole model to fit on
+# EVERY card, but scales throughput nearly linearly.
+# ---------------------------------------------------------------------------
 parallel: single
-device: cuda:0
-reserve_per_device: null   # split only, e.g. [1, 8] or [-1, 20]
-use_per_device: null       # split only, e.g. [1, 8] to force a boundary
-split_even: null           # split only: true (2 GB load margin) or a margin in GB. Balance the
-                           #   layer split evenly across GPUs instead of the default greedy
-                           #   fill-device-0-first; excludes reserve/use_per_device
+device: cuda:0             # single only: the one device to load and train on
+
+# How the SPLIT is placed (split only; the three knobs are mutually exclusive):
+#
+# * Default (all three null): greedy autosplit -- packs device 0 until an
+#   allocation fails, then moves to device 1, etc. Simple, but the first
+#   card ends up wall-to-wall weights with no headroom for activations and
+#   optimizer state, which is where mid-run OOMs come from.
+# * split_even: the fix for that. Reads each module's weight size from the
+#   safetensors headers, computes an even per-device share, and caps each
+#   card at its share plus a load-time margin (GB). `true` = 2 GB margin,
+#   or give the margin directly (e.g. split_even: 3.0). Every card keeps
+#   similar free VRAM for training. Raise the margin if loading dies with
+#   "Insufficient VRAM in split"; lower it if the split comes out lopsided.
+# * reserve_per_device: greedy autosplit, but keep N GB free per card,
+#   e.g. [1, 8] keeps 8 GB free on cuda:1. A negative value excludes that
+#   card entirely, e.g. [-1, 20]. Manual tuning per model.
+# * use_per_device: hard GB budget per card, e.g. [14, 23] caps cuda:0 at
+#   14 GB. 0 excludes a card. The fully-manual version of split_even --
+#   still useful to force a specific boundary (e.g. keep the big LM head
+#   with more headroom on the last card).
+split_even: null
+reserve_per_device: null
+use_per_device: null
 
 # DDP torchrun launch settings (used only when parallel: ddp)
 ddp:
-  nproc_per_node: 2
-  standalone: true
+  nproc_per_node: 2        # one process per GPU
+  standalone: true         # single-node rendezvous; set false for multi-node
   nnodes: null
   node_rank: null
   master_addr: null
@@ -34,103 +70,213 @@ ddp:
   rdzv_endpoint: null
   rdzv_id: null
 
-# LoRA / optimization
-r: 32
-alpha: 64.0
-lora_dropout: 0.0         # PEFT-style dropout on the LoRA branch input (typical 0.05-0.1);
-                          #   train-time only, not applied to embed/head adapters,
-                          #   incompatible with quant_aware: ste
+# ---------------------------------------------------------------------------
+# LoRA adapter
+# ---------------------------------------------------------------------------
+r: 32                     # adapter rank; params scale with r, quality saturates model/task-dependently
+alpha: 64.0               # scale = alpha/r (or alpha/sqrt(r) with use_rslora)
+lora_dropout: 0.0         # PEFT-style dropout on each LoRA branch's input (typical 0.05-0.1).
+                          #   Mild regularizer for small datasets / many epochs. Train-time only
+                          #   (eval and inference are exact); frozen base path never dropped; not
+                          #   applied to embed/head adapters; incompatible with quant_aware: ste
+use_rslora: false         # single/split only; scale = alpha/sqrt(r) -- keeps the effective scale
+                          #   stable when sweeping r (at fixed r it's just an alpha rescale)
+targets: null             # target module leaf names; null = default attn+mlp projections
+                          #   (q/k/v/o_proj + gate/up/down_proj); [] = no per-linear LoRA (for
+                          #   embed/head-only runs). MoE models: plain gate/up/down_proj adapt the
+                          #   dense/shared-expert paths only; add expert_gate_proj expert_up_proj
+                          #   expert_down_proj to also adapt the routed experts (router always frozen)
+expert_r: null            # rank for ROUTED-expert adapters when it should differ from r. One
+                          #   adapter pair per expert per layer, so on a many-expert model use a
+                          #   small value (PEFT's MoE recipe: ~r/num_experts, min 1). null = same as r
+
+# Adapter initialization (single/split only). Gate ANY non-default init with
+# qlora_validate_native.py --init-lora <mode> before a long run.
+init_lora: default        # default: kaiming A / zero B (step 0 = exact base model).
+                          #   pissa: top-r principal components of the frozen base.
+                          #   qerr:  top-r SVD of the quantization error vs the ORIGINAL model
+                          #          (needs init_ref_model) -- starts from the closest rank-r
+                          #          repair of the bf16 model.
+                          #   eva:   A from the top-r right-singular vectors of each target's
+                          #          input activations (short pre-pass over the training data)
+init_svd_niter: 16        # randomized-SVD iterations for the SVD inits (0 = exact, slow)
+init_ref_model: null      # ORIGINAL unquantized HF model dir (required by init_lora: qerr)
+init_eva_tokens: 65536    # token budget for the eva activation pre-pass
+
+# Quantization-aware training (single/split only): make the trained delta
+# survive the merge-and-requantize deploy path by construction.
+quant_aware: none         # none | noise | ste. noise: fresh per-step pseudo-quant noise on the
+                          #   adapted frozen weights (differentiable proxy for the requantize).
+                          #   ste: adapter delta snapped to the quant floor in the forward with a
+                          #   straight-through gradient (sub-floor components contribute nothing,
+                          #   as after a real requantize). Training only -- eval/saves are exact
+quant_aware_scale: 1.0    # multiplier on the per-layer quant-error scale
+quant_aware_ref_model: null  # ORIGINAL unquantized HF dir to MEASURE the error scale (exact);
+                             #   falls back to init_ref_model, else the trellis-bitrate estimate
+
+# ---------------------------------------------------------------------------
+# Optimization
+# ---------------------------------------------------------------------------
 lr: 0.0002
-weight_decay: 0.01
-optim: adamw              # single/split only: adamw, adamw8bit, paged_adamw8bit
-scheduler: none           # none, linear, cosine
-warmup_ratio: 0.0
-warmup_steps: 0
-epochs: 0.0
-steps: 1000
-batch: 4                  # per-GPU micro-batch under ddp
-grad_accum: 1
-max_grad_norm: 1.0
+weight_decay: 0.01        # AdamW weight decay on the LoRA params
+optim: adamw              # single/split only. adamw: torch AdamW, fp32 moments = 8 bytes per
+                          #   trainable param, allocated lazily at the FIRST optimizer step (why a
+                          #   run can pass step 0 and OOM at step 1). adamw8bit: bitsandbytes 8-bit
+                          #   moments, ~4x smaller -- the first lever on tight VRAM.
+                          #   paged_adamw8bit: same, plus the moments page to host RAM on pressure
+scheduler: none           # none (constant after warmup) | linear | cosine (decay to 0)
+warmup_ratio: 0.0         # fraction of total steps warming LR from 0 (e.g. 0.05); ignored if
+warmup_steps: 0           #   warmup_steps > 0, which sets the warmup length directly
+epochs: 0.0               # >0: derive steps to cover this many passes over the data (steps ignored)
+steps: 1000               # training steps when epochs == 0; ~steps*batch*grad_accum examples seen
+batch: 4                  # micro-batch (rows per forward); under ddp this is PER GPU
+grad_accum: 1             # micro-batches accumulated per optimizer step. batch x grad_accum is the
+                          #   effective batch; raise grad_accum (not batch) when VRAM is tight
+max_grad_norm: 1.0        # gradient clipping on the LoRA group (0 disables)
+ga_loss: token            # gradient-accumulation weighting. token: weight each micro-batch by its
+                          #   supervised-token share so the step gradient equals one big batch (the
+                          #   Oct-2024 HF/Unsloth GA fix). mean: old mean-of-means, for reproducing
+                          #   old runs. No-op at grad_accum: 1
 
+# ---------------------------------------------------------------------------
 # Data
-dataset: superdrew100/UwU_Alpaca_data
+#
+# The loader is dataset-agnostic: either point the three *_key columns at an
+# instruction-style schema (Alpaca, Dolly, ...), or set messages_key for
+# OpenAI-style chat rows. Verify a NEW dataset once with `inspect: 5` -- it
+# decodes the first N built examples (prompt span vs supervised span, and
+# whether seq_len truncated the response) and exits without training.
+# ---------------------------------------------------------------------------
+dataset: superdrew100/UwU_Alpaca_data   # HF dataset id or local path
 dataset_split: train
-instruction_key: instruction
-context_key: input
-response_key: output
-messages_key: null
-prompt_format: auto       # auto, mistral, metharme, gemma4-nothink, llama3, qwen3.5, qwen3.5-nothink
-clean_text: false
-no_clean_text: false      # deprecated compatibility knob
-min_response_words: 3
-uppercase_response: false
-max_samples: 4000
-shuffle: false
-shuffle_seed: 0
-seq_len: 512
-pack: false
-pack_algo: bfd            # bfd (best-fit decreasing, ~97%+ fill) | nextfit (old)
-ga_loss: token            # token (weight micro-batches by supervised tokens) | mean (old)
-profile_dequant: 0        # time trellis reconstruction for the first N steps
-inspect: 0                # single/split only
+instruction_key: instruction  # column with the prompt/instruction (Alpaca: instruction, Dolly: instruction)
+context_key: input            # optional extra-context column, prepended to the prompt when present
+                              #   (Alpaca: input, Dolly: context); missing columns are ignored
+response_key: output          # column with the SUPERVISED response (Alpaca: output, Dolly: response)
+messages_key: null            # column of OpenAI-style single-turn messages (e.g. messages). When set,
+                              #   the user turn is the prompt, the assistant turn the supervised
+                              #   response, and the three *_key columns above are ignored
+prompt_format: auto           # chat template the pairs are rendered into. auto = the model's native
+                              #   one (Llama-3 headers, Mistral [INST], ChatML for qwen3/3.5, ...).
+                              #   Explicit: mistral, metharme, gemma4-nothink (thought span pre-closed
+                              #   empty -- no reasoning trained), llama3, qwen3.5 (plain ChatML; use
+                              #   when responses carry their own <think> spans), qwen3.5-nothink
+                              #   (empty <think> pre-closed in the masked prompt, matching no-think
+                              #   inference prefill), chatml. Only the response span gets loss
+clean_text: false             # strip [stage directions]/*actions* + normalize whitespace before
+                              #   training. Helps play-script style sets; leave OFF for reasoning /
+                              #   code / markdown data, where brackets and structure are content
+no_clean_text: false          # deprecated no-op (cleaning is opt-in now); kept so old configs run
+min_response_words: 3         # drop rows whose (cleaned) response is shorter than this
+uppercase_response: false     # smoke test: train ALL-CAPS responses -- a maximally dense transform
+                              #   that must show up in generation if the training path works at all
+max_samples: 4000             # cap on source rows (0/large = all); random subset under shuffle
+shuffle: false                # one deterministic shuffle before the val_frac carve and training,
+                              #   so the held-out split is a random sample; matched across arms
+shuffle_seed: 0               # seed for shuffle (and the max_samples subset)
+seq_len: 512                  # tokens per training sequence; prompt+response beyond this is
+                              #   truncated (inspect: N reports truncations). The main activation-
+                              #   memory knob together with batch
+pack: false                   # sample packing: concatenate short documents into each seq_len
+                              #   sequence instead of padding, so short-answer data stops wasting
+                              #   the forward on pads. Documents stay isolated (per-doc RoPE reset +
+                              #   block-diagonal attention). Not supported on GatedDeltaNet models
+                              #   (Qwen3.5/3.6 linear-attention recurrence). Eval stays unpacked
+pack_algo: bfd                # bin packing for pack: bfd (best-fit decreasing, ~97%+ fill) |
+                              #   nextfit (old arrival-order, ~80-85% fill; kept for A/B)
 
-# Trainable modules / memory levers
-targets: null             # null = default projections; [] = no per-linear LoRA (embed/head only).
-                          # MoE models (Qwen3-MoE / Qwen3.5-MoE / Gemma4 MoE): plain gate/up/down_proj
-                          # adapt the dense/shared-expert paths only; add expert_gate_proj expert_up_proj
-                          # expert_down_proj to also adapt the routed experts (router always frozen).
-expert_r: null            # LoRA rank for routed-expert adapters (null = same as r). On a
-                          # many-expert model use a small value (PEFT's recipe: ~r/num_experts, min 1).
-train_embeddings: false
-train_head: false
-lora_embed: false         # single/split only
-lora_head: false          # single/split only
-offload_embed_head_optim: false  # single/split only, requires torchao + train_embeddings/train_head
-offload_activations: false       # single/split only
-vram_spillover: false            # single only, Linux only: allocate via CUDA unified memory so a run
-                                 #   slightly over VRAM spills to host RAM (like Windows' driver sysmem
-                                 #   fallback) instead of OOMing. Slow when meaningfully oversubscribed.
-use_liger: false                 # single/split only
-use_rslora: false                # single/split only; scale = alpha/sqrt(r) (rank-sweep stable)
-init_lora: default               # single/split only; default | pissa | qerr | eva (SVD adapter inits;
-                                 #   gate first: qlora_validate_native.py --init-lora <mode>)
-init_svd_niter: 16               # randomized-SVD iterations for init_lora (0 = exact, slow)
-init_ref_model: null             # ORIGINAL unquantized HF model dir (required by init_lora: qerr)
-init_eva_tokens: 65536           # token budget for the eva activation pre-pass (init_lora: eva)
-quant_aware: none                # single/split only; none | noise | ste. Quantization-aware LoRA so
-                                 #   the trained delta survives merge-and-requantize: noise = fresh
-                                 #   per-step pseudo-quant noise on the adapted frozen weights; ste =
-                                 #   the adapter delta snapped to the quant floor (straight-through).
-quant_aware_scale: 1.0           # multiplier on the per-layer quant-error scale
-quant_aware_ref_model: null      # ORIGINAL unquantized HF dir to MEASURE the error scale (exact);
-                                 #   falls back to init_ref_model, else the trellis-bitrate estimate
-compute_dtype: bfloat16
-no_grad_ckpt: false
-attn_impl: auto           # auto, eager, flash
-ce_chunk: 1024
-head_vocab_chunk: 0
+# ---------------------------------------------------------------------------
+# Compute / VRAM levers
+#
+# Roughly in the order to reach for them when a run doesn't fit:
+#   1. optim: adamw8bit          (above -- optimizer state ~4x smaller)
+#   2. attn_impl: flash          (O(t) attention memory; the long-context lever)
+#   3. batch down + grad_accum up (same effective batch, less live activation)
+#   4. head_vocab_chunk: 32768   (big-vocab models: bounds the head spike)
+#   5. offload_activations: true (checkpointed activations to pinned RAM)
+#   6. vram_spillover: true      (single-GPU Linux safety net: spill to RAM
+#                                 instead of OOM; slowdown grows with spill)
+# split runs: split_even (above) is what keeps per-card headroom balanced.
+# ---------------------------------------------------------------------------
+compute_dtype: bfloat16   # float32 | float16 | bfloat16. bf16 is the intended path; fp32 is the
+                          #   numerics reference (2x memory, slow); fp16 mainly for pre-Ampere cards
+no_grad_ckpt: false       # disable gradient checkpointing: much more activation memory for some
+                          #   speed -- only for small models with VRAM to spare
+attn_impl: auto           # auto: FlashAttention-2 when flash_attn imports and the run is CUDA
+                          #   fp16/bf16, else eager. flash: require it. eager: reference path,
+                          #   O(seq_len^2) memory
+ce_chunk: 1024            # supervised-token chunk for the fused frozen-head cross-entropy: streams
+                          #   the loss so the full [tokens, vocab] logit tensor never materializes;
+                          #   smaller = less peak memory, marginally slower
+head_vocab_chunk: 0       # reconstruct + matmul the frozen LM head in vocab-column chunks (0 = off,
+                          #   single-shot). Bounds the head's peak on the OUTPUT device -- the full
+                          #   [hidden, vocab] reconstruction + fp32 upcast is THE spike on big-vocab
+                          #   models (Gemma 262k). Try 32768. Same loss/grads; no extra dequant cost
+offload_activations: false    # single/split only: checkpointed block activations to pinned CPU RAM
+                              #   (synchronous copies -- modest wall-clock cost)
+offload_embed_head_optim: false  # single/split only, needs torchao + train_embeddings/train_head:
+                                 #   keep the (huge) embed/head Adam state + bf16 masters on CPU
+vram_spillover: false     # single only, Linux only: allocate CUDA tensors as unified memory so a
+                          #   run slightly over VRAM spills cold pages to host RAM (what Windows'
+                          #   driver sysmem fallback does) instead of insta-OOMing. Eviction is
+                          #   page-LRU, not importance-aware -- place known-cold data first with the
+                          #   levers above and keep this as the safety net. A few % over VRAM is
+                          #   usable; heavy oversubscription crawls. Peak-VRAM stats read n/a.
+                          #   Builds a tiny allocator with nvcc on first use (training/uvm_allocator.py)
+use_liger: false          # single/split only: RMSNorm + SwiGLU through Liger Triton kernels (lower
+                          #   activation memory, faster; slightly different numerics -- gate with
+                          #   qlora_validate_native.py --use-liger first)
+dequant_mode: fast        # frozen-weight dequant path. fast: reconstruct only the inner trellis
+                          #   weight, apply Hadamard/sign transforms to the activations (the
+                          #   inference math). legacy: full get_weight_tensor per reconstruction,
+                          #   kept for A/B and reproducing old runs
+dequant_cache: false      # opt-in: reuse each frozen weight between the checkpoint-recompute
+                          #   forward and its backward (3 -> 2 dequants/step). Box-measured: a net
+                          #   LOSS under dequant_mode: fast (~1-4% tok/s AND +0.5-1.5 GB peak);
+                          #   only worth trying with dequant_mode: legacy
+profile_dequant: 0        # time trellis reconstruction for the first N steps, then keep training
+inspect: 0                # single/split only: decode the first N built examples and exit (see Data)
 
+# ---------------------------------------------------------------------------
+# Trainable extras beyond per-linear LoRA (all single/split only except
+# train_embeddings/train_head, which DDP also supports)
+# ---------------------------------------------------------------------------
+train_embeddings: false   # FULLY train the input embeddings (modules_to_save). vocab x hidden --
+                          #   big; see offload_embed_head_optim. Tied model: also trains the head
+train_head: false         # FULLY train the LM head; switches loss off the fused frozen-head path
+lora_embed: false         # rank-r LoRA on the embedding instead (cheap, GPU-resident;
+                          #   mutually exclusive with train_embeddings). Merge-path artifact
+lora_head: false          # rank-r LoRA on the LM head instead (tiny params; memory scales with
+                          #   supervised tokens; mutually exclusive with train_head). Merge-path
+
+# ---------------------------------------------------------------------------
 # Sampling / checkpoints / resume
-sample_every: 25          # single/split only
+# ---------------------------------------------------------------------------
+sample_every: 25          # single/split only: generate a live sample every N steps (0 = off; also
+                          #   skips creating the generation KV cache -- a small VRAM saving)
 sample_prompt: Tell me about your day.
-save_every: 0
-checkpoint_every: 0
-keep_checkpoints: 0
-resume: null
-reset_optimizer: false
+save_every: 0             # overwrite the adapter at `out` every N steps (0 = only at the end;
+                          #   Ctrl-C also saves). Single rolling copy
+checkpoint_every: 0       # every N steps save a RETAINED checkpoint to out/checkpoint-<step>
+keep_checkpoints: 0       # cap on retained checkpoints (0 = keep all)
+resume: null              # path to a checkpoint dir to resume from (optimizer + scheduler + data
+                          #   position restored)
+reset_optimizer: false    # with resume: keep the adapter weights but restart optimizer/scheduler
 
+# ---------------------------------------------------------------------------
 # Evaluation / run log
 #
-# PRIMARY eval (what --save-best and the printed "val" loss track). The usual
+# PRIMARY eval (what save_best and the printed "val" loss track). The usual
 # setup for a dataset with its own held-out split is just:
 #   eval_split: test
 #   eval_every: 50
 # eval2_* is an optional SECOND monitor with the same options (e.g. wikitext
 # LM loss watched alongside your task eval); it never drives save_best.
+# ---------------------------------------------------------------------------
 eval_split: null          # split of eval_dataset (or dataset) used as held-out eval
 eval_dataset: null        # defaults to `dataset`
-eval_config: null         # HF dataset config for the primary eval set
-eval_text_key: null       # set (e.g. text) for a plain-text LM eval instead of SFT
+eval_config: null         # HF dataset config name for the primary eval set
+eval_text_key: null       # set (e.g. text) for a plain-text LM eval instead of SFT pairs
 eval_max_samples: 0       # cap source rows (0 = all)
 eval_max_blocks: 0        # cap packed LM blocks when eval_text_key is set (0 = all)
 eval2_dataset: null       # enable the second monitor by naming a dataset here
@@ -139,7 +285,7 @@ eval2_config: null        # e.g. wikitext-2-raw-v1 for the wikitext dataset
 eval2_text_key: null      # e.g. text -> LM loss over packed seq_len blocks
 eval2_max_samples: 0
 eval2_max_blocks: 0       # size eval2 to roughly match the primary eval set
-val_frac: 0.0             # no eval_split? carve this fraction off train instead
+val_frac: 0.0             # no eval_split? carve this fraction off train as held-out instead
 eval_every: 0             # report held-out loss every N steps (0 = only at the end)
 save_best: false          # save only when the PRIMARY held-out loss improves
-run_log: qlora_runs.csv
+run_log: qlora_runs.csv   # CSV run log (one row per run: hyperparams, losses, tok/s, peak VRAM)

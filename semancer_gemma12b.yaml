@@ -9,7 +9,7 @@ out: out/semancer_gemma12b
 
 # Execution mode — split for headroom (262k-vocab bf16 head); head on cuda:1
 parallel: split
-use_per_device: [8, 23]
+split_even: true             # balanced split; was use_per_device: [8, 23] (manual starve-split)
 
 # LoRA / optimization
 r: 32

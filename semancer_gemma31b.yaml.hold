@@ -9,7 +9,9 @@ out: out/semancer_gemma31b
 
 # Execution mode — 29 GB of weights needs both 3090s; head on cuda:1
 parallel: split
-use_per_device: [13, 17]    # both GPUs need ~5.5GB headroom for the fp32 embed/head upcast (preapply_had_l OOM, 2026-07-12)
+split_even: true            # balanced split; was use_per_device: [13, 17] (both GPUs need ~5.5GB headroom
+                            #   for the fp32 embed/head upcast -- preapply_had_l OOM, 2026-07-12; even shares
+                            #   leave more than that free per card)
 
 # LoRA / optimization
 r: 32

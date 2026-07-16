@@ -10,7 +10,7 @@ out: out/qwen36_semancy_experts
 
 # Execution mode
 parallel: split
-use_per_device: [18, 23]    # natural split from the S23 smoke; head on cuda:1
+split_even: true            # balanced split; was use_per_device: [18, 23] (natural split from the S23 smoke; head on cuda:1)
 
 # LoRA / optimization
 r: 32

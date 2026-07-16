@@ -9,7 +9,7 @@ out: out/semancer_qwen36_27b
 
 # Execution mode — 22 GB of weights needs both 3090s; head on cuda:1
 parallel: split
-use_per_device: [14, 23]    # was [18,23]: GPU0 rode the edge and OOM'd twice (2026-07-12); starve it more
+split_even: true            # balanced split; was use_per_device: [14, 23] ([18,23] rode the edge, GPU0 OOM'd twice 2026-07-12)
 
 # LoRA / optimization
 r: 32
