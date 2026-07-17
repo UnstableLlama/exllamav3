@@ -111,6 +111,11 @@ def _run_main():
     # ever sees it. "--lora-r" sidesteps that; dest stays "r" so code is unchanged.
     ap.add_argument("--lora-r", dest="r", type=int, default=64)
     ap.add_argument("--alpha", type=float, default=64.0)
+    ap.add_argument("--lora-dropout", type=float, default=0.0,
+                    help="PEFT-style dropout on each per-linear LoRA branch's "
+                         "input (frozen base path never dropped; train-time "
+                         "only). Per-rank RNG, so DDP ranks draw independent "
+                         "masks -- same as PEFT under DDP.")
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--weight-decay", type=float, default=0.01,
                     help="AdamW weight decay on the LoRA params (default 0.01).")
@@ -369,7 +374,7 @@ def _run_main():
         compute_dtype=cdt, gradient_checkpointing=not args.no_grad_ckpt,
         train_embeddings=args.train_embeddings, train_head=args.train_head,
         attn_impl=args.attn_impl, head_vocab_chunk=args.head_vocab_chunk,
-        expert_r=args.expert_r,
+        expert_r=args.expert_r, lora_dropout=args.lora_dropout,
     )
     net.train()
     if args.pack and getattr(net, "has_gdn", False):

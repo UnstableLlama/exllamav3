@@ -990,6 +990,73 @@ def sample(model, cache, tokenizer, generator, build_prompt, prompt, max_new_tok
     return resp.strip().replace("\n", " ")
 
 
+def compute_even_split_budgets(model, config, margin_gb):
+    """Per-device ``use_per_device`` budgets (GB) that steer the autosplit
+    loader into an approximately EVEN split of the weights across all visible
+    CUDA devices (--split-even).
+
+    The stock autosplit is greedy: it packs device 0 until an allocation
+    fails, then advances -- so device 0 ends up wall-to-wall weights with no
+    training headroom while the last device sits half empty. Rather than
+    patching the loader, this measures each module's weight bytes from the
+    safetensors headers (``config.stc``; modules that load to CPU, i.e. the
+    embedding, are excluded) and solves the contiguous balanced-partition
+    problem over the module sequence (binary search on capacity + greedy
+    feasibility -- the module order is fixed by the forward, only the
+    boundaries move). Each device's byte share plus ``margin_gb`` of
+    load-time slack (dummy-forward activations, KV cache slices, dequant
+    temporaries) becomes its ``use_per_device`` cap, which the loader
+    enforces via per-device memory fractions and lifts after loading.
+
+    Approximate by design: the slack lets a realized boundary drift a layer
+    or two past the ideal one. A tied-embeddings LM head has no tensors of
+    its own in the file, so it's estimated at the embedding's size.
+    """
+    n = torch.cuda.device_count()
+    if n < 2:
+        raise SystemExit("--split-even needs >= 2 visible CUDA devices")
+
+    cpu_bytes = [sum(config.stc.get_tensor_sizes(m.key)) for m in model.modules
+                 if m.caps.get("prefer_cpu")]
+    sizes = []
+    for m in model.modules:
+        if m.caps.get("prefer_cpu"):
+            continue
+        b = sum(config.stc.get_tensor_sizes(m.key))
+        if b == 0 and m.caps.get("logits_output") and cpu_bytes:
+            b = max(cpu_bytes)   # tied head: materialized from the embedding
+        sizes.append(b)
+
+    # Smallest capacity that fits the sequence in <= n contiguous chunks.
+    def chunks_at(cap):
+        parts, acc = 1, 0
+        for s in sizes:
+            if acc + s > cap and acc > 0:
+                parts += 1
+                acc = 0
+            acc += s
+        return parts
+
+    lo, hi = max(sizes), sum(sizes)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if chunks_at(mid) <= n:
+            hi = mid
+        else:
+            lo = mid + 1
+
+    budgets, acc = [], 0
+    for s in sizes:
+        if acc + s > lo and acc > 0:
+            budgets.append(acc)
+            acc = 0
+        acc += s
+    budgets.append(acc)
+    # A 0 budget excludes the device entirely (loader treats use=0 as unused),
+    # so a model that balances across fewer than n devices leaves the rest idle.
+    return [b / 1024**3 + margin_gb if b > 0 else 0.0 for b in budgets]
+
+
 def main():
     """Run the trainer with failure capture: any exception or non-zero
     SystemExit appends a ``status=failed`` row (with phase + error summary) to
@@ -1044,10 +1111,27 @@ def _run_main():
                          "across visible GPUs (memory, for models too big for one card)")
     ap.add_argument("--reserve-per-device", nargs="*", type=float, default=None, metavar="GB",
                     help="(split) GB to reserve per device; negative excludes a device")
+    ap.add_argument("--split-even", nargs="?", type=float, const=2.0, default=None,
+                    metavar="MARGIN_GB",
+                    help="(split) Balance the layer split across GPUs instead of the "
+                         "default greedy fill-device-0-first: each device is capped to "
+                         "its even share of the model's weight bytes (measured from the "
+                         "safetensors headers) plus MARGIN_GB of load-time slack "
+                         "(default 2.0), leaving every card similar training headroom. "
+                         "Raise the margin if loading fails with 'Insufficient VRAM in "
+                         "split'; shrink it if the split comes out lopsided. Mutually "
+                         "exclusive with --reserve-per-device/--use-per-device.")
     ap.add_argument("--use-per-device", nargs="*", type=float, default=None, metavar="GB",
                     help="(split) GB budget per device; caps a card to force/tune the split")
     ap.add_argument("--r", type=int, default=32)
     ap.add_argument("--alpha", type=float, default=64.0)
+    ap.add_argument("--lora-dropout", type=float, default=0.0,
+                    help="PEFT-style dropout on each per-linear LoRA branch's "
+                         "input (frozen base path never dropped; train-time "
+                         "only, off in eval/inference). Typical 0.05-0.1; mild "
+                         "regularizer for small datasets / many epochs. Not "
+                         "applied to embed/head adapters. Incompatible with "
+                         "--quant-aware ste.")
     ap.add_argument("--use-rslora", action="store_true",
                     help="Rank-stabilized LoRA scaling: scale = alpha/sqrt(r) "
                          "instead of alpha/r. At a FIXED rank this is just an "
@@ -1270,6 +1354,16 @@ def _run_main():
                          "double-buffered side-stream copies that overlap compute, "
                          "value-exact) or sync (torch save_on_cpu, the pre-S36 "
                          "behavior -- blocking copies; keep for A/B or retain_graph).")
+    ap.add_argument("--vram-spillover", action="store_true",
+                    help="Linux only: allocate all CUDA tensors as unified memory "
+                         "(cudaMallocManaged) so a run that slightly exceeds VRAM "
+                         "spills cold pages to host RAM instead of insta-OOMing -- "
+                         "the behavior Windows' driver sysmem fallback provides by "
+                         "default. Slowdown is proportional to the spill (a few %% "
+                         "over VRAM is usable; big oversubscription crawls). Peak-"
+                         "VRAM reporting is unavailable in this mode, and --parallel "
+                         "split is rejected (its capacity probing is meaningless "
+                         "when allocations never fail). See training/uvm_allocator.py.")
     ap.add_argument("--use-liger", action="store_true",
                     help="Route RMSNorm (2D/3D norms) and SwiGLU (silu only) through "
                          "Liger Triton kernels for lower activation memory + speed. "
@@ -1431,6 +1525,19 @@ def _run_main():
                          "where each avoided reconstruction is 5-7 ms.")
     args = ap.parse_args()
 
+    # UVM spillover must be installed before the first CUDA tensor exists, so
+    # this runs before anything touches a device (model load is the first).
+    if args.vram_spillover:
+        if args.parallel == "split":
+            raise SystemExit(
+                "--vram-spillover is not compatible with --parallel split: the "
+                "autosplit loader probes real device capacity (memory fractions "
+                "+ OOM boundaries), which is meaningless when managed-memory "
+                "allocations never fail. Use --parallel single, or split "
+                "without spillover.")
+        import uvm_allocator
+        uvm_allocator.enable()
+
     from exllamav3.training import backbone as _backbone_cfg
     _backbone_cfg.set_dequant_mode(args.dequant_mode)
 
@@ -1488,8 +1595,19 @@ def _run_main():
         from exllamav3 import Cache
         cache = Cache(model, max_num_tokens=4096)
 
+    if args.split_even is not None and args.parallel != "split":
+        raise SystemExit("--split-even only applies to --parallel split.")
     if args.parallel == "split":
         load_kwargs = {}
+        if args.split_even is not None:
+            if args.reserve_per_device is not None or args.use_per_device is not None:
+                raise SystemExit("--split-even computes its own per-device budgets; "
+                                 "drop --reserve-per-device/--use-per-device.")
+            budgets = compute_even_split_budgets(model, config, args.split_even)
+            print(f" -- split-even: use_per_device = "
+                  f"[{', '.join(f'{b:.1f}' for b in budgets)}] GB "
+                  f"(even weight shares + {args.split_even:g} GB load margin)")
+            load_kwargs["use_per_device"] = budgets
         if args.reserve_per_device is not None:
             load_kwargs["reserve_per_device"] = args.reserve_per_device
         if args.use_per_device is not None:
@@ -1525,7 +1643,7 @@ def _run_main():
         lora_embed=args.lora_embed, lora_head=args.lora_head,
         offload_activations=args.offload_activations,
         offload_mode=args.offload_mode, use_liger=args.use_liger,
-        expert_r=args.expert_r,
+        expert_r=args.expert_r, lora_dropout=args.lora_dropout,
     )
     net.train()
     if args.pack and getattr(net, "has_gdn", False):
@@ -1891,12 +2009,15 @@ def _run_main():
     # Start the training timer + VRAM peak AFTER the baseline eval so neither is
     # counted against training throughput.
     t0 = time.time()
-    if torch.cuda.is_available():
+    # The UVM spillover allocator (a torch pluggable allocator) doesn't support
+    # memory stats -- reset/max_memory_allocated raise -- so peak VRAM is
+    # reported as unavailable in that mode.
+    if torch.cuda.is_available() and not args.vram_spillover:
         for d in active_devices:
             torch.cuda.reset_peak_memory_stats(d)
 
     def peak_vram_gb():
-        if not torch.cuda.is_available():
+        if not torch.cuda.is_available() or args.vram_spillover:
             return 0.0
         return max((torch.cuda.max_memory_allocated(d) / 1e9 for d in active_devices),
                    default=0.0)
@@ -2198,7 +2319,9 @@ def _run_main():
     if final_eval2 is not None:
         print(f"[EVAL] eval2 ({eval2_label}) loss: {final_eval2:.4f} "
               f"over {len(val2_examples)} examples")
-    if torch.cuda.is_available():
+    if args.vram_spillover:
+        peak_str = "n/a (uvm spillover)"
+    elif torch.cuda.is_available():
         peak_str = " / ".join(
             f"cuda:{d} {torch.cuda.max_memory_allocated(d) / 1e9:.2f}GB"
             for d in active_devices

@@ -181,6 +181,14 @@ def configure_quant_aware(
         return
     assert mode in ("noise", "ste"), f"unknown quant_aware mode {mode!r}"
     assert scale > 0.0, "--quant-aware-scale must be > 0"
+    if mode == "ste" and any(w.lora_drop is not None for w in wrappers):
+        # ste's closure serves W + (Q(Δ) - Δ) and relies on the fused forward
+        # adding the UN-dropped x@Δ back so the total is W + Q(Δ). lora_dropout
+        # moves the adapter term onto a dropped input, so the -Δ no longer
+        # cancels and the forward would see a corrupted base. noise composes
+        # fine (it only perturbs the frozen weight).
+        raise SystemExit("quant_aware=ste is incompatible with lora_dropout > 0; "
+                         "use quant_aware=noise or drop the dropout.")
 
     refs = None
     if ref_model_dir:

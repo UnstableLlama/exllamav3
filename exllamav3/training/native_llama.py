@@ -254,6 +254,10 @@ class DiffLinear(nn.Module):
     qa_state = None       # shared {"tick", "seed"} dict owned by the net
     qa_layer_id = 0       # stable per-layer seed offset
 
+    # LoRA-branch dropout (PEFT's lora_dropout). Class default so headless
+    # instances and pre-feature checkpoints behave exactly as before.
+    lora_drop = None
+
     def __init__(
         self,
         linear: nn.Module,
@@ -261,6 +265,7 @@ class DiffLinear(nn.Module):
         alpha: float = 16.0,
         use_rslora: bool = False,
         compute_dtype: torch.dtype = torch.bfloat16,
+        dropout: float = 0.0,
     ):
         super().__init__()
         assert backbone.is_loaded(linear), \
@@ -284,6 +289,10 @@ class DiffLinear(nn.Module):
             self.lora_a = nn.Parameter(torch.empty(self.in_features, r, dtype=torch.float32, device=dev))
             self.lora_b = nn.Parameter(torch.zeros(r, self.out_features, dtype=torch.float32, device=dev))
             nn.init.kaiming_uniform_(self.lora_a, a=5 ** 0.5)
+            # PEFT-style lora_dropout: dropout on the LoRA branch's input only,
+            # the frozen base path always sees the undropped x. Train-time only
+            # (nn.Dropout is identity in eval; forward also gates on training).
+            self.lora_drop = nn.Dropout(dropout) if dropout > 0.0 else None
         else:
             self.scale = 1.0
             self.register_parameter("lora_a", None)
@@ -365,8 +374,28 @@ class DiffLinear(nn.Module):
     def _qa_active(self) -> bool:
         return bool(self.qa_mode) and self.qa_sigma is not None and self.training
 
+    def _lora_drop_term(self, xc: torch.Tensor) -> torch.Tensor:
+        """The LoRA branch on the DROPPED input, through plain autograd
+        (grads reach the fp32 masters through the .to casts, same as the
+        fused Functions' cast-back)."""
+        a = self.lora_a.to(xc.dtype)
+        b = self.lora_b.to(xc.dtype)
+        return self.scale * ((self.lora_drop(xc) @ a) @ b)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         xc = x.to(self.compute_dtype)
+
+        # lora_dropout: the fused Functions share ONE input between the frozen
+        # base matmul and the LoRA branch, but PEFT dropout must hit only the
+        # branch input. So with dropout live, run the fused op adapter-free
+        # (keeping bias and the pissa offset -- those belong to the effective
+        # frozen base) and add the low-rank term on the dropped input outside.
+        # Taken only while training with p > 0: eval and p=0 keep the fused
+        # path, so parity/gradcheck numerics are untouched. Incompatible with
+        # quant_aware=ste (rejected at configure time): ste's closure relies
+        # on the un-dropped branch cancelling its -delta term.
+        drop_lora = (self.lora_drop is not None and self.training
+                     and self.adapter_enabled and self.lora_a is not None)
 
         # Fast path (audit A1): trellis inner + activation-side transforms.
         # Quant-aware runs need the full-weight closure to perturb, so they
@@ -383,6 +412,12 @@ class DiffLinear(nn.Module):
                 return EXL3LoRAHadFunction.apply(
                     xc, None, None, bias, 1.0,
                     inner_fn, suh, svh, had, None, None, 1.0)
+            if drop_lora:
+                y = EXL3LoRAHadFunction.apply(
+                    xc, None, None, bias, 1.0,
+                    inner_fn, suh, svh, had,
+                    self.init_a0, self.init_b0, self.scale)
+                return y + self._lora_drop_term(xc)
             return EXL3LoRAHadFunction.apply(
                 xc, self.lora_a, self.lora_b, bias, self.scale,
                 inner_fn, suh, svh, had,
@@ -399,6 +434,16 @@ class DiffLinear(nn.Module):
                 1.0,
                 backbone.frozen_weight_closure(self.linear, self.compute_dtype),
             )
+        if drop_lora:
+            # Closure includes the pissa residual and any quant-aware NOISE
+            # perturbation; only the trainable low-rank term moves outside.
+            y = EXL3LoRAFunction.apply(
+                xc, None, None,
+                backbone.frozen_bias(self.linear, self.compute_dtype),
+                1.0,
+                self._weight_closure_qa(),
+            )
+            return y + self._lora_drop_term(xc)
         return EXL3LoRAFunction.apply(
             xc, self.lora_a, self.lora_b,
             backbone.frozen_bias(self.linear, self.compute_dtype),
@@ -409,7 +454,8 @@ class DiffLinear(nn.Module):
     def extra_repr(self) -> str:
         return (f"key={self.key}, in={self.in_features}, out={self.out_features}, "
                 f"r={self.r}, compute_dtype={self.compute_dtype}"
-                f"{', pissa_offset' if self.init_a0 is not None else ''}")
+                f"{', pissa_offset' if self.init_a0 is not None else ''}"
+                f"{f', dropout={self.lora_drop.p}' if self.lora_drop is not None else ''}")
 
 
 class NativeLlamaQLoRA(nn.Module):
@@ -447,6 +493,7 @@ class NativeLlamaQLoRA(nn.Module):
     offload_mode = "async"
     _offloader = None
     init_lora = "default"
+    lora_dropout = 0.0
     # Quant-aware training (training.quant_aware): shared {"tick", "seed"}
     # state when a mode is enabled via set_quant_aware(), else None (exact
     # weights; the default -- eval/validate and old checkpoints unaffected).
@@ -480,6 +527,7 @@ class NativeLlamaQLoRA(nn.Module):
         offload_mode: str = "async",
         use_liger: bool = False,
         expert_r: Optional[int] = None,
+        lora_dropout: float = 0.0,
     ):
         super().__init__()
         # Offload the (grad-checkpointed) saved activations to CPU, and/or route
@@ -528,6 +576,13 @@ class NativeLlamaQLoRA(nn.Module):
         # MoE recipe divides the rank by the expert count (rank_pattern); this
         # is that knob. None = same rank as everything else.
         self.expert_r = int(expert_r) if expert_r is not None else None
+        # PEFT-style lora_dropout on every per-linear adapter's branch input
+        # (incl. routed experts). The embed/head adapters (lora_embed/lora_head
+        # and the fully-trained modules_to_save) are NOT dropped -- they're
+        # separate whole-module surfaces, not low-rank branches on a linear.
+        self.lora_dropout = float(lora_dropout)
+        if not (0.0 <= self.lora_dropout < 1.0):
+            raise ValueError(f"lora_dropout must be in [0, 1), got {lora_dropout}")
 
         # All reach into exllamav3's internal module layout goes through backbone:
         # embedding first, final RMSNorm + LM head last, transformer blocks between.
@@ -558,6 +613,7 @@ class NativeLlamaQLoRA(nn.Module):
                 alpha=alpha,
                 use_rslora=use_rslora,
                 compute_dtype=compute_dtype,
+                dropout=lora_dropout,
             )
             wrappers.append(w)
             return w
@@ -2143,7 +2199,7 @@ class NativeLlamaQLoRA(nn.Module):
             "r": r,
             "lora_alpha": alpha,
             "use_rslora": use_rslora,
-            "lora_dropout": 0.0,
+            "lora_dropout": getattr(self, "lora_dropout", 0.0),
             "bias": "none",
             "fan_in_fan_out": False,
             "target_modules": sorted(target_leaves),

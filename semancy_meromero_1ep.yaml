@@ -12,7 +12,7 @@ out: out/meromero_semancy_1ep
 
 # Execution mode
 parallel: split
-use_per_device: [8, 23]     # starve-split from the S26 smoke; head on cuda:1
+split_even: true            # balanced split; was use_per_device: [8, 23] (starve-split from the S26 smoke; head on cuda:1)
 
 # LoRA / optimization
 r: 32
