@@ -48,7 +48,8 @@ targets:
   - k_proj
   - v_proj
   - o_proj
-offload_activations: true
+offload_activations: false   # OFF: 1B@4bpw fits ~5GB VRAM; matches the EBFT arm
+                             # (whose offload pool OOM'd the host — see doc/ebft.md).
 attn_impl: auto
 sample_every: 0
 

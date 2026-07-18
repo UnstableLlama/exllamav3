@@ -323,6 +323,11 @@ _HTML_TEMPLATE = r"""<!doctype html>
   table.cmp td.k, table.cmp th.k { color: var(--muted); font-weight: 400; white-space: nowrap; }
   table.cmp th .sw { margin-right: 6px; }
   tr.diff td { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; }
+  .tbtn { font: inherit; font-size: 13px; cursor: pointer; background: var(--panel);
+          color: var(--fg); border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px; }
+  .tbtn:hover { border-color: var(--accent); }
+  #importMsg { margin-left: 2px; }
 </style>
 </head>
 <body>
@@ -331,6 +336,12 @@ _HTML_TEMPLATE = r"""<!doctype html>
     <h1 id="title"></h1>
     <div class="sub" id="subtitle"></div>
     <div id="legend"></div>
+    <div class="toolbar">
+      <button id="importBtn" class="tbtn" type="button">＋ Overlay another report…</button>
+      <button id="resetBtn" class="tbtn" type="button" hidden>Reset</button>
+      <input id="importInput" type="file" accept=".html,text/html" multiple hidden>
+      <span class="sub" id="importMsg"></span>
+    </div>
   </header>
   <div id="summary"></div>
   <h2>metrics</h2>
@@ -341,8 +352,9 @@ _HTML_TEMPLATE = r"""<!doctype html>
 <script>
 const DATA = /*__DATA__*/;
 const PALETTE = ["#3b82f6","#ef4444","#10b981","#f59e0b","#8b5cf6","#ec4899","#14b8a6","#f97316"];
-const RUNS = (DATA.runs || []).map((r, i) => Object.assign({}, r, {color: PALETTE[i % PALETTE.length]}));
-const MULTI = RUNS.length > 1;
+const BASE_RUNS = (DATA.runs || []);
+let RUNS = BASE_RUNS.slice();  // working set; overlay import appends, reset restores
+function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
 
 function el(tag, attrs, kids) {
   const svgTags = {svg:1, path:1, line:1, circle:1, text:1, g:1};
@@ -386,68 +398,76 @@ function xticks(min, max, count) {
   return arr.filter((v, i) => i === 0 || i === arr.length - 1 || (v - min > tol && max - v > tol));
 }
 
-// ---- header ----
-const title = document.getElementById("title");
-const subtitle = document.getElementById("subtitle");
-if (MULTI) {
-  title.textContent = "Comparison — " + RUNS.length + " runs";
-  const leg = el("div", {class: "legend"});
-  RUNS.forEach(r => {
-    const st = (r.meta && r.meta.status || "").toLowerCase();
-    const chip = el("span", {class: "chip"}, [swatch(r.color), el("span", {text: r.meta.label})]);
-    if (st) chip.appendChild(el("span", {class: "badge b-" + st, text: st}));
-    leg.appendChild(chip);
-  });
-  document.getElementById("legend").appendChild(leg);
-} else {
-  const m = (RUNS[0] && RUNS[0].meta) || {};
-  const cfg0 = (RUNS[0] && RUNS[0].config) || {};
-  title.textContent = m.run_name || "training run";
-  const status = (m.status || "running").toLowerCase();
-  const dur = (m.started && m.finished)
-    ? Math.round((new Date(m.finished) - new Date(m.started)) / 1000) : null;
-  subtitle.textContent = [
-    cfg0.model || cfg0.model_name || "",
-    m.started ? ("started " + m.started.replace("T", " ")) : "",
-    dur != null ? (dur + "s wall") : "",
-  ].filter(Boolean).join("  ·  ") + "  ";
-  subtitle.appendChild(el("span", {class: "badge b-" + status, text: status}));
-}
-
-// ---- summary ----
-const summaryRoot = document.getElementById("summary");
 function unionKeys(objs) {
   const seen = [], set = new Set();
   objs.forEach(o => Object.keys(o || {}).forEach(k => { if (!set.has(k)) { set.add(k); seen.push(k); } }));
   return seen;
 }
-if (!MULTI) {
-  const sum = (RUNS[0] && RUNS[0].summary) || {};
-  const kk = Object.keys(sum);
-  if (kk.length) {
-    const cards = el("div", {class: "cards"});
-    kk.forEach(k => cards.appendChild(el("div", {class: "card"}, [
-      el("div", {class: "k", text: k}), el("div", {class: "v", text: fmt(sum[k])})])));
-    summaryRoot.appendChild(cards);
-  }
-} else {
-  const skeys = unionKeys(RUNS.map(r => r.summary));
-  if (skeys.length) {
-    const tbl = el("table", {class: "cmp"});
-    const head = el("tr", {}, [el("th", {class: "k", text: ""})]);
-    RUNS.forEach(r => head.appendChild(el("th", {}, [swatch(r.color), el("span", {text: r.meta.label})])));
-    tbl.appendChild(head);
-    skeys.forEach(k => {
-      const tr = el("tr", {}, [el("td", {class: "k", text: k})]);
-      RUNS.forEach(r => tr.appendChild(el("td", {text: fmt((r.summary || {})[k])})));
-      tbl.appendChild(tr);
-    });
-    summaryRoot.appendChild(el("div", {class: "cmp-wrap"}, [tbl]));
-  }
-}
 
-// ---- charts ----
-function chart(name, seriesList) {
+// ---- render the whole page from a runs array; called on load and on every
+// overlay import, so all chart scales recompute across the current run set ----
+function render(runs) {
+  const MULTI = runs.length > 1;
+
+  // header
+  const title = document.getElementById("title");
+  const subtitle = document.getElementById("subtitle");
+  const legendRoot = document.getElementById("legend");
+  clear(legendRoot); title.textContent = ""; subtitle.textContent = "";
+  if (MULTI) {
+    title.textContent = "Comparison — " + runs.length + " runs";
+    const leg = el("div", {class: "legend"});
+    runs.forEach(r => {
+      const st = (r.meta && r.meta.status || "").toLowerCase();
+      const chip = el("span", {class: "chip"}, [swatch(r.color), el("span", {text: r.meta.label})]);
+      if (st) chip.appendChild(el("span", {class: "badge b-" + st, text: st}));
+      leg.appendChild(chip);
+    });
+    legendRoot.appendChild(leg);
+  } else {
+    const m = (runs[0] && runs[0].meta) || {};
+    const cfg0 = (runs[0] && runs[0].config) || {};
+    title.textContent = m.run_name || "training run";
+    const status = (m.status || "running").toLowerCase();
+    const dur = (m.started && m.finished)
+      ? Math.round((new Date(m.finished) - new Date(m.started)) / 1000) : null;
+    subtitle.textContent = [
+      cfg0.model || cfg0.model_name || "",
+      m.started ? ("started " + m.started.replace("T", " ")) : "",
+      dur != null ? (dur + "s wall") : "",
+    ].filter(Boolean).join("  ·  ") + "  ";
+    subtitle.appendChild(el("span", {class: "badge b-" + status, text: status}));
+  }
+
+  // summary
+  const summaryRoot = document.getElementById("summary"); clear(summaryRoot);
+  if (!MULTI) {
+    const sum = (runs[0] && runs[0].summary) || {};
+    const kk = Object.keys(sum);
+    if (kk.length) {
+      const cards = el("div", {class: "cards"});
+      kk.forEach(k => cards.appendChild(el("div", {class: "card"}, [
+        el("div", {class: "k", text: k}), el("div", {class: "v", text: fmt(sum[k])})])));
+      summaryRoot.appendChild(cards);
+    }
+  } else {
+    const skeys = unionKeys(runs.map(r => r.summary));
+    if (skeys.length) {
+      const tbl = el("table", {class: "cmp"});
+      const head = el("tr", {}, [el("th", {class: "k", text: ""})]);
+      runs.forEach(r => head.appendChild(el("th", {}, [swatch(r.color), el("span", {text: r.meta.label})])));
+      tbl.appendChild(head);
+      skeys.forEach(k => {
+        const tr = el("tr", {}, [el("td", {class: "k", text: k})]);
+        runs.forEach(r => tr.appendChild(el("td", {text: fmt((r.summary || {})[k])})));
+        tbl.appendChild(tr);
+      });
+      summaryRoot.appendChild(el("div", {class: "cmp-wrap"}, [tbl]));
+    }
+  }
+
+  // charts
+function chart(name, seriesList, multi) {
   const W = 360, H = 158, PL = 44, PR = 12, PT = 10, PB = 26;
   let xmin = Infinity, xmax = -Infinity, ymin = Infinity, ymax = -Infinity;
   seriesList.forEach(s => s.points.forEach(p => {
@@ -484,7 +504,7 @@ function chart(name, seriesList) {
 
   const box = el("div", {class: "chart"});
   const titleRow = el("div", {class: "title"}, [el("span", {text: name})]);
-  if (!MULTI) {
+  if (!multi) {
     const pts = seriesList[0].points;
     titleRow.appendChild(el("span", {class: "cur", text: "last " + fmt(pts[pts.length - 1][1])}));
   }
@@ -508,7 +528,7 @@ function chart(name, seriesList) {
       if (pp) {
         dot.setAttribute("cx", sx(pp[0])); dot.setAttribute("cy", sy(pp[1])); dot.setAttribute("opacity", 1);
         rows += '<div class="row"><span class="sw" style="background:' + s.color + '"></span>'
-             + (MULTI ? s.label + ": " : "") + fmt(pp[1]) + '</div>';
+             + (multi ? s.label + ": " : "") + fmt(pp[1]) + '</div>';
       }
     });
     tip.innerHTML = rows; tip.style.opacity = 1;
@@ -522,56 +542,115 @@ function chart(name, seriesList) {
   return box;
 }
 
-// metric union across runs, grouped by prefix
-const groupOrder = ["train", "eval", "perf"];
-const metricNames = unionKeys(RUNS.map(r => r.series));
-const groups = {};
-metricNames.forEach(k => {
-  const g = k.includes("/") ? k.split("/")[0] : "other";
-  (groups[g] = groups[g] || []).push(k);
-});
-const gnames = Object.keys(groups).sort((a, b) => {
-  const ia = groupOrder.indexOf(a), ib = groupOrder.indexOf(b);
-  return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || a.localeCompare(b);
-});
-const chartsRoot = document.getElementById("charts");
-gnames.forEach(g => {
-  groups[g].sort().forEach(metric => {
-    const seriesList = [];
-    RUNS.forEach(r => {
-      const pts = (r.series[metric] || []).filter(p => p[0] !== null && p[0] !== undefined);
-      if (pts.length) seriesList.push({label: r.meta.label, color: r.color, points: pts});
+  // charts: metric union across runs, grouped by prefix; chart() recomputes
+  // its own x/y domains from the union of series handed to it.
+  const groupOrder = ["train", "eval", "perf"];
+  const metricNames = unionKeys(runs.map(r => r.series));
+  const groups = {};
+  metricNames.forEach(k => {
+    const g = k.includes("/") ? k.split("/")[0] : "other";
+    (groups[g] = groups[g] || []).push(k);
+  });
+  const gnames = Object.keys(groups).sort((a, b) => {
+    const ia = groupOrder.indexOf(a), ib = groupOrder.indexOf(b);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || a.localeCompare(b);
+  });
+  const chartsRoot = document.getElementById("charts"); clear(chartsRoot);
+  gnames.forEach(g => {
+    groups[g].sort().forEach(metric => {
+      const seriesList = [];
+      runs.forEach(r => {
+        const pts = (r.series[metric] || []).filter(p => p[0] !== null && p[0] !== undefined);
+        if (pts.length) seriesList.push({label: r.meta.label, color: r.color, points: pts});
+      });
+      if (seriesList.length) chartsRoot.appendChild(chart(metric, seriesList, MULTI));
     });
-    if (seriesList.length) chartsRoot.appendChild(chart(metric, seriesList));
   });
-});
-if (!chartsRoot.children.length)
-  chartsRoot.appendChild(el("div", {class: "sub", text: "no metrics logged"}));
+  if (!chartsRoot.children.length)
+    chartsRoot.appendChild(el("div", {class: "sub", text: "no metrics logged"}));
 
-// ---- config ----
-const configRoot = document.getElementById("config");
-if (!MULTI) {
-  const cfg = (RUNS[0] && RUNS[0].config) || {};
-  const wrap = el("div", {class: "cfg-wrap"});
-  const t = el("table", {class: "cfg"});
-  Object.keys(cfg).forEach(k => t.appendChild(el("tr", {}, [
-    el("td", {class: "k", text: k}), el("td", {class: "v", text: fmt(cfg[k])})])));
-  wrap.appendChild(t); configRoot.appendChild(wrap);
-} else {
-  const ckeys = unionKeys(RUNS.map(r => r.config));
-  const tbl = el("table", {class: "cmp"});
-  const head = el("tr", {}, [el("th", {class: "k", text: ""})]);
-  RUNS.forEach(r => head.appendChild(el("th", {}, [swatch(r.color), el("span", {text: r.meta.label})])));
-  tbl.appendChild(head);
-  ckeys.forEach(k => {
-    const vals = RUNS.map(r => (r.config || {})[k]);
-    const differ = vals.some(v => JSON.stringify(v) !== JSON.stringify(vals[0]));
-    const tr = el("tr", differ ? {class: "diff"} : {}, [el("td", {class: "k", text: k})]);
-    vals.forEach(v => tr.appendChild(el("td", {text: fmt(v)})));
-    tbl.appendChild(tr);
-  });
-  configRoot.appendChild(el("div", {class: "cmp-wrap"}, [tbl]));
+  // config
+  const configRoot = document.getElementById("config"); clear(configRoot);
+  if (!MULTI) {
+    const cfg = (runs[0] && runs[0].config) || {};
+    const wrap = el("div", {class: "cfg-wrap"});
+    const t = el("table", {class: "cfg"});
+    Object.keys(cfg).forEach(k => t.appendChild(el("tr", {}, [
+      el("td", {class: "k", text: k}), el("td", {class: "v", text: fmt(cfg[k])})])));
+    wrap.appendChild(t); configRoot.appendChild(wrap);
+  } else {
+    const ckeys = unionKeys(runs.map(r => r.config));
+    const tbl = el("table", {class: "cmp"});
+    const head = el("tr", {}, [el("th", {class: "k", text: ""})]);
+    runs.forEach(r => head.appendChild(el("th", {}, [swatch(r.color), el("span", {text: r.meta.label})])));
+    tbl.appendChild(head);
+    ckeys.forEach(k => {
+      const vals = runs.map(r => (r.config || {})[k]);
+      const differ = vals.some(v => JSON.stringify(v) !== JSON.stringify(vals[0]));
+      const tr = el("tr", differ ? {class: "diff"} : {}, [el("td", {class: "k", text: k})]);
+      vals.forEach(v => tr.appendChild(el("td", {text: fmt(v)})));
+      tbl.appendChild(tr);
+    });
+    configRoot.appendChild(el("div", {class: "cmp-wrap"}, [tbl]));
+  }
 }
+
+// ---- assign per-run colors + disambiguate duplicate labels, then render ----
+function prep(runs) {
+  const out = runs.map((r, i) => ({
+    meta: Object.assign({}, r.meta || {}),
+    config: r.config || {}, summary: r.summary || {}, series: r.series || {},
+    color: PALETTE[i % PALETTE.length],
+  }));
+  const seen = {};
+  out.forEach(r => {
+    const base = r.meta.label || r.meta.run_name || "run";
+    seen[base] = (seen[base] || 0) + 1;
+    r.meta.label = seen[base] > 1 ? base + " #" + seen[base] : base;
+  });
+  return out;
+}
+function rerender() {
+  render(prep(RUNS));
+  document.getElementById("resetBtn").hidden = RUNS.length <= BASE_RUNS.length;
+}
+
+// ---- overlay import: read another report.html, pull its DATA.runs, append ----
+function extractRuns(text) {
+  const marker = "const DATA = ";
+  const i = text.indexOf(marker);
+  if (i < 0) throw new Error("not a run report");
+  const rest = text.slice(i + marker.length);
+  const end = rest.indexOf(";\n");
+  let blob = (end < 0 ? rest : rest.slice(0, end)).trim();
+  if (blob.endsWith(";")) blob = blob.slice(0, -1);
+  const runs = JSON.parse(blob).runs || [];
+  if (!runs.length) throw new Error("no runs in file");
+  return runs;
+}
+const importInput = document.getElementById("importInput");
+document.getElementById("importBtn").addEventListener("click", () => importInput.click());
+document.getElementById("resetBtn").addEventListener("click", () => {
+  RUNS = BASE_RUNS.slice(); rerender();
+  document.getElementById("importMsg").textContent = "";
+});
+importInput.addEventListener("change", async ev => {
+  const files = Array.from(ev.target.files || []);
+  let added = 0; const errs = [];
+  for (const f of files) {
+    try { extractRuns(await f.text()).forEach(r => RUNS.push(r)); added += 1; }
+    catch (e) { errs.push(f.name + " — " + e.message); }
+  }
+  ev.target.value = "";  // let the same file be re-picked later
+  rerender();
+  const msg = [];
+  if (added) msg.push("overlaid " + added + " report" + (added > 1 ? "s" : ""));
+  if (errs.length) msg.push("skipped: " + errs.join("; "));
+  document.getElementById("importMsg").textContent = msg.join("  ·  ");
+});
+
+// initial paint
+rerender();
 </script>
 </body>
 </html>

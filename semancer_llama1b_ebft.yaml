@@ -58,7 +58,9 @@ targets:
   - k_proj
   - v_proj
   - o_proj
-offload_activations: true
+offload_activations: false   # OFF: 1B@4bpw fits ~5GB VRAM; the pinned-buffer
+                             # pool grows unbounded under EBFT's per-step shape
+                             # variance and OOM'd the host (see doc/ebft.md).
 attn_impl: auto
 
 # Evaluation (eval also runs rollouts for held-out CFM -- the paper's headline

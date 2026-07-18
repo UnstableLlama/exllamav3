@@ -16,6 +16,49 @@ reference code are full-fine-tuning only).
 
 ---
 
+## ⚠️ Known issue (Session 40): activation offload → host-RAM OOM, whole-machine crash
+
+**Symptom.** A quarter-epoch A/B run (`semancer_llama1b_ebft.yaml`, Llama-3.2-1B
+@4bpw, batch 4 / anchors 4 / n 4, `offload_activations: true`) grew host RAM
+without bound and killed the whole box (64 GB RAM + swap exhausted) around
+step ~23/28. VRAM stayed near-empty (~5 GB) the entire time. The SFT arm on the
+same data finished fine (28 steps / 33 s).
+
+**Root cause — NOT model size.** `offload_activations: true` sends
+gradient-checkpoint activations to **pinned host RAM** via
+`AsyncActivationOffload` (`exllamav3/training/offload.py`). The pinned-buffer
+pool is keyed by `(shape, dtype)` (`offload.py:70`, returned at `:164`) with
+**no eviction and no total-bytes cap**, and the offloader instance persists for
+the whole run (`native_llama.py:1683-1686`). Its design assumption
+(`offload.py:24` comment: "steady state holds one buffer") holds for SFT, whose
+tensor shapes barely change — but **EBFT picks random anchors every step**
+(`pick_anchors(..., rng)`), so the rollout tensor `rows` has a *different padded
+length* (and often a different row count) each step. Each step therefore
+allocates a fresh ~4 GB set of pinned buffers under a brand-new shape key and
+orphans the previous step's buffers in the pool forever → monotonic pinned-RAM
+growth → ~step 14-16 crosses 64 GB → pinned pages can't swap, the rest thrashes,
+machine locks. `R = batch·anchors·n = 64` rollout rows × up to seq_len makes each
+step's offloaded activations large, so the blowup is fast.
+
+**Immediate mitigation (done): `offload_activations: false` in both semancer
+llama1b A/B YAMLs.** A 1B @4bpw + LoRA trains in ~5 GB — offload was pure
+downside here. This makes the A/B safe to relaunch after a context refresh.
+Only reach for offload on a model that genuinely doesn't fit.
+
+**Real fix (not built — needs GPU + user sign-off):** bound the pool in
+`offload.py` — evict by total pinned bytes (LRU over shape keys) with a cap, or
+clear the pool at each step/pass boundary. Verify with SFT (shape-stable, must
+stay at steady-state one-buffer-per-shape) *and* EBFT (shape-varying, must not
+grow across steps). Consider a startup warn when `offload_activations` is set
+but the model + activations comfortably fit VRAM.
+
+**Confidence:** high on the mechanism (pool code read: shape-keyed, no eviction,
+persistent instance, EBFT per-step shape variance). The exact crash step is from
+live observation (~23/28) — the scratchpad log was wiped on reboot, so this is
+inferred from code, not a captured RAM trace.
+
+---
+
 ## What EBFT is, in one paragraph
 
 Instead of next-token CE (SFT) or a scalar verifier reward (RLVR), train the
