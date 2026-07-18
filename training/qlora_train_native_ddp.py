@@ -489,6 +489,8 @@ def _run_main():
     # Finalize step count (from --epochs over the FULL train set) and warmup.
     eff_batch = args.batch * world_size * args.grad_accum
     args.steps, warmup_steps = resolve_steps_and_warmup(args, len(examples), eff_batch)
+    # For the per-step epoch readout (steps_per_epoch stashed by the resolver).
+    epochs_total = args.epochs if args.epochs > 0 else args.steps / args.steps_per_epoch
     if is_main(rank):
         print(f" -- {len(examples)} train examples total, ~{len(shard)} per rank; "
               f"{len(val_examples)} held out for eval "
@@ -749,7 +751,9 @@ def _run_main():
             _, tot_tps = meter.rates()
             ema = global_loss if ema is None else 0.9 * ema + 0.1 * global_loss
             if is_main(rank):
-                print(f"  step {step:>5}/{args.steps} | loss {global_loss:6.4f} | "
+                print(f"  step {step:>5}/{args.steps} | "
+                      f"ep {step / args.steps_per_epoch:.2f}/{epochs_total:.4g} | "
+                      f"loss {global_loss:6.4f} | "
                       f"ema {ema:6.4f} | grad {gnorm:7.4f} | "
                       f"lr {sched.get_last_lr()[0]:.2e} | "
                       f"~{tot_tps * world_size:,.0f} tok/s | {timer.step_line()}")

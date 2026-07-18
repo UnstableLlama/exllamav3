@@ -294,3 +294,8 @@ val_frac: 0.0             # no eval_split? carve this fraction off train as held
 eval_every: 0             # report held-out loss every N steps (0 = only at the end)
 save_best: false          # save only when the PRIMARY held-out loss improves
 run_log: qlora_runs.csv   # CSV run log (one row per run: hyperparams, losses, tok/s, peak VRAM)
+wandb_project: null       # single/split only: log to Weights & Biases under this project (null/
+                          #   empty = off). Per-step loss/ema/grad/lr/|dB|/tok-s/epoch + eval
+                          #   losses + final summary; run config mirrors the run-log CSV row
+wandb_run_name: null      # wandb run name (default: basename of `out`)
+wandb_entity: null        # wandb user/team (default: account default)

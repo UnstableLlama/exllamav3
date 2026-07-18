@@ -220,10 +220,25 @@ def append_run_log(path, record):
 # preemption) can't be caught -- those runs leave no row.
 _FAIL_CTX = {"run_log": None, "record": {}, "phase": "startup", "logged": False}
 
+# The live wandb run (when --wandb-project is set), kept module-level so the
+# failure logger can close it with a failure exit code. _finish_wandb is
+# idempotent: the first caller (normal finish, Ctrl-C, or _log_failure) wins.
+_WANDB_RUN = {"run": None}
+
+
+def _finish_wandb(exit_code=0):
+    run, _WANDB_RUN["run"] = _WANDB_RUN["run"], None
+    if run is not None:
+        try:
+            run.finish(exit_code=exit_code)
+        except Exception as exc:  # never let wandb teardown mask the real exit
+            print(f"[wandb] finish failed: {exc}")
+
 
 def _log_failure(status, exc):
     """Append a run-log row for a run that died, plus the full traceback to a
     sidecar ``<run_log>.errors.log`` (tracebacks don't fit a CSV cell)."""
+    _finish_wandb(exit_code=1)
     if _FAIL_CTX["logged"] or not _FAIL_CTX["run_log"]:
         return
     _FAIL_CTX["logged"] = True
@@ -656,10 +671,14 @@ def resolve_steps_and_warmup(args, num_train_examples, effective_batch):
     the requested number of passes over the data: one optimizer step consumes
     ``effective_batch`` examples, so an epoch is ``ceil(N / effective_batch)``
     steps. ``--warmup-steps`` (when > 0) wins over ``--warmup-ratio``.
+
+    Also stashes ``args.steps_per_epoch`` (computed even in --steps mode) so the
+    training loop can show per-step epoch progress.
     """
+    eff = max(1, int(effective_batch))
+    steps_per_epoch = max(1, math.ceil(num_train_examples / eff))
+    args.steps_per_epoch = steps_per_epoch
     if getattr(args, "epochs", 0) and args.epochs > 0:
-        eff = max(1, int(effective_batch))
-        steps_per_epoch = max(1, math.ceil(num_train_examples / eff))
         args.steps = max(1, math.ceil(args.epochs * steps_per_epoch))
     warmup = (args.warmup_steps if getattr(args, "warmup_steps", 0) and args.warmup_steps > 0
               else int(round(getattr(args, "warmup_ratio", 0.0) * args.steps)))
@@ -1523,6 +1542,17 @@ def _run_main():
                          "costs ~1-4%% tok/s AND +0.5-1.5 GB peak VRAM (worst on "
                          "MoE). Only worth trying with --dequant-mode legacy, "
                          "where each avoided reconstruction is 5-7 ms.")
+    ap.add_argument("--wandb-project", default="",
+                    help="Log the run to Weights & Biases under this project "
+                         "(opt-in; empty = wandb never imported). Logs the "
+                         "per-step readout (loss/ema/grad/lr/|dB|/tok-s/epoch), "
+                         "eval losses as they happen, and a final summary; the "
+                         "run config mirrors the run-log CSV row so runs are "
+                         "comparable across both.")
+    ap.add_argument("--wandb-run-name", default="",
+                    help="wandb run name (default: basename of --out).")
+    ap.add_argument("--wandb-entity", default="",
+                    help="wandb entity (user/team; empty = account default).")
     args = ap.parse_args()
 
     # UVM spillover must be installed before the first CUDA tensor exists, so
@@ -1993,6 +2023,26 @@ def _run_main():
     # (peak_vram_gb / log_run are defined once below, after the baseline eval --
     # an earlier duplicate pair that used to sit here was dead code and is gone.)
 
+    # Optional wandb run (--wandb-project). Config reuses the failure-logger
+    # record (the same identity/hyperparameter fields as the run-log CSV),
+    # refreshed with the values finalized since startup (epoch-resolved steps,
+    # warmup, targets, split sizes), so CSV rows and wandb runs line up.
+    wandb_run = None
+    if args.wandb_project:
+        import wandb
+        wandb_config = dict(_FAIL_CTX["record"])
+        wandb_config.update(
+            steps_planned=args.steps, steps_per_epoch=args.steps_per_epoch,
+            warmup_steps=warmup_steps, targets=" ".join(net.target_modules),
+            trainable_params=net.num_trainable(), n_train=len(examples),
+            n_val=len(val_examples), n_eval2=len(val2_examples))
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity or None,
+            name=args.wandb_run_name or os.path.basename(os.path.normpath(args.out)),
+            config=wandb_config)
+        _WANDB_RUN["run"] = wandb_run
+
     # Baseline eval at step 0 (the adapter is a no-op at init, B=0, so this is the
     # base model's held-out loss) -- a reference point for the trained numbers.
     _FAIL_CTX["phase"] = "baseline_eval"
@@ -2005,6 +2055,10 @@ def _run_main():
         if start_eval2 is not None:
             parts.append(f"{eval2_label} {start_eval2:.4f}")
         print("    [eval] step 0 (baseline): " + " | ".join(parts))
+        if wandb_run is not None:
+            wandb_run.log({k: v for k, v in (("eval/held_out", start_val),
+                                             ("eval/eval2", start_eval2))
+                           if v is not None}, step=0)
 
     # Start the training timer + VRAM peak AFTER the baseline eval so neither is
     # counted against training throughput.
@@ -2124,6 +2178,11 @@ def _run_main():
         prof.start()
         print(f" -- torch.profiler armed: 3 skip + 2 warmup steps, then "
               f"{args.torch_profile} profiled steps -> {prof_dir}")
+    # Per-step epoch readout: steps_per_epoch was stashed by
+    # resolve_steps_and_warmup from the same training units the loop consumes
+    # (packed blocks under --pack), so in --steps mode the total shows the
+    # equivalent epoch count the step budget works out to.
+    epochs_total = args.epochs if args.epochs > 0 else args.steps / args.steps_per_epoch
     try:
         for step in range(resume_step + 1, args.steps + 1):
             _FAIL_CTX["phase"] = f"train step {step}"
@@ -2192,15 +2251,27 @@ def _run_main():
             tok_seen += step_sup
             tot_seen += step_tot
             meter.update(time.time() - step_t0, step_sup, step_tot)
-            _, tot_tps = meter.rates()
+            sup_tps, tot_tps = meter.rates()
 
             if start_loss is None:
                 start_loss = accum_loss
             end_loss = accum_loss
             ema = accum_loss if ema is None else 0.9 * ema + 0.1 * accum_loss
-            print(f"  step {step:>5}/{args.steps} | loss {accum_loss:6.4f} | "
-                  f"ema {ema:6.4f} | grad {gnorm:7.4f} | lr {sched.get_last_lr()[0]:.2e} | "
-                  f"|dB| {adapter_b_norm():7.3f} | {tot_tps:,.0f} tok/s | {timer.step_line()}")
+            epoch_now = step / args.steps_per_epoch
+            cur_lr = sched.get_last_lr()[0]
+            b_dist = adapter_b_norm()
+            print(f"  step {step:>5}/{args.steps} | "
+                  f"ep {epoch_now:.2f}/{epochs_total:.4g} | "
+                  f"loss {accum_loss:6.4f} | "
+                  f"ema {ema:6.4f} | grad {gnorm:7.4f} | lr {cur_lr:.2e} | "
+                  f"|dB| {b_dist:7.3f} | {tot_tps:,.0f} tok/s | {timer.step_line()}")
+            if wandb_run is not None:
+                wandb_run.log({
+                    "train/loss": accum_loss, "train/ema": ema,
+                    "train/grad_norm": gnorm, "train/lr": cur_lr,
+                    "train/adapter_b_dist": b_dist, "train/epoch": epoch_now,
+                    "perf/sup_tok_s": sup_tps, "perf/tot_tok_s": tot_tps,
+                }, step=step)
 
             # Keep the failure record current so a later crash (or kill -9 at
             # least leaves the errors.log short a row, see _FAIL_CTX note)
@@ -2244,6 +2315,13 @@ def _run_main():
                 if v2 is not None:
                     parts.append(f"{eval2_label} {v2:.4f}")
                 print(f"    [eval] step {step}: " + " | ".join(parts))
+                if wandb_run is not None:
+                    metrics = {k: v for k, v in (("eval/held_out", vl),
+                                                 ("eval/eval2", v2))
+                               if v is not None}
+                    if vl is not None:
+                        metrics["eval/best_val"] = best_val
+                    wandb_run.log(metrics, step=step)
 
             if args.sample_every and step % args.sample_every == 0:
                 net.eval()
@@ -2288,6 +2366,7 @@ def _run_main():
             if step > 0:
                 save("[interrupted]")
         log_run("interrupted", time.time() - t0, None, None)
+        _finish_wandb()
         raise SystemExit(0)
 
     if prof is not None:       # run shorter than the profile window
@@ -2333,6 +2412,18 @@ def _run_main():
           f"peak VRAM {peak_str} | {dt:.0f}s for {step} steps | "
           f"step time: {timer.summary()}")
     log_run("completed", dt, val_loss, final_eval2)
+    if wandb_run is not None:
+        wandb_run.summary.update({k: v for k, v in {
+            "end_loss": end_loss, "final_val": val_loss,
+            "final_eval2": final_eval2,
+            "best_val": best_val if best_val != float("inf") else None,
+            "best_val_step": best_val_step or None,
+            "peak_vram_gb": peak_vram_gb(),
+            "sup_tok_s": tok_seen / dt if dt else 0,
+            "tot_tok_s": tot_seen / dt if dt else 0,
+            "total_s": dt, "steps_done": step,
+        }.items() if v is not None})
+        _finish_wandb()
     print("Verify with: python training/qlora_infer_native.py "
           f"--model {args.model} --adapter {args.out}")
 

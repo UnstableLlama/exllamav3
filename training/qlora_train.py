@@ -65,6 +65,7 @@ SINGLE_ONLY_KEYS = {
     "init_eva_tokens",
     "quant_aware", "quant_aware_scale", "quant_aware_ref_model",
     "torch_profile",   # torch.profiler window; DDP backend has no such flag
+    "wandb_project", "wandb_run_name", "wandb_entity",  # not mirrored to DDP yet
 }
 DDP_ONLY_KEYS = set()
 ALIASES = {"lora_r": "r"}  # DDP backend spells this --lora-r; config uses r.
@@ -93,6 +94,9 @@ SINGLE_ONLY_DEFAULTS = {
     "quant_aware": "none",
     "quant_aware_scale": 1.0,
     "quant_aware_ref_model": None,
+    "wandb_project": "",
+    "wandb_run_name": "",
+    "wandb_entity": "",
 }
 
 
