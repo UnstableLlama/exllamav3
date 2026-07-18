@@ -5,6 +5,7 @@ No GPU/torch needed. Run: python tests/test_run_report.py
 
 import json
 import os
+import re
 import sys
 import tempfile
 
@@ -22,6 +23,13 @@ def _data_of(html):
     """Extract and parse the injected DATA JSON blob from a rendered report."""
     blob = html.split("const DATA = ", 1)[1].split(";\n", 1)[0]
     return json.loads(blob)
+
+
+def _nojs_body(html):
+    """The report body as a JS-disabled viewer (iOS Files/Quick Look, attachment
+    previews) sees it: everything between <body>..</body> with <script> removed."""
+    body = html.split("<body>", 1)[1].split("</body>", 1)[0]
+    return re.sub(r"<script.*?</script>", "", body, flags=re.S)
 
 
 def test_full_run_renders():
@@ -148,6 +156,56 @@ def test_compare_dedupes_labels():
     print("  compare disambiguates duplicate labels: OK")
 
 
+def test_static_prerender_single_run_no_js():
+    # The report must render WITHOUT JavaScript: iOS Files/Quick Look and
+    # attachment previews run the file JS-disabled, so the charts/cards/config
+    # are pre-rendered to static HTML+SVG in Python. Assert they survive with
+    # every <script> stripped.
+    with tempfile.TemporaryDirectory() as out:
+        rep = RunLogger(out, "static-single", config={"lr": 1e-5, "model": "m/x"})
+        rep.log({"eval/held_out": 3.0}, step=0)
+        for s in range(1, 6):
+            rep.log({"train/loss": 3.0 - 0.1 * s}, step=s)
+        rep.update_summary({"best_val": 2.5, "steps_done": 5})
+        rep.finish(exit_code=0)
+
+        html = open(os.path.join(_rdir(out), "report.html")).read()
+        assert "__STATIC_" not in html, "a static placeholder token was left unreplaced"
+        body = _nojs_body(html)
+        assert "static-single" in body, "title missing from no-JS body"
+        assert body.count("<svg") >= 2, "charts not pre-rendered (no <svg> without JS)"
+        assert 'class="plot"' in body, "no plotted series path in static SVG"
+        assert 'class="card"' in body, "summary cards not pre-rendered"
+        assert "best_val" in body and "table class=\"cfg\"" in body, "summary/config missing"
+    print("  static pre-render (single run, no JS): OK")
+
+
+def test_static_prerender_compare_no_js():
+    with tempfile.TemporaryDirectory() as root:
+        outs = []
+        for name, base in (("sft", 3.0), ("ebft", 3.2)):
+            out = os.path.join(root, name)
+            rep = RunLogger(out, name, config={"arm": name, "lr": 1e-5})
+            for s in range(1, 5):
+                rep.log({"train/loss": base - 0.1 * s}, step=s)
+            rep.update_summary({"best_val": base - 0.2})
+            rep.finish(exit_code=0)
+            outs.append(out)
+        cmp_path = os.path.join(root, "cmp.html")
+        compare_reports(outs, cmp_path)
+
+        html = open(cmp_path).read()
+        assert "__STATIC_" not in html, "a static placeholder token was left unreplaced"
+        body = _nojs_body(html)
+        assert "Comparison" in body, "comparison title missing from no-JS body"
+        assert body.count('class="chip"') == 2, "legend chips not pre-rendered per run"
+        assert body.count('class="cmp"') == 2, "summary + config compare tables missing"
+        assert 'class="diff"' in body, "differing-config rows not highlighted statically"
+        # Overlaid runs -> a chart SVG carrying more than one plotted series.
+        assert body.count('class="plot"') > body.count("<svg"), "series not overlaid in static charts"
+    print("  static pre-render (compare, no JS): OK")
+
+
 if __name__ == "__main__":
     test_full_run_renders()
     test_finish_is_idempotent()
@@ -155,4 +213,6 @@ if __name__ == "__main__":
     test_render_from_partial_after_crash()
     test_compare_overlays_runs()
     test_compare_dedupes_labels()
+    test_static_prerender_single_run_no_js()
+    test_static_prerender_compare_no_js()
     print("ALL RUN_REPORT TESTS PASSED")

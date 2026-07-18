@@ -36,7 +36,9 @@ Drop-in shape mirrors the wandb calls it replaces::
 """
 
 import datetime
+import html as _html
 import json
+import math
 import os
 
 
@@ -194,9 +196,298 @@ def _load_run(out_dir, label=None):
     return {"meta": meta, "config": config, "summary": summary, "series": series}
 
 
+# --------------------------------------------------------------------------- #
+# Static pre-render. The report is normally drawn by the inline JS at load time,
+# but some viewers run the file with JavaScript disabled -- iOS Files/Quick Look,
+# Mail/Messages/AirDrop attachment previews, in-app browsers. There the empty
+# JS-target containers show nothing. So we ALSO render the header/summary/charts/
+# config to static HTML+SVG in Python and inject it into those containers. When
+# JS *does* run it clears and redraws them (identical output, plus interactivity)
+# -- the static pass is a no-JS fallback, the JS is progressive enhancement. The
+# two paths mirror each other on purpose; keep them in sync when either changes.
+# --------------------------------------------------------------------------- #
+
+_PALETTE = ["#3b82f6", "#ef4444", "#10b981", "#f59e0b",
+            "#8b5cf6", "#ec4899", "#14b8a6", "#f97316"]
+
+
+def _e(v):
+    """HTML-escape (incl. quotes) any value to a str -- mirrors the JS setText."""
+    return _html.escape(str(v), quote=True)
+
+
+def _fmt(v):
+    """Number formatting matching the JS ``fmt()`` so static and JS agree."""
+    if v is None:
+        return "–"  # en dash
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return str(v)
+    if v == 0:
+        return "0"
+    a = abs(v)
+    if a >= 1e6 or (0 < a < 1e-3):  # JS toExponential(2), e.g. "1.23e+6"
+        mant, exp = ("%.2e" % v).split("e")
+        ei = int(exp)
+        return "%se%s%d" % (mant, "+" if ei >= 0 else "-", abs(ei))
+    if isinstance(v, int) or float(v).is_integer():  # JS Number.isInteger -> toLocaleString
+        return "{:,}".format(int(v))
+    if a >= 100:
+        return "%.1f" % v
+    return "%.4f" % v
+
+
+def _union_keys(objs):
+    """Keys across dicts, first-seen order -- mirrors the JS ``unionKeys()``."""
+    seen, out = set(), []
+    for o in objs:
+        for k in (o or {}):
+            if k not in seen:
+                seen.add(k)
+                out.append(k)
+    return out
+
+
+def _xticks(mn, mx, count=5):
+    """Port of the JS ``xticks()`` -- round interior ticks, endpoints kept."""
+    mn, mx = round(mn), round(mx)
+    if mn == mx:
+        return [mn]
+    span = mx - mn
+    raw = span / (count - 1)
+    mag = 10 ** math.floor(math.log10(raw))
+    norm = raw / mag
+    step = (1 if norm < 1.5 else 2 if norm < 3 else 5 if norm < 7 else 10) * mag
+    t = {mn, mx}
+    v = math.ceil(mn / step) * step
+    while v < mx:
+        if v > mn:
+            t.add(round(v))
+        v += step
+    arr = sorted(t)
+    tol = span * 0.08
+    return [x for i, x in enumerate(arr)
+            if i == 0 or i == len(arr) - 1 or (x - mn > tol and mx - x > tol)]
+
+
+def _sw(color):
+    return '<span class="sw" style="background:%s"></span>' % color
+
+
+def _svg_chart(series_list):
+    """Static SVG for one chart: grid, axes, one polyline per series. The
+    interactive dots/crosshair/tooltip are added only by the JS on hover."""
+    W, H, PL, PR, PT, PB = 360, 158, 44, 12, 10, 26
+    xmin = ymin = float("inf")
+    xmax = ymax = float("-inf")
+    for s in series_list:
+        for p in s["points"]:
+            xmin = min(xmin, p[0]); xmax = max(xmax, p[0])
+            ymin = min(ymin, p[1]); ymax = max(ymax, p[1])
+    if xmin == xmax:
+        xmax = xmin + 1
+    if ymin == ymax:
+        pad = abs(ymin) or 1
+        ymin -= pad * 0.05; ymax += pad * 0.05
+    pady = (ymax - ymin) * 0.08
+    ymin -= pady; ymax += pady
+
+    def sx(v):
+        return PL + (v - xmin) / (xmax - xmin) * (W - PL - PR)
+
+    def sy(v):
+        return PT + (1 - (v - ymin) / (ymax - ymin)) * (H - PT - PB)
+
+    out = ['<svg viewBox="0 0 %d %d" width="%d" height="%d" '
+           'preserveAspectRatio="xMidYMid meet">' % (W, H, W, H)]
+    for i in range(4):
+        yv = ymin + (ymax - ymin) * i / 3
+        y = sy(yv)
+        out.append('<line class="grid-line" x1="%d" y1="%.3f" x2="%d" y2="%.3f"/>'
+                   % (PL, y, W - PR, y))
+        out.append('<text class="axis-txt" x="%d" y="%.3f" text-anchor="end">%s</text>'
+                   % (PL - 5, y + 3, _e(_fmt(yv))))
+    for xv in _xticks(xmin, xmax, 5):
+        x = sx(xv)
+        if xmin < xv < xmax:
+            out.append('<line class="grid-line" x1="%.3f" y1="%d" x2="%.3f" y2="%d"/>'
+                       % (x, PT, x, H - PB))
+        out.append('<text class="axis-txt" x="%.3f" y="%d" text-anchor="middle">%s</text>'
+                   % (x, H - 8, _e(str(xv))))
+    for s in series_list:
+        d = " ".join(("L" if i else "M") + "%.1f %.1f" % (sx(p[0]), sy(p[1]))
+                     for i, p in enumerate(s["points"]))
+        out.append('<path class="plot" d="%s" stroke="%s"/>' % (d, s["color"]))
+    out.append("</svg>")
+    return "".join(out)
+
+
+def _chart_box(name, series_list, multi):
+    cur = ("" if multi else
+           '<span class="cur">last %s</span>'
+           % _e(_fmt(series_list[0]["points"][-1][1])))
+    return ('<div class="chart"><div class="title"><span>%s</span>%s</div>'
+            '<div class="svg-holder">%s</div></div>'
+            % (_e(name), cur, _svg_chart(series_list)))
+
+
+def _split_scales(series_list):
+    """Port of the JS ``splitScales()`` -- true when series sit on incomparable
+    y-scales and should each get their own chart rather than be overlaid."""
+    if len(series_list) < 2:
+        return False
+    ulo = float("inf"); uhi = float("-inf"); spans = []
+    for s in series_list:
+        lo = float("inf"); hi = float("-inf")
+        for p in s["points"]:
+            lo = min(lo, p[1]); hi = max(hi, p[1])
+        ulo = min(ulo, lo); uhi = max(uhi, hi)
+        spans.append(hi - lo)
+    union = uhi - ulo
+    nz = [sp for sp in spans if sp > 0]
+    if not (union > 0) or not nz:
+        return False
+    return min(nz) / union < 0.10
+
+
+def _charts_html(runs, multi):
+    group_order = ["train", "eval", "perf"]
+    metric_names = _union_keys([r["series"] for r in runs])
+    groups = {}
+    for k in metric_names:
+        g = k.split("/")[0] if "/" in k else "other"
+        groups.setdefault(g, []).append(k)
+
+    def gkey(g):
+        return (group_order.index(g) if g in group_order else 99, g)
+
+    out = []
+    for g in sorted(groups, key=gkey):
+        for metric in sorted(groups[g]):
+            series_list = []
+            for r in runs:
+                pts = [p for p in r["series"].get(metric, []) if p[0] is not None]
+                if pts:
+                    series_list.append({"label": r["meta"]["label"],
+                                        "color": r["color"], "points": pts})
+            if not series_list:
+                continue
+            if multi and _split_scales(series_list):
+                for s in series_list:
+                    out.append(_chart_box(metric + " — " + s["label"], [s], False))
+            else:
+                out.append(_chart_box(metric, series_list, multi))
+    return "".join(out) or '<div class="sub">no metrics logged</div>'
+
+
+def _summary_html(runs, multi):
+    if not multi:
+        sm = runs[0]["summary"] or {}
+        if not sm:
+            return ""
+        cards = "".join(
+            '<div class="card"><div class="k">%s</div><div class="v">%s</div></div>'
+            % (_e(k), _e(_fmt(sm[k]))) for k in sm)
+        return '<div class="cards">%s</div>' % cards
+    skeys = _union_keys([r["summary"] for r in runs])
+    if not skeys:
+        return ""
+    head = ('<tr><th class="k"></th>'
+            + "".join('<th>%s<span>%s</span></th>' % (_sw(r["color"]), _e(r["meta"]["label"]))
+                      for r in runs) + "</tr>")
+    rows = "".join(
+        '<tr><td class="k">%s</td>%s</tr>'
+        % (_e(k), "".join('<td>%s</td>' % _e(_fmt((r["summary"] or {}).get(k)))
+                          for r in runs))
+        for k in skeys)
+    return '<div class="cmp-wrap"><table class="cmp">%s%s</table></div>' % (head, rows)
+
+
+def _config_html(runs, multi):
+    if not multi:
+        cfg = runs[0]["config"] or {}
+        rows = "".join(
+            '<tr><td class="k">%s</td><td class="v">%s</td></tr>'
+            % (_e(k), _e(_fmt(cfg[k]))) for k in cfg)
+        return '<div class="cfg-wrap"><table class="cfg">%s</table></div>' % rows
+    ckeys = _union_keys([r["config"] for r in runs])
+    head = ('<tr><th class="k"></th>'
+            + "".join('<th>%s<span>%s</span></th>' % (_sw(r["color"]), _e(r["meta"]["label"]))
+                      for r in runs) + "</tr>")
+    rows = []
+    for k in ckeys:
+        vals = [(r["config"] or {}).get(k) for r in runs]
+        differ = any(json.dumps(v, sort_keys=True) != json.dumps(vals[0], sort_keys=True)
+                     for v in vals)
+        cells = "".join('<td>%s</td>' % _e(_fmt(v)) for v in vals)
+        rows.append('<tr%s><td class="k">%s</td>%s</tr>'
+                    % (' class="diff"' if differ else "", _e(k), cells))
+    return ('<div class="cmp-wrap"><table class="cmp">%s%s</table></div>'
+            % (head, "".join(rows)))
+
+
+def _header_sections(runs, multi):
+    """Return (title, subtitle_html, legend_html) mirroring the JS header code."""
+    if multi:
+        chips = ""
+        for r in runs:
+            st = (r["meta"].get("status") or "").lower()
+            badge = '<span class="badge b-%s">%s</span>' % (_e(st), _e(st)) if st else ""
+            chips += ('<span class="chip">%s<span>%s</span>%s</span>'
+                      % (_sw(r["color"]), _e(r["meta"]["label"]), badge))
+        return "Comparison — %d runs" % len(runs), "", '<div class="legend">%s</div>' % chips
+    m = runs[0]["meta"]
+    cfg0 = runs[0]["config"] or {}
+    status = (m.get("status") or "running").lower()
+    dur = None
+    if m.get("started") and m.get("finished"):
+        try:
+            dur = round((datetime.datetime.fromisoformat(m["finished"])
+                         - datetime.datetime.fromisoformat(m["started"])).total_seconds())
+        except ValueError:
+            dur = None
+    parts = [cfg0.get("model") or cfg0.get("model_name") or "",
+             ("started " + m["started"].replace("T", " ")) if m.get("started") else "",
+             ("%ds wall" % dur) if dur is not None else ""]
+    sub = "  ·  ".join(p for p in parts if p) + "  "
+    subtitle = _e(sub) + '<span class="badge b-%s">%s</span>' % (_e(status), _e(status))
+    return (m.get("run_name") or "training run"), subtitle, ""
+
+
+def _static_sections(runs_raw):
+    """Pre-render every JS-populated container to static HTML. Mirrors the JS
+    ``prep()`` (per-run color + duplicate-label disambiguation) then each render
+    branch. Returns the {token: html} map injected by ``_write_html``."""
+    runs = []
+    for i, r in enumerate(runs_raw):
+        runs.append({"meta": dict(r.get("meta") or {}), "config": r.get("config") or {},
+                     "summary": r.get("summary") or {}, "series": r.get("series") or {},
+                     "color": _PALETTE[i % len(_PALETTE)]})
+    seen = {}
+    for r in runs:
+        base = r["meta"].get("label") or r["meta"].get("run_name") or "run"
+        seen[base] = seen.get(base, 0) + 1
+        r["meta"]["label"] = base + " #" + str(seen[base]) if seen[base] > 1 else base
+    if not runs:  # nothing to draw; leave containers empty
+        return {k: "" for k in ("__STATIC_TITLE__", "__STATIC_SUBTITLE__",
+                                "__STATIC_LEGEND__", "__STATIC_SUMMARY__",
+                                "__STATIC_CHARTS__", "__STATIC_CONFIG__")}
+    multi = len(runs) > 1
+    title, subtitle, legend = _header_sections(runs, multi)
+    return {
+        "__STATIC_TITLE__": _e(title),
+        "__STATIC_SUBTITLE__": subtitle,
+        "__STATIC_LEGEND__": legend,
+        "__STATIC_SUMMARY__": _summary_html(runs, multi),
+        "__STATIC_CHARTS__": _charts_html(runs, multi),
+        "__STATIC_CONFIG__": _config_html(runs, multi),
+    }
+
+
 def _write_html(payload, out_path):
     html = _HTML_TEMPLATE.replace(
         "/*__DATA__*/", json.dumps(payload, separators=(",", ":")))
+    for token, frag in _static_sections(payload.get("runs") or []).items():
+        html = html.replace(token, frag)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
     return out_path
@@ -260,8 +551,10 @@ _HTML_TEMPLATE = r"""<!doctype html>
     --muted: #8a93a0; --grid: #21262e; --accent: #60a5fa;
   }
   * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   body {
     margin: 0; background: var(--bg); color: var(--fg);
+    overflow-x: hidden;
     font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
   .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 80px; }
@@ -279,21 +572,21 @@ _HTML_TEMPLATE = r"""<!doctype html>
   .chip { display: inline-flex; align-items: center; gap: 7px; background: var(--panel);
           border: 1px solid var(--border); border-radius: 999px; padding: 4px 12px; font-size: 13px; }
   .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; flex: none; }
-  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px,1fr));
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(150px,100%),1fr));
            gap: 10px; margin: 8px 0 4px; }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
           padding: 11px 13px; }
   .card .k { color: var(--muted); font-size: 12px; }
   .card .v { font-size: 18px; font-weight: 600; margin-top: 2px;
              font-variant-numeric: tabular-nums; word-break: break-word; }
-  .charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px,1fr)); gap: 14px; }
+  .charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(340px,100%),1fr)); gap: 14px; }
   .chart { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
            padding: 12px 12px 6px; }
   .chart .title { font-size: 13px; font-weight: 600; margin-bottom: 2px;
                   display: flex; justify-content: space-between; align-items: baseline; }
   .chart .cur { color: var(--muted); font-weight: 400; font-variant-numeric: tabular-nums; }
   .svg-holder { position: relative; }
-  svg { width: 100%; display: block; }
+  svg { width: 100%; height: auto; display: block; }
   .grid-line { stroke: var(--grid); stroke-width: 1; }
   .axis-txt { fill: var(--muted); font-size: 10px; }
   .plot { fill: none; stroke-width: 1.6; }
@@ -311,13 +604,14 @@ _HTML_TEMPLATE = r"""<!doctype html>
   table.cfg td.v { font-variant-numeric: tabular-nums; word-break: break-word; }
   .cfg-wrap { columns: 2; column-gap: 34px; }
   @media (max-width: 640px) { .cfg-wrap { columns: 1; } }
-  .cmp-wrap { overflow-x: auto; }
+  .cmp-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
   table.cmp th, table.cmp td { border-bottom: 1px solid var(--border); padding: 6px 16px 6px 0;
                                text-align: left; font-variant-numeric: tabular-nums; vertical-align: top; }
   table.cmp th { color: var(--fg); font-weight: 600; }
   table.cmp td.k, table.cmp th.k { color: var(--muted); font-weight: 400; white-space: nowrap; }
   table.cmp th .sw { margin-right: 6px; }
-  tr.diff td { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  tr.diff td { background: rgba(96,165,250,.12);  /* fallback for iOS < 16.2 (no color-mix) */
+               background: color-mix(in srgb, var(--accent) 10%, transparent); }
   .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; }
   .tbtn { font: inherit; font-size: 13px; cursor: pointer; background: var(--panel);
           color: var(--fg); border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px; }
@@ -328,9 +622,9 @@ _HTML_TEMPLATE = r"""<!doctype html>
 <body>
 <div class="wrap">
   <header>
-    <h1 id="title"></h1>
-    <div class="sub" id="subtitle"></div>
-    <div id="legend"></div>
+    <h1 id="title">__STATIC_TITLE__</h1>
+    <div class="sub" id="subtitle">__STATIC_SUBTITLE__</div>
+    <div id="legend">__STATIC_LEGEND__</div>
     <div class="toolbar">
       <button id="importBtn" class="tbtn" type="button">＋ Overlay another report…</button>
       <button id="resetBtn" class="tbtn" type="button" hidden>Reset</button>
@@ -338,11 +632,11 @@ _HTML_TEMPLATE = r"""<!doctype html>
       <span class="sub" id="importMsg"></span>
     </div>
   </header>
-  <div id="summary"></div>
+  <div id="summary">__STATIC_SUMMARY__</div>
   <h2>metrics</h2>
-  <div class="charts" id="charts"></div>
+  <div class="charts" id="charts">__STATIC_CHARTS__</div>
   <h2>config</h2>
-  <div id="config"></div>
+  <div id="config">__STATIC_CONFIG__</div>
 </div>
 <script>
 const DATA = /*__DATA__*/;
@@ -475,7 +769,7 @@ function chart(name, seriesList, multi) {
   const sx = v => PL + (v - xmin) / (xmax - xmin) * (W - PL - PR);
   const sy = v => PT + (1 - (v - ymin) / (ymax - ymin)) * (H - PT - PB);
 
-  const svg = el("svg", {viewBox: `0 0 ${W} ${H}`});
+  const svg = el("svg", {viewBox: `0 0 ${W} ${H}`, width: W, height: H, preserveAspectRatio: "xMidYMid meet"});
   for (let i = 0; i <= 3; i++) {
     const yv = ymin + (ymax - ymin) * i / 3, y = sy(yv);
     svg.appendChild(el("line", {class: "grid-line", x1: PL, y1: y, x2: W - PR, y2: y}));
