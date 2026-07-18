@@ -244,8 +244,8 @@ def compare_reports(out_dirs, output_path=None, labels=None):
 # series}, ...]}. One run -> single-run report (summary cards); several runs ->
 # overlay-comparison report (legend + one line per run per chart, per-run
 # summary/config columns). Charts are drawn to SVG by the vanilla JS below -- no
-# external requests, so the file works offline and hosts anywhere. Light/dark
-# follow the viewer's OS preference.
+# external requests, so the file works offline and hosts anywhere. Always dark
+# (single-run and comparison pages share this one template, so they match).
 # --------------------------------------------------------------------------- #
 _HTML_TEMPLATE = r"""<!doctype html>
 <html lang="en">
@@ -255,14 +255,9 @@ _HTML_TEMPLATE = r"""<!doctype html>
 <title>training run report</title>
 <style>
   :root {
-    --bg: #ffffff; --panel: #f7f8fa; --border: #e3e6ea; --fg: #1a1d21;
-    --muted: #6b7280; --grid: #eceef1; --accent: #2563eb;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #0f1216; --panel: #171b21; --border: #262b33; --fg: #e6e9ee;
-      --muted: #8a93a0; --grid: #21262e; --accent: #60a5fa;
-    }
+    color-scheme: dark;
+    --bg: #0f1216; --panel: #171b21; --border: #262b33; --fg: #e6e9ee;
+    --muted: #8a93a0; --grid: #21262e; --accent: #60a5fa;
   }
   * { box-sizing: border-box; }
   body {
@@ -542,6 +537,26 @@ function chart(name, seriesList, multi) {
   return box;
 }
 
+  // A metric whose per-run series sit on incomparable scales (e.g. SFT CE loss
+  // ~3.4 vs the EBFT composite RL+γCE loss ~0.1) is split into one chart per
+  // run instead of overlaid: the union y-range would flatten every line.
+  // "Incomparable" = the smallest varying series' own span is under 10% of the
+  // union span. All-constant series (flat lr lines etc.) always overlay.
+  function splitScales(seriesList) {
+    if (seriesList.length < 2) return false;
+    let ulo = Infinity, uhi = -Infinity;
+    const spans = seriesList.map(s => {
+      let lo = Infinity, hi = -Infinity;
+      s.points.forEach(p => { if (p[1] < lo) lo = p[1]; if (p[1] > hi) hi = p[1]; });
+      if (lo < ulo) ulo = lo; if (hi > uhi) uhi = hi;
+      return hi - lo;
+    });
+    const union = uhi - ulo;
+    const nz = spans.filter(sp => sp > 0);
+    if (!(union > 0) || !nz.length) return false;
+    return Math.min(...nz) / union < 0.10;
+  }
+
   // charts: metric union across runs, grouped by prefix; chart() recomputes
   // its own x/y domains from the union of series handed to it.
   const groupOrder = ["train", "eval", "perf"];
@@ -563,7 +578,11 @@ function chart(name, seriesList, multi) {
         const pts = (r.series[metric] || []).filter(p => p[0] !== null && p[0] !== undefined);
         if (pts.length) seriesList.push({label: r.meta.label, color: r.color, points: pts});
       });
-      if (seriesList.length) chartsRoot.appendChild(chart(metric, seriesList, MULTI));
+      if (!seriesList.length) return;
+      if (MULTI && splitScales(seriesList))
+        seriesList.forEach(s => chartsRoot.appendChild(chart(metric + " — " + s.label, [s], false)));
+      else
+        chartsRoot.appendChild(chart(metric, seriesList, MULTI));
     });
   });
   if (!chartsRoot.children.length)
