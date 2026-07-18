@@ -49,8 +49,10 @@ from qlora_train_native import (  # noqa: E402
     resolve_steps_and_warmup, ThroughputMeter, StepTimer, append_run_log,
     checkpoint_dir, prune_checkpoints,
     save_trainer_state, load_trainer_state, restore_optimizer_state,
-    _FAIL_CTX, _log_failure,
+    format_prompt_and_eot, sample,
+    _FAIL_CTX, _log_failure, _REPORT, _finish_report,
 )
+from run_report import RunLogger  # noqa: E402
 
 from exllamav3 import Config, Model, Tokenizer  # noqa: E402
 from exllamav3.training.native_llama import NativeLlamaQLoRA  # noqa: E402
@@ -116,6 +118,26 @@ def _run_main():
                          "input (frozen base path never dropped; train-time "
                          "only). Per-rank RNG, so DDP ranks draw independent "
                          "masks -- same as PEFT under DDP.")
+    ap.add_argument("--use-rslora", action="store_true",
+                    help="Rank-stabilized LoRA scaling: scale = alpha/sqrt(r) "
+                         "instead of alpha/r (see the single-GPU arm).")
+    ap.add_argument("--init-lora", choices=["default", "pissa", "qerr", "eva"],
+                    default="default",
+                    help="Adapter initialization (see the single-GPU arm). Under "
+                         "DDP the init is computed ON RANK 0 ONLY (randomized SVD "
+                         "is not deterministic across processes) and broadcast; "
+                         "for pissa the frozen A0/B0 offsets -- part of every "
+                         "forward -- are broadcast too, so all ranks compute "
+                         "identical losses.")
+    ap.add_argument("--init-svd-niter", type=int, default=16,
+                    help="Randomized-SVD subspace iterations for --init-lora "
+                         "(0 = exact full SVD, much slower). Default 16.")
+    ap.add_argument("--init-ref-model", default=None,
+                    help="ORIGINAL (unquantized) HF model dir; required by "
+                         "--init-lora qerr.")
+    ap.add_argument("--init-eva-tokens", type=int, default=65536,
+                    help="Token budget for the --init-lora eva activation "
+                         "pre-pass (rank 0 only; result is broadcast).")
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--weight-decay", type=float, default=0.01,
                     help="AdamW weight decay on the LoRA params (default 0.01).")
@@ -288,6 +310,19 @@ def _run_main():
                     help="With --resume, restore weights only and start the "
                          "optimizer/schedule/step fresh (use when changing "
                          "LR/schedule or the GPU count).")
+    ap.add_argument("--sample-every", type=int, default=0,
+                    help="Generate a sample completion every N steps (rank 0 "
+                         "generates, all ranks barrier so lockstep is kept; 0 "
+                         "disables -- note the single-GPU arm defaults to 25).")
+    ap.add_argument("--sample-prompt", default="Tell me about your day.")
+    ap.add_argument("--no-report", action="store_true",
+                    help="Disable the local run report. By default every run "
+                         "with an --out writes a self-contained report to "
+                         "<out>/run_report/report.html (rank 0 only; same "
+                         "format as the single-GPU arm).")
+    ap.add_argument("--run-name", default=None,
+                    help="Name for the local run report (defaults to the "
+                         "basename of --out).")
     ap.add_argument("--run-log", default="qlora_runs.csv",
                     help="Append one metadata row per run to this CSV (rank 0 only). "
                          "Same schema as the single-GPU arm; failures are recorded "
@@ -333,7 +368,10 @@ def _run_main():
             "dataset": args.dataset, "eval_split": args.eval_split or "",
             "eval_dataset": args.eval_dataset or "",
             "eval2_dataset": args.eval2_dataset or "",
-            "r": args.r, "alpha": args.alpha, "lr": args.lr,
+            "r": args.r, "alpha": args.alpha,
+            "expert_r": "" if args.expert_r is None else args.expert_r,
+            "use_rslora": int(bool(args.use_rslora)), "init_lora": args.init_lora,
+            "lr": args.lr,
             "scheduler": args.scheduler, "weight_decay": args.weight_decay,
             "batch": args.batch, "grad_accum": args.grad_accum,
             "world_size": world_size,
@@ -359,6 +397,13 @@ def _run_main():
     _FAIL_CTX["phase"] = "load_model"
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
+    # KV cache for live samples: must exist BEFORE model.load() so attention
+    # layers allocate their cache pages. Rank 0 only -- it's the only rank that
+    # generates (the others barrier), and the cache costs VRAM.
+    cache = None
+    if args.sample_every and is_main(rank):
+        from exllamav3 import Cache
+        cache = Cache(model, max_num_tokens=4096)
     model.load(device=device, progressbar=is_main(rank))
     tokenizer = Tokenizer.from_config(config)
     pad_id = tokenizer.pad_token_id
@@ -371,6 +416,7 @@ def _run_main():
         _FAIL_CTX["record"]["arch"] = getattr(config, "architecture", "")
     net = NativeLlamaQLoRA(
         model, r=args.r, alpha=args.alpha, target_modules=args.targets,
+        use_rslora=args.use_rslora,
         compute_dtype=cdt, gradient_checkpointing=not args.no_grad_ckpt,
         train_embeddings=args.train_embeddings, train_head=args.train_head,
         attn_impl=args.attn_impl, head_vocab_chunk=args.head_vocab_chunk,
@@ -389,18 +435,53 @@ def _run_main():
               f"{', +modules_to_save (' + str(sum(p.numel() for p in ms)) + ')' if ms else ''})")
         print(f" -- {net.describe_attn()}")
 
-    # 3a. Optionally resume from a checkpoint (e.g. stop a single-GPU run, then
+    # 3a. SVD-based LoRA init (pissa/qerr). Rank 0 ONLY: the fast-SVD recipe
+    #     (torch.svd_lowrank) is randomized and NOT deterministic across
+    #     processes, so every rank computing its own would silently diverge.
+    #     Rank 0's result reaches the other ranks via the 3c/3d broadcasts.
+    #     On resume this is recomputed and then OVERWRITTEN by load_adapter
+    #     below (pissa restores its exact offsets from the checkpoint sidecar)
+    #     -- a few wasted seconds on rank 0, kept for parity with the
+    #     single-GPU arm. (eva runs after the dataset is built -- it needs an
+    #     activation pre-pass.)
+    if args.init_lora in ("pissa", "qerr"):
+        _FAIL_CTX["phase"] = "init_lora"
+        if is_main(rank):
+            net.apply_init_lora(args.init_lora, ref_model_dir=args.init_ref_model,
+                                svd_niter=args.init_svd_niter)
+
+    # 3b. Optionally resume from a checkpoint (e.g. stop a single-GPU run, then
     #     continue on N GPUs). Every rank loads the same file; the broadcast below
     #     then guarantees bit-identical starting weights regardless.
     if args.resume:
         net.load_adapter(args.resume)
 
-    # 3b. Sync initial trainable weights from rank 0 so every rank starts
+    # 3c. Sync initial trainable weights from rank 0 so every rank starts
     #     identical (lora_a is random, lora_b zero; embed/head copies are
     #     identical already but broadcast for safety). Without this, ranks would
     #     diverge from step 1.
     for p in net.trainable_parameters():
         dist.broadcast(p.data, src=0)
+
+    # 3d. PiSSA's frozen A0/B0 offsets are part of EVERY forward (the wrappers
+    #     compute against the residual base W - s*A0@B0), so they must be
+    #     bit-identical across ranks too -- 3c only covers the trainable A/B.
+    #     Broadcast rank 0's fp32 masters (from the fresh SVD, or the resume
+    #     sidecar) and install them on the other ranks. set_init_offset also
+    #     refreshes the CPU masters, so a rank-0 save writes the same values.
+    if args.init_lora == "pissa":
+        for w in net._wrappers:
+            if w.r <= 0:
+                continue
+            if is_main(rank):
+                a0 = w.init_a0_master.to(device)
+                b0 = w.init_b0_master.to(device)
+            else:
+                a0 = torch.empty(w.lora_a.shape, dtype=torch.float32, device=device)
+                b0 = torch.empty(w.lora_b.shape, dtype=torch.float32, device=device)
+            dist.broadcast(a0, src=0)
+            dist.broadcast(b0, src=0)
+            w.set_init_offset(a0, b0)
 
     # 4. Data. Build the full set identically on every rank (same seed/order), then
     #    take a disjoint stride-shard so each GPU trains on different examples.
@@ -483,6 +564,34 @@ def _run_main():
                   f"blocks of {args.seq_len} tok ({100.0 * real_tokens / cap:.1f}% "
                   f"filled, ~{real_tokens / max(1, len(examples)):.0f} real tok/block)")
 
+    # eva init runs HERE (not with pissa/qerr above): it streams a no-grad
+    # activation pre-pass over the actual training batches. Rank 0 only (the
+    # incremental sketch uses randomized svd_lowrank -- not deterministic across
+    # processes); the examples list is identical on every rank so rank 0's
+    # pre-pass sees the same data a single-GPU run would. The other ranks wait
+    # in the broadcast below. Skipped on resume -- the checkpoint's A/B already
+    # carry the init, and unlike pissa there are no frozen offsets.
+    if args.init_lora == "eva" and not args.resume:
+        _FAIL_CTX["phase"] = "init_lora"
+        if is_main(rank):
+            def eva_prepass():
+                used, i = 0, 0
+                while used < args.init_eva_tokens and i < len(examples):
+                    batch = examples[i:i + args.batch]
+                    i += len(batch)
+                    input_ids, _, attn, pos_ids, seg_ids = collate(batch, pad_id)
+                    used += int(attn.sum())
+                    yield dict(input_ids=input_ids, attention_mask=attn,
+                               position_ids=pos_ids, seg_ids=seg_ids)
+
+            net.apply_init_lora("eva", svd_niter=args.init_svd_niter,
+                                eva_batches=eva_prepass())
+        for p in net.trainable_parameters():
+            dist.broadcast(p.data, src=0)
+    elif args.init_lora == "eva" and is_main(rank):
+        print(" -- eva init skipped on --resume (the checkpoint's adapters "
+              "already carry it)")
+
     shard = examples[rank::world_size]
     assert shard, "no training examples on this rank"
 
@@ -498,6 +607,37 @@ def _run_main():
         print(f" -- {args.steps} steps, eff_batch {eff_batch}, "
               f"scheduler={args.scheduler}, warmup={warmup_steps}, "
               f"weight_decay={args.weight_decay}")
+
+    # Local run report -- the DEFAULT logging path, rank 0 only (same format as
+    # the single-GPU arm; metrics stream to disk so a crash still renders).
+    # Registered in the shared _REPORT so _log_failure finishes it on a crash.
+    report = None
+    if is_main(rank) and args.out and not args.no_report:
+        run_config = dict(_FAIL_CTX["record"])
+        run_config.update(
+            steps_planned=args.steps, steps_per_epoch=args.steps_per_epoch,
+            warmup_steps=warmup_steps, targets=" ".join(net.target_modules),
+            trainable_params=net.num_trainable(), n_train=len(examples),
+            n_val=len(val_examples), n_eval2=len(val2_examples))
+        run_name = args.run_name or os.path.basename(os.path.normpath(args.out))
+        report = RunLogger(args.out, run_name, config=run_config)
+        _REPORT["rep"] = report
+
+    # Live-sample generator (rank 0 only; see --sample-every). The barrier keeps
+    # the other ranks in lockstep while rank 0 generates.
+    generator, build_prompt = None, None
+    if args.sample_every:
+        if is_main(rank):
+            from exllamav3 import Generator
+            build_prompt, _ = format_prompt_and_eot(model, tokenizer, args.prompt_format)
+            generator = Generator(model=model, cache=cache, tokenizer=tokenizer)
+            net.eval()
+            with torch.inference_mode():
+                base = sample(model, cache, tokenizer, generator, build_prompt,
+                              args.sample_prompt)
+            net.train()
+            print(f"\n\U0001f3ad  baseline (step 0): {args.sample_prompt}\n     -> {base}\n")
+        dist.barrier()
 
     opt = torch.optim.AdamW(net.param_groups(args.weight_decay), lr=args.lr)
     sched = make_lr_scheduler(opt, args.scheduler, args.steps, warmup_steps)
@@ -520,6 +660,32 @@ def _run_main():
         elif is_main(rank):
             print(f" -- {args.resume} has no trainer_state.pt; resuming weights "
                   f"only (cold optimizer + schedule from step 0).")
+
+    # |dB| telemetry baseline (rank 0 only -- it's the only rank that logs).
+    # Same rationale as the single-GPU arm: with an SVD init the raw ||B|| is
+    # dominated by the init component, so log the distance from init instead.
+    b0_refs = []
+    if is_main(rank):
+        with torch.no_grad():
+            for w in net._wrappers:
+                if w.r <= 0:
+                    continue
+                if w.init_b0_master is not None:
+                    b0_refs.append((w, w.init_b0_master))
+                elif args.init_lora != "default" and w.lora_b.abs().max().item() > 0:
+                    b0_refs.append((w, w.lora_b.detach().float().cpu().clone()))
+                else:
+                    b0_refs.append((w, None))
+
+    def adapter_b_norm():
+        with torch.no_grad():
+            tot = 0.0
+            for w, b0 in b0_refs:
+                if b0 is None:
+                    tot += w.lora_b.float().pow(2).sum().item()
+                else:
+                    tot += (w.lora_b.detach().float().cpu() - b0).pow(2).sum().item()
+            return tot ** 0.5
 
     def batches():
         order = list(range(len(shard)))
@@ -612,6 +778,11 @@ def _run_main():
             if start_eval2 is not None:
                 parts.append(f"{eval2_label} {start_eval2:.4f}")
             print("    [eval] step 0 (baseline): " + " | ".join(parts))
+            if report is not None:
+                base_eval = {k: v for k, v in (("eval/held_out", start_val),
+                                               ("eval/eval2", start_eval2))
+                             if v is not None}
+                report.log(base_eval, step=0)
 
     # Start the training timer + VRAM peak after the baseline eval.
     t0 = time.time()
@@ -632,7 +803,10 @@ def _run_main():
             "out": args.out, "dataset": args.dataset,
             "eval_split": args.eval_split or "", "eval_dataset": args.eval_dataset or "",
             "eval2_dataset": args.eval2_dataset or "",
-            "r": args.r, "alpha": args.alpha, "lr": args.lr,
+            "r": args.r, "alpha": args.alpha,
+            "expert_r": "" if args.expert_r is None else args.expert_r,
+            "use_rslora": int(bool(args.use_rslora)), "init_lora": args.init_lora,
+            "lr": args.lr,
             "scheduler": args.scheduler, "warmup_steps": warmup_steps,
             "weight_decay": args.weight_decay, "batch": args.batch,
             "grad_accum": args.grad_accum, "world_size": world_size,
@@ -751,12 +925,26 @@ def _run_main():
             _, tot_tps = meter.rates()
             ema = global_loss if ema is None else 0.9 * ema + 0.1 * global_loss
             if is_main(rank):
+                epoch_now = step / args.steps_per_epoch
+                cur_lr = sched.get_last_lr()[0]
+                b_dist = adapter_b_norm()
                 print(f"  step {step:>5}/{args.steps} | "
-                      f"ep {step / args.steps_per_epoch:.2f}/{epochs_total:.4g} | "
+                      f"ep {epoch_now:.2f}/{epochs_total:.4g} | "
                       f"loss {global_loss:6.4f} | "
                       f"ema {ema:6.4f} | grad {gnorm:7.4f} | "
-                      f"lr {sched.get_last_lr()[0]:.2e} | "
+                      f"lr {cur_lr:.2e} | |dB| {b_dist:7.3f} | "
                       f"~{tot_tps * world_size:,.0f} tok/s | {timer.step_line()}")
+                if report is not None:
+                    sup_tps, _ = meter.rates()
+                    report.log({
+                        "train/loss": global_loss, "train/ema": ema,
+                        "train/grad_norm": gnorm, "train/lr": cur_lr,
+                        "train/adapter_b_dist": b_dist, "train/epoch": epoch_now,
+                        # This rank's rates x world_size -- an aggregate estimate
+                        # (shards are balanced); the final [PERF] line is exact.
+                        "perf/sup_tok_s": sup_tps * world_size,
+                        "perf/tot_tok_s": tot_tps * world_size,
+                    }, step=step)
                 # Keep the failure record current (steps reached, loss, memory).
                 _FAIL_CTX["record"].update(
                     steps_done=step, end_loss=round(global_loss, 6),
@@ -798,6 +986,27 @@ def _run_main():
                     best_val_step = step
                     if args.save_best:
                         save(f"[best step {step}, val {vl:.4f}]")
+                if is_main(rank) and report is not None:
+                    eval_metrics = {k: v for k, v in (("eval/held_out", vl),
+                                                      ("eval/eval2", v2))
+                                    if v is not None}
+                    if vl is not None:
+                        eval_metrics["eval/best_val"] = best_val
+                    report.log(eval_metrics, step=step)
+
+            if args.sample_every and step % args.sample_every == 0:
+                # Rank 0 generates through the native path; everyone else waits
+                # at the barrier so the next step's collectives stay lockstep.
+                if is_main(rank):
+                    net.eval()
+                    net.apply_to_native()  # make generation reflect the adapter
+                    with torch.inference_mode():
+                        txt = sample(model, cache, tokenizer, generator,
+                                     build_prompt, args.sample_prompt)
+                    net.remove_from_native()
+                    net.train()
+                    print(f"\n  \U0001f3ad  [step {step}] {args.sample_prompt}\n     -> {txt}\n")
+                dist.barrier()
 
             if args.save_every and step % args.save_every == 0:
                 save(f"[checkpoint step {step}]")
@@ -864,6 +1073,18 @@ def _run_main():
     # Record the run (rank 0 only, inside log_run) with all-reduced tok/s totals.
     log_run(status, dt, val_loss, val2_loss,
             tok_t[0].item() / dt if dt else 0, tok_t[1].item() / dt if dt else 0)
+    if report is not None:
+        final_summary = {k: v for k, v in {
+            "end_loss": end_loss, "final_val": val_loss, "final_eval2": val2_loss,
+            "best_val": best_val if best_val != float("inf") else None,
+            "best_val_step": best_val_step or None,
+            "peak_vram_gb": torch.cuda.max_memory_allocated(device) / 1e9,
+            "sup_tok_s": tok_t[0].item() / dt if dt else 0,
+            "tot_tok_s": tok_t[1].item() / dt if dt else 0,
+            "total_s": dt, "steps_done": step,
+        }.items() if v is not None}
+        report.update_summary(final_summary)
+        _finish_report(status=status)
     dist.destroy_process_group()
 
 

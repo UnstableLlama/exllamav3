@@ -60,18 +60,20 @@ COMMON_KEYS = {
     "eval2_dataset", "eval2_split", "eval2_config",
     "eval2_text_key", "eval2_max_samples", "eval2_max_blocks", "val_frac",
     "eval_every", "save_best", "run_log",
+    # Ported to the DDP backend (Session 44): init computed on rank 0 and
+    # broadcast; report/samples are rank-0-only there.
+    "use_rslora", "init_lora", "init_svd_niter", "init_ref_model",
+    "init_eva_tokens",
+    "sample_every", "sample_prompt",
+    "no_report", "run_name",
 }
 SINGLE_ONLY_KEYS = {
     "device", "parallel", "reserve_per_device", "use_per_device", "split_even", "optim",
     "inspect", "lora_embed", "lora_head", "offload_embed_head_optim",
     "offload_activations", "offload_mode", "vram_spillover", "use_liger",
-    "sample_every", "sample_prompt",
-    "use_rslora", "init_lora", "init_svd_niter", "init_ref_model",
-    "init_eva_tokens",
     "quant_aware", "quant_aware_scale", "quant_aware_ref_model",
     "torch_profile",   # torch.profiler window; DDP backend has no such flag
     "wandb_project", "wandb_run_name", "wandb_entity",  # not mirrored to DDP yet
-    "no_report", "run_name",   # local run report; native single/split + ebft, not DDP
 }
 DDP_ONLY_KEYS = set()
 
@@ -139,21 +141,12 @@ SINGLE_ONLY_DEFAULTS = {
     "offload_mode": "async",
     "vram_spillover": False,
     "use_liger": False,
-    "sample_every": 25,
-    "sample_prompt": "Tell me about your day.",
-    "use_rslora": False,
-    "init_lora": "default",
-    "init_svd_niter": 16,
-    "init_ref_model": None,
-    "init_eva_tokens": 65536,
     "quant_aware": "none",
     "quant_aware_scale": 1.0,
     "quant_aware_ref_model": None,
     "wandb_project": "",
     "wandb_run_name": "",
     "wandb_entity": "",
-    "no_report": False,
-    "run_name": "",
 }
 
 

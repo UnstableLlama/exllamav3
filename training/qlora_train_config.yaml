@@ -94,7 +94,7 @@ lora_dropout: 0.0         # PEFT-style dropout on each LoRA branch's input (typi
                           #   Mild regularizer for small datasets / many epochs. Train-time only
                           #   (eval and inference are exact); frozen base path never dropped; not
                           #   applied to embed/head adapters; incompatible with quant_aware: ste
-use_rslora: false         # single/split only; scale = alpha/sqrt(r) -- keeps the effective scale
+use_rslora: false         # scale = alpha/sqrt(r) -- keeps the effective scale
                           #   stable when sweeping r (at fixed r it's just an alpha rescale)
 targets: null             # target module leaf names; null = default attn+mlp projections
                           #   (q/k/v/o_proj + gate/up/down_proj); [] = no per-linear LoRA (for
@@ -105,8 +105,10 @@ expert_r: null            # rank for ROUTED-expert adapters when it should diffe
                           #   adapter pair per expert per layer, so on a many-expert model use a
                           #   small value (PEFT's MoE recipe: ~r/num_experts, min 1). null = same as r
 
-# Adapter initialization (single/split only). Gate ANY non-default init with
-# qlora_validate_native.py --init-lora <mode> before a long run.
+# Adapter initialization. Gate ANY non-default init with
+# qlora_validate_native.py --init-lora <mode> before a long run. Under
+# parallel: ddp the init is computed on rank 0 and broadcast (pissa's frozen
+# A0/B0 offsets included), so all ranks hold identical state.
 init_lora: default        # default: kaiming A / zero B (step 0 = exact base model).
                           #   pissa: top-r principal components of the frozen base.
                           #   qerr:  top-r SVD of the quantization error vs the ORIGINAL model
@@ -318,7 +320,9 @@ lora_head: false          # rank-r LoRA on the LM head instead (tiny params; mem
 # Sampling / checkpoints / resume
 # ---------------------------------------------------------------------------
 sample_every: 25          # generate a live sample every N steps (0 = off; also skips creating the
-                          #   generation KV cache -- a small VRAM saving). Works for method: sft AND
+                          #   generation KV cache -- a small VRAM saving). Under parallel: ddp rank 0
+                          #   generates while the other ranks barrier (that backend defaults to 0).
+                          #   Works for method: sft AND
                           #   method: ebft (both use the native inference path with the current
                           #   adapter installed). On method: ebft with rollout_sampler: native it
                           #   reuses the rollout generator; on MoE LoRA the preview shows the BASE
@@ -358,13 +362,14 @@ val_frac: 0.0             # no eval_split? carve this fraction off train as held
 eval_every: 0             # report held-out loss every N steps (0 = only at the end)
 save_best: false          # save only when the PRIMARY held-out loss improves
 run_log: qlora_runs.csv   # CSV run log (one row per run: hyperparams, losses, tok/s, peak VRAM)
-no_report: false          # single/split + ebft: the local run report is the DEFAULT logging path --
+no_report: false          # the local run report is the DEFAULT logging path (all backends; rank 0
+                          #   writes it under parallel: ddp) --
                           #   a self-contained HTML dashboard (config + per-step metrics + evals +
                           #   summary, inline SVG charts, no account) at <out>/run_report/report.html.
                           #   true = off. Overlay two runs (e.g. SFT vs EBFT) with:
                           #   python training/run_report.py <outA> <outB> --labels A,B -o cmp.html
 run_name: null            # title for that report / its compare-legend label (default: basename of
-                          #   `out`). Independent of wandb; not supported under parallel: ddp
+                          #   `out`). Independent of wandb
 wandb_project: null       # single/split only: log to Weights & Biases under this project (null/
                           #   empty = off). Per-step loss/ema/grad/lr/|dB|/tok-s/epoch + eval
                           #   losses + final summary; run config mirrors the run-log CSV row
