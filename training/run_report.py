@@ -617,6 +617,14 @@ _HTML_TEMPLATE = r"""<!doctype html>
           color: var(--fg); border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px; }
   .tbtn:hover { border-color: var(--accent); }
   #importMsg { margin-left: 2px; }
+  .resume-panel { display: flex; flex-direction: column; gap: 8px; margin-top: 10px;
+                  padding: 10px 12px; background: var(--panel); border: 1px solid var(--border);
+                  border-radius: 8px; }
+  .resume-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 13px; }
+  .resume-row .rl { font-weight: 600; }
+  .resume-panel select, .resume-panel input { font: inherit; font-size: 13px; background: var(--bg);
+        color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; }
+  .resume-panel input[type=number] { width: 96px; }
 </style>
 </head>
 <body>
@@ -631,6 +639,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       <input id="importInput" type="file" accept=".html,text/html" multiple hidden>
       <span class="sub" id="importMsg"></span>
     </div>
+    <div id="resumePanel" class="resume-panel" hidden></div>
   </header>
   <div id="summary">__STATIC_SUMMARY__</div>
   <h2>metrics</h2>
@@ -941,25 +950,111 @@ function extractRuns(text) {
   if (!runs.length) throw new Error("no runs in file");
   return runs;
 }
+// step range actually present in a run's series (across every metric)
+function stepBounds(run) {
+  let lo = Infinity, hi = -Infinity;
+  Object.values(run.series || {}).forEach(pts => pts.forEach(p => {
+    if (p[0] < lo) lo = p[0]; if (p[0] > hi) hi = p[0];
+  }));
+  return [lo, hi];
+}
+// "(epoch X.XX)" if the base run logged steps_per_epoch, else ""
+function epochHint(baseRun, step) {
+  const spe = baseRun.config && baseRun.config.steps_per_epoch;
+  return (spe && spe > 0) ? " (epoch " + (step / spe).toFixed(2) + ")" : "";
+}
+// shift every point's x (step) by off, in place
+function applyStepOffset(run, off) {
+  if (!off) return;
+  const s = run.series || {};
+  Object.keys(s).forEach(k => { s[k] = s[k].map(p => [p[0] + off, p[1]]); });
+}
+
+// Ask, per imported run, whether it CONTINUES a currently-shown run and at which
+// step -- then splice it in with its x-axis shifted so its first point lands on
+// that join step (robust whether the resumed trainer reset its step counter to 0
+// or kept counting). A shared metric like eval/held_out then draws as one
+// continuous curve across the SFT->EBFT join.
+const resumePanel = document.getElementById("resumePanel");
+function showResumeLinker(pending, errs) {
+  clear(resumePanel); resumePanel.hidden = false;
+  const existing = RUNS.slice();  // candidate base runs, frozen at prompt time
+  pending.forEach(pr => {
+    const [plo] = stepBounds(pr);
+    const row = el("div", {class: "resume-row"});
+    row.appendChild(el("span", {class: "rl", text: (pr.meta && pr.meta.label) || "imported run"}));
+    const sel = el("select", {});
+    sel.appendChild(el("option", {value: "-1", text: "— standalone (no resume) —"}));
+    existing.forEach((r, i) => sel.appendChild(el("option", {value: String(i), text: "continues " + r.meta.label})));
+    const stepIn = el("input", {type: "number", step: "1", disabled: "", placeholder: "join step"});
+    const hint = el("span", {class: "sub"});
+    function refresh() {
+      const bi = parseInt(sel.value, 10);
+      if (bi < 0) { stepIn.disabled = true; stepIn.value = ""; hint.textContent = ""; return; }
+      stepIn.disabled = false;
+      if (stepIn.value === "") stepIn.value = String(stepBounds(existing[bi])[1]);
+      hint.textContent = epochHint(existing[bi], parseFloat(stepIn.value) || 0);
+    }
+    sel.addEventListener("change", refresh);
+    stepIn.addEventListener("input", refresh);
+    row.appendChild(sel);
+    row.appendChild(el("span", {class: "sub", text: "at step"}));
+    row.appendChild(stepIn); row.appendChild(hint);
+    row._pr = pr; row._sel = sel; row._stepIn = stepIn; row._plo = plo; row._existing = existing;
+    resumePanel.appendChild(row);
+  });
+  const apply = el("button", {class: "tbtn", type: "button", text: "Add to chart"});
+  apply.addEventListener("click", () => {
+    resumePanel.querySelectorAll(".resume-row").forEach(row => {
+      const bi = parseInt(row._sel.value, 10);
+      if (bi >= 0) {
+        const join = parseFloat(row._stepIn.value) || 0;
+        applyStepOffset(row._pr, join - row._plo);  // land first point on the join step
+        const base = row._existing[bi];
+        row._pr.meta = row._pr.meta || {};
+        row._pr.meta.label = ((row._pr.meta.label) || "run") + " ↳@" + join;
+        row._pr.meta.resume_of = base.meta.label; row._pr.meta.resume_at = join;
+      }
+      RUNS.push(row._pr);
+    });
+    resumePanel.hidden = true; clear(resumePanel);
+    rerender();
+    document.getElementById("importMsg").textContent = "";
+  });
+  const cancel = el("button", {class: "tbtn", type: "button", text: "Cancel"});
+  cancel.addEventListener("click", () => { resumePanel.hidden = true; clear(resumePanel); });
+  const btnRow = el("div", {class: "resume-row"}, [apply, cancel]);
+  if (errs && errs.length) btnRow.appendChild(el("span", {class: "sub", text: "skipped: " + errs.join("; ")}));
+  resumePanel.appendChild(btnRow);
+}
+
 const importInput = document.getElementById("importInput");
 document.getElementById("importBtn").addEventListener("click", () => importInput.click());
 document.getElementById("resetBtn").addEventListener("click", () => {
   RUNS = BASE_RUNS.slice(); rerender();
+  resumePanel.hidden = true; clear(resumePanel);
   document.getElementById("importMsg").textContent = "";
 });
 importInput.addEventListener("change", async ev => {
   const files = Array.from(ev.target.files || []);
-  let added = 0; const errs = [];
+  const pending = []; const errs = [];
   for (const f of files) {
-    try { extractRuns(await f.text()).forEach(r => RUNS.push(r)); added += 1; }
+    try { extractRuns(await f.text()).forEach(r => pending.push(r)); }
     catch (e) { errs.push(f.name + " — " + e.message); }
   }
   ev.target.value = "";  // let the same file be re-picked later
-  rerender();
-  const msg = [];
-  if (added) msg.push("overlaid " + added + " report" + (added > 1 ? "s" : ""));
-  if (errs.length) msg.push("skipped: " + errs.join("; "));
-  document.getElementById("importMsg").textContent = msg.join("  ·  ");
+  const msg = document.getElementById("importMsg");
+  // With runs already on screen, offer the resume linker; otherwise just add.
+  if (pending.length && RUNS.length) {
+    showResumeLinker(pending, errs);
+  } else {
+    pending.forEach(r => RUNS.push(r));
+    rerender();
+    const parts = [];
+    if (pending.length) parts.push("overlaid " + pending.length + " report" + (pending.length > 1 ? "s" : ""));
+    if (errs.length) parts.push("skipped: " + errs.join("; "));
+    msg.textContent = parts.join("  ·  ");
+  }
 });
 
 // initial paint
