@@ -30,6 +30,14 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
 - `qlora_train_native_ddp.py` — the multi-GPU DDP variant (run under
   `torchrun`).
 - `qlora_train_pref.py` — DPO / KTO preference training on the native path.
+- `qlora_train_ebft.py` — Energy-Based Fine-Tuning (EBFT, arXiv:2603.12248):
+  on-policy feature-matching policy gradient. The frozen feature network is
+  the adapter-disabled base (the DPO/KTO reference trick); rollouts use the
+  exact sampler over the differentiable forward; rewards/RLOO live in
+  `exllamav3/training/ebft.py` (reference-faithful to `sjelassi/ebft_openrlhf`,
+  CPU-tested in `tests/test_ebft.py`). Run `--self-test` first on a new
+  model. First known EBFT + LoRA/quantized implementation — treat results
+  as research, compare against an SFT baseline on the same data.
 - `qlora_validate_native.py` — the correctness gates: compares the
   differentiable training forward against exllamav3's own inference forward.
   Run this FIRST on any new model/architecture.
@@ -72,5 +80,7 @@ deploy by merge-and-requantize. See the Session 20/21/26/28 notes in
 
 - `doc/qlora_handoff.md` — the full engineering log (per-session results,
   decision records, backlog).
+- `doc/ebft.md` — Energy-Based Fine-Tuning: design decisions, what's verified,
+  how to run, and open work. Standalone context-refresh doc for the EBFT path.
 - `doc/qlora_feasibility.md`, `doc/qlora_multigpu_plan.md`,
   `doc/qlora_optimization_audit.md` — design rationale and plans.

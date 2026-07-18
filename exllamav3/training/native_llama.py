@@ -67,6 +67,7 @@ from __future__ import annotations
 from typing import Callable, Iterable, Optional
 import contextlib
 import json
+import math
 import os
 import torch
 import torch.nn as nn
@@ -506,6 +507,10 @@ class NativeLlamaQLoRA(nn.Module):
     # logprobs in preference training (DPO/KTO) -- the PEFT "disable adapter"
     # trick, so no second model copy is ever loaded.
     _adapters_off = False
+    # EBFT feature taps (collect_hidden): (set[int] block idxs, [b,P] positions
+    # or None) while active, else None. Class default so older pickles/subclasses
+    # without the attribute still run the forward untapped.
+    _collect_spec = None
 
     def __init__(
         self,
@@ -1683,7 +1688,8 @@ class NativeLlamaQLoRA(nn.Module):
             save_ctx = torch.autograd.graph.save_on_cpu(pin_memory=True)
         cur_device = first_device
         with save_ctx:
-            for meta, entry, dev in zip(self._block_meta, self.blocks, self._block_devices):
+            for bi, (meta, entry, dev) in enumerate(
+                    zip(self._block_meta, self.blocks, self._block_devices)):
                 # Cross the device boundary if this block sits on another card. All
                 # no-ops under a single-device load (dev == cur_device throughout).
                 if dev != cur_device:
@@ -1701,21 +1707,34 @@ class NativeLlamaQLoRA(nn.Module):
                         )
                     else:
                         hidden = self._gdn_forward(meta, entry, hidden)
-                    continue
-                mode = self._attn_mode_for(meta, mem_eff)
-                # eager: seg-aware additive bias. flash + sdpa both isolate documents
-                # via pack_ctx (cu_seqlens for flash-varlen; per-document SDPA loop for
-                # big-head), so neither builds the [t, t] bias.
-                attn_bias = get_bias(meta["sliding_window"], dev) if mode == "eager" else None
-                pack = pack_ctx if (mode in ("flash", "sdpa") and pack_ctx is not None) else None
-                if ckpt:
-                    hidden = torch.utils.checkpoint.checkpoint(
-                        self._block_forward, meta, entry, hidden, position_ids, attn_bias,
-                        mode, pack, use_reentrant=False,
-                    )
                 else:
-                    hidden = self._block_forward(meta, entry, hidden, position_ids,
-                                                 attn_bias, mode, pack)
+                    mode = self._attn_mode_for(meta, mem_eff)
+                    # eager: seg-aware additive bias. flash + sdpa both isolate
+                    # documents via pack_ctx (cu_seqlens for flash-varlen; per-
+                    # document SDPA loop for big-head), so neither builds the
+                    # [t, t] bias.
+                    attn_bias = get_bias(meta["sliding_window"], dev) if mode == "eager" else None
+                    pack = pack_ctx if (mode in ("flash", "sdpa") and pack_ctx is not None) else None
+                    if ckpt:
+                        hidden = torch.utils.checkpoint.checkpoint(
+                            self._block_forward, meta, entry, hidden, position_ids, attn_bias,
+                            mode, pack, use_reentrant=False,
+                        )
+                    else:
+                        hidden = self._block_forward(meta, entry, hidden, position_ids,
+                                                     attn_bias, mode, pack)
+                # EBFT feature taps: stash the residual stream after selected
+                # blocks (see collect_hidden). The stream is the raw pre-norm
+                # residual, matching HF's output_hidden_states[bi+1] convention
+                # that the EBFT reference implementation reads its features from.
+                if self._collect_spec is not None:
+                    want, pos = self._collect_spec
+                    if bi in want:
+                        h = hidden.detach().float()
+                        if pos is not None:
+                            p = pos.to(h.device).unsqueeze(-1).expand(-1, -1, h.shape[-1])
+                            h = h.gather(1, p)
+                        self.collected[bi] = h
 
         # Final norm + head live on the output device (the last split device).
         # Return fp32 hidden so the head / cross-entropy path keeps its existing
@@ -1838,6 +1857,43 @@ class NativeLlamaQLoRA(nn.Module):
             chunk=chunk, ignore_index=ignore_index, shift=True,
             softcap=self.final_softcap,
         )
+
+    # --- EBFT feature taps ---------------------------------------------------
+
+    def feature_block_indices(self, fracs=(0.25, 0.50, 0.75)) -> list[int]:
+        """0-based block indices for EBFT feature extraction at fractional
+        depths. Matches the reference implementation's HF-convention pick
+        ``hidden_states[clamp(floor(L*frac), 1, L)]`` where ``hidden_states[k]``
+        is the residual stream after block ``k-1`` -- hence the ``-1`` here."""
+        L = len(self.blocks)
+        idxs = sorted({max(1, min(L, math.floor(L * f))) - 1 for f in fracs})
+        return idxs
+
+    @contextlib.contextmanager
+    def collect_hidden(self, block_indices, positions=None):
+        """Collect the residual stream after selected blocks during forwards
+        inside this context (the EBFT feature-network taps).
+
+        ``block_indices``: 0-based indices into ``self.blocks``; index ``i``
+        stores the residual stream AFTER block ``i`` (HF's
+        ``output_hidden_states[i+1]``, pre final-norm). ``positions``: optional
+        ``[b, P]`` long tensor of token positions to gather per row, keeping
+        the stored tensors at ``[b, P, d]`` instead of the full ``[b, t, d]``
+        stream (the full stream at fp32 is hundreds of MB per tap on real
+        batches -- always pass positions in training loops).
+
+        Collected tensors are detached fp32, left on their block's device, in
+        ``self.collected`` (dict block index -> tensor), overwritten by each
+        forward inside the context. Not reentrant (one active spec at a time),
+        and composes with ``adapters_disabled()`` for the frozen feature
+        network phi."""
+        assert self._collect_spec is None, "collect_hidden is not reentrant"
+        self._collect_spec = (set(int(i) for i in block_indices), positions)
+        self.collected: dict[int, torch.Tensor] = {}
+        try:
+            yield self
+        finally:
+            self._collect_spec = None
 
     # --- preference training (DPO / KTO) ------------------------------------
 
