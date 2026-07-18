@@ -53,6 +53,12 @@ import torch
 from exllamav3 import Config, Model, Tokenizer
 from exllamav3.training.native_llama import NativeLlamaQLoRA
 
+# Local run logger + self-contained HTML report -- the default logging path
+# (replaces wandb for shareable dashboards). Same dir on sys.path when this file
+# is run as a script or imported by the other trainers.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from run_report import RunLogger  # noqa: E402
+
 
 class ThroughputMeter:
     """Rolling tok/s over a sliding window of recent steps, for a live readout.
@@ -225,6 +231,11 @@ _FAIL_CTX = {"run_log": None, "record": {}, "phase": "startup", "logged": False}
 # idempotent: the first caller (normal finish, Ctrl-C, or _log_failure) wins.
 _WANDB_RUN = {"run": None}
 
+# The local run report (default logging path), kept module-level for the same
+# reason: the failure logger renders it with a failure exit code on a crash so a
+# died run still gets its report.html. _finish_report is idempotent.
+_REPORT = {"rep": None}
+
 
 def _finish_wandb(exit_code=0):
     run, _WANDB_RUN["run"] = _WANDB_RUN["run"], None
@@ -235,10 +246,20 @@ def _finish_wandb(exit_code=0):
             print(f"[wandb] finish failed: {exc}")
 
 
+def _finish_report(exit_code=0, status=None):
+    rep, _REPORT["rep"] = _REPORT["rep"], None
+    if rep is not None:
+        try:
+            rep.finish(exit_code=exit_code, status=status)
+        except Exception as exc:  # never let report render mask the real exit
+            print(f"[report] finish failed: {exc}")
+
+
 def _log_failure(status, exc):
     """Append a run-log row for a run that died, plus the full traceback to a
     sidecar ``<run_log>.errors.log`` (tracebacks don't fit a CSV cell)."""
     _finish_wandb(exit_code=1)
+    _finish_report(exit_code=1)
     if _FAIL_CTX["logged"] or not _FAIL_CTX["run_log"]:
         return
     _FAIL_CTX["logged"] = True
@@ -1542,9 +1563,17 @@ def _run_main():
                          "costs ~1-4%% tok/s AND +0.5-1.5 GB peak VRAM (worst on "
                          "MoE). Only worth trying with --dequant-mode legacy, "
                          "where each avoided reconstruction is 5-7 ms.")
+    ap.add_argument("--no-report", action="store_true",
+                    help="Disable the local run report. By default every run "
+                         "with an --out writes a self-contained report to "
+                         "<out>/run_report/report.html (config, per-step metrics, "
+                         "evals, summary; inline charts, no third-party account) "
+                         "-- the default shareable dashboard. This turns it off "
+                         "for throwaway runs.")
     ap.add_argument("--wandb-project", default="",
                     help="Log the run to Weights & Biases under this project "
-                         "(opt-in; empty = wandb never imported). Logs the "
+                         "(opt-in, OFF by default -- the local report is the "
+                         "default path; empty = wandb never imported). Logs the "
                          "per-step readout (loss/ema/grad/lr/|dB|/tok-s/epoch), "
                          "eval losses as they happen, and a final summary; the "
                          "run config mirrors the run-log CSV row so runs are "
@@ -2023,24 +2052,37 @@ def _run_main():
     # (peak_vram_gb / log_run are defined once below, after the baseline eval --
     # an earlier duplicate pair that used to sit here was dead code and is gone.)
 
-    # Optional wandb run (--wandb-project). Config reuses the failure-logger
-    # record (the same identity/hyperparameter fields as the run-log CSV),
-    # refreshed with the values finalized since startup (epoch-resolved steps,
-    # warmup, targets, split sizes), so CSV rows and wandb runs line up.
+    # Run config: reuses the failure-logger record (the same identity/
+    # hyperparameter fields as the run-log CSV), refreshed with the values
+    # finalized since startup (epoch-resolved steps, warmup, targets, split
+    # sizes), so the CSV row, the local report, and any wandb run all line up.
+    run_config = dict(_FAIL_CTX["record"])
+    run_config.update(
+        steps_planned=args.steps, steps_per_epoch=args.steps_per_epoch,
+        warmup_steps=warmup_steps, targets=" ".join(net.target_modules),
+        trainable_params=net.num_trainable(), n_train=len(examples),
+        n_val=len(val_examples), n_eval2=len(val2_examples))
+    run_name = args.wandb_run_name or os.path.basename(os.path.normpath(args.out))
+
+    # Local run report -- the DEFAULT logging path (self-contained HTML, no
+    # third-party account). On by default whenever there's an --out to write it
+    # next to; --no-report opts out. Metrics stream to disk as they're logged so
+    # a crash still renders whatever it got (via _finish_report in _log_failure).
+    report = None
+    if args.out and not args.no_report:
+        report = RunLogger(args.out, run_name, config=run_config)
+        _REPORT["rep"] = report
+
+    # Optional wandb run (--wandb-project; OFF by default). Same config so runs
+    # are comparable across the CSV, the local report, and wandb.
     wandb_run = None
     if args.wandb_project:
         import wandb
-        wandb_config = dict(_FAIL_CTX["record"])
-        wandb_config.update(
-            steps_planned=args.steps, steps_per_epoch=args.steps_per_epoch,
-            warmup_steps=warmup_steps, targets=" ".join(net.target_modules),
-            trainable_params=net.num_trainable(), n_train=len(examples),
-            n_val=len(val_examples), n_eval2=len(val2_examples))
         wandb_run = wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity or None,
-            name=args.wandb_run_name or os.path.basename(os.path.normpath(args.out)),
-            config=wandb_config)
+            name=run_name,
+            config=run_config)
         _WANDB_RUN["run"] = wandb_run
 
     # Baseline eval at step 0 (the adapter is a no-op at init, B=0, so this is the
@@ -2055,10 +2097,13 @@ def _run_main():
         if start_eval2 is not None:
             parts.append(f"{eval2_label} {start_eval2:.4f}")
         print("    [eval] step 0 (baseline): " + " | ".join(parts))
+        base_eval = {k: v for k, v in (("eval/held_out", start_val),
+                                       ("eval/eval2", start_eval2))
+                     if v is not None}
+        if report is not None:
+            report.log(base_eval, step=0)
         if wandb_run is not None:
-            wandb_run.log({k: v for k, v in (("eval/held_out", start_val),
-                                             ("eval/eval2", start_eval2))
-                           if v is not None}, step=0)
+            wandb_run.log(base_eval, step=0)
 
     # Start the training timer + VRAM peak AFTER the baseline eval so neither is
     # counted against training throughput.
@@ -2265,13 +2310,16 @@ def _run_main():
                   f"loss {accum_loss:6.4f} | "
                   f"ema {ema:6.4f} | grad {gnorm:7.4f} | lr {cur_lr:.2e} | "
                   f"|dB| {b_dist:7.3f} | {tot_tps:,.0f} tok/s | {timer.step_line()}")
+            train_metrics = {
+                "train/loss": accum_loss, "train/ema": ema,
+                "train/grad_norm": gnorm, "train/lr": cur_lr,
+                "train/adapter_b_dist": b_dist, "train/epoch": epoch_now,
+                "perf/sup_tok_s": sup_tps, "perf/tot_tok_s": tot_tps,
+            }
+            if report is not None:
+                report.log(train_metrics, step=step)
             if wandb_run is not None:
-                wandb_run.log({
-                    "train/loss": accum_loss, "train/ema": ema,
-                    "train/grad_norm": gnorm, "train/lr": cur_lr,
-                    "train/adapter_b_dist": b_dist, "train/epoch": epoch_now,
-                    "perf/sup_tok_s": sup_tps, "perf/tot_tok_s": tot_tps,
-                }, step=step)
+                wandb_run.log(train_metrics, step=step)
 
             # Keep the failure record current so a later crash (or kill -9 at
             # least leaves the errors.log short a row, see _FAIL_CTX note)
@@ -2315,13 +2363,15 @@ def _run_main():
                 if v2 is not None:
                     parts.append(f"{eval2_label} {v2:.4f}")
                 print(f"    [eval] step {step}: " + " | ".join(parts))
+                eval_metrics = {k: v for k, v in (("eval/held_out", vl),
+                                                  ("eval/eval2", v2))
+                                if v is not None}
+                if vl is not None:
+                    eval_metrics["eval/best_val"] = best_val
+                if report is not None:
+                    report.log(eval_metrics, step=step)
                 if wandb_run is not None:
-                    metrics = {k: v for k, v in (("eval/held_out", vl),
-                                                 ("eval/eval2", v2))
-                               if v is not None}
-                    if vl is not None:
-                        metrics["eval/best_val"] = best_val
-                    wandb_run.log(metrics, step=step)
+                    wandb_run.log(eval_metrics, step=step)
 
             if args.sample_every and step % args.sample_every == 0:
                 net.eval()
@@ -2366,6 +2416,7 @@ def _run_main():
             if step > 0:
                 save("[interrupted]")
         log_run("interrupted", time.time() - t0, None, None)
+        _finish_report(exit_code=0, status="interrupted")
         _finish_wandb()
         raise SystemExit(0)
 
@@ -2412,17 +2463,21 @@ def _run_main():
           f"peak VRAM {peak_str} | {dt:.0f}s for {step} steps | "
           f"step time: {timer.summary()}")
     log_run("completed", dt, val_loss, final_eval2)
+    final_summary = {k: v for k, v in {
+        "end_loss": end_loss, "final_val": val_loss,
+        "final_eval2": final_eval2,
+        "best_val": best_val if best_val != float("inf") else None,
+        "best_val_step": best_val_step or None,
+        "peak_vram_gb": peak_vram_gb(),
+        "sup_tok_s": tok_seen / dt if dt else 0,
+        "tot_tok_s": tot_seen / dt if dt else 0,
+        "total_s": dt, "steps_done": step,
+    }.items() if v is not None}
+    if report is not None:
+        report.update_summary(final_summary)
+        _finish_report()
     if wandb_run is not None:
-        wandb_run.summary.update({k: v for k, v in {
-            "end_loss": end_loss, "final_val": val_loss,
-            "final_eval2": final_eval2,
-            "best_val": best_val if best_val != float("inf") else None,
-            "best_val_step": best_val_step or None,
-            "peak_vram_gb": peak_vram_gb(),
-            "sup_tok_s": tok_seen / dt if dt else 0,
-            "tot_tok_s": tot_seen / dt if dt else 0,
-            "total_s": dt, "steps_done": step,
-        }.items() if v is not None})
+        wandb_run.summary.update(final_summary)
         _finish_wandb()
     print("Verify with: python training/qlora_infer_native.py "
           f"--model {args.model} --adapter {args.out}")

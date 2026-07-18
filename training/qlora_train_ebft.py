@@ -75,8 +75,9 @@ from qlora_train_native import (  # noqa: E402
     save_trainer_state, load_trainer_state, restore_optimizer_state,
     build_sft_examples, build_lm_examples,
     build_optimizer, make_lr_scheduler, resolve_steps_and_warmup,
-    _FAIL_CTX, _log_failure,
+    _FAIL_CTX, _log_failure, _REPORT, _finish_report,
 )
+from run_report import RunLogger  # noqa: E402
 
 from exllamav3 import Config, Model, Tokenizer  # noqa: E402
 from exllamav3.training.native_llama import NativeLlamaQLoRA  # noqa: E402
@@ -485,6 +486,9 @@ def _run_main():
     ap.add_argument("--offload-mode", choices=["async", "sync"], default="async")
     ap.add_argument("--use-liger", action="store_true")
     ap.add_argument("--dequant-mode", choices=["fast", "legacy"], default="fast")
+    ap.add_argument("--no-report", action="store_true",
+                    help="Disable the local run report (default: on when --out is "
+                         "set, written to <out>/run_report/report.html).")
     args = ap.parse_args()
 
     from exllamav3.training import backbone as _backbone
@@ -790,11 +794,31 @@ def _run_main():
     run_started = datetime.datetime.now().isoformat(timespec="seconds")
     meter = ThroughputMeter()
 
+    # Local run report -- the default logging path (same as the SFT trainer, so
+    # EBFT and SFT runs render comparable dashboards). On by default when there's
+    # an --out; --no-report opts out. Reuses native's module-level _REPORT state
+    # so native's failure logger renders it on a crash. Config mirrors the CSV row.
+    report = None
+    if args.out and not args.no_report:
+        run_config = dict(_FAIL_CTX["record"])
+        run_config.update(
+            warmup_steps=warmup_steps, targets=" ".join(net.target_modules),
+            trainable_params=net.num_trainable(), n_train=len(examples),
+            n_val=len(val_examples))
+        report = RunLogger(
+            args.out, os.path.basename(os.path.normpath(args.out)),
+            config=run_config)
+        _REPORT["rep"] = report
+
     _FAIL_CTX["phase"] = "baseline_eval"
     if val_examples:
         start_val, em = evaluate()
         if start_val is not None:
             print(f"    [eval] step 0 (baseline): {fmt_eval(start_val, em)}")
+            if report is not None:
+                report.log({k: v for k, v in (("eval/held_out", start_val),
+                                              ("eval/cfm", em.get("cfm")))
+                            if v is not None}, step=0)
 
     t0 = time.time()
     if torch.cuda.is_available():
@@ -906,6 +930,19 @@ def _run_main():
                   f"|dB| {adapter_b_norm():7.3f} | {tot_tps:,.0f} tok/s | "
                   f"{timer.step_line()}")
 
+            if report is not None:
+                report.log({
+                    "train/loss": accum_loss, "train/ema": ema,
+                    "train/rl": mm.get("rl", 0.0), "train/ce": mm.get("ce", 0.0),
+                    "train/reward": mm.get("reward", 0.0),
+                    "train/align": mm.get("align", 0.0),
+                    "train/div": mm.get("div", 0.0), "train/dup": mm.get("dup", 0.0),
+                    "train/cfm": mm.get("cfm", 0.0), "train/grad_norm": gnorm,
+                    "train/lr": sched.get_last_lr()[0],
+                    "train/adapter_b_dist": adapter_b_norm(),
+                    "perf/tot_tok_s": tot_tps,
+                }, step=step)
+
             _FAIL_CTX["record"].update(
                 steps_done=step, end_loss=round(accum_loss, 6),
                 peak_vram_gb=round(peak_vram_gb(), 3))
@@ -917,6 +954,15 @@ def _run_main():
                 last_eval_step, last_val = step, vl
                 if vl is not None:
                     print(f"    [eval] step {step}: {fmt_eval(vl, em)}")
+                    if report is not None:
+                        emetrics = {"eval/held_out": vl}
+                        if "cfm" in em:
+                            emetrics["eval/cfm"] = em["cfm"]
+                        if vl < best_val:
+                            emetrics["eval/best_val"] = vl
+                        else:
+                            emetrics["eval/best_val"] = best_val
+                        report.log(emetrics, step=step)
                     if vl < best_val:
                         best_val = vl
                         best_val_step = step
@@ -942,6 +988,12 @@ def _run_main():
             if step > 0:
                 save("[interrupted]")
         log_run("interrupted", time.time() - t0, None)
+        if report is not None:
+            report.update_summary({
+                "end_loss": end_loss, "best_val": best_val if best_val != float("inf") else None,
+                "best_val_step": best_val_step or None,
+                "peak_vram_gb": peak_vram_gb(), "steps_done": step})
+        _finish_report(exit_code=0, status="interrupted")
         raise SystemExit(0)
 
     dt = time.time() - t0
@@ -967,6 +1019,17 @@ def _run_main():
           f"{tot_seen / dt if dt else 0:,.0f} tot tok/s | peak VRAM {peak_str} | "
           f"{dt:.0f}s for {step} steps | step time: {timer.summary()}")
     log_run("completed", dt, val_loss)
+    if report is not None:
+        report.update_summary({k: v for k, v in {
+            "end_loss": end_loss, "final_val": val_loss,
+            "best_val": best_val if best_val != float("inf") else None,
+            "best_val_step": best_val_step or None,
+            "peak_vram_gb": peak_vram_gb(),
+            "sup_tok_s": tok_seen / dt if dt else 0,
+            "tot_tok_s": tot_seen / dt if dt else 0,
+            "total_s": dt, "steps_done": step,
+        }.items() if v is not None})
+        _finish_report()
     print("Verify with: python training/qlora_infer_native.py "
           f"--model {args.model} --adapter {args.out}")
 

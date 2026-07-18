@@ -38,6 +38,15 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
   CPU-tested in `tests/test_ebft.py`). Run `--self-test` first on a new
   model. First known EBFT + LoRA/quantized implementation — treat results
   as research, compare against an SFT baseline on the same data.
+- `run_report.py` — the default local logging path (replaces wandb for
+  shareable dashboards). Every run with an `--out` streams config + per-step
+  metrics + evals to `<out>/run_report/` and renders a self-contained
+  `report.html` (inline vanilla-JS SVG charts, no CDN, no account) on finish;
+  a crash still renders whatever it logged. Used by both the SFT
+  (`qlora_train_native.py`) and EBFT trainers with a shared metric schema, so
+  SFT-vs-EBFT runs render comparable dashboards. `--no-report` opts out;
+  `--wandb-project` is still available but off by default. CPU-tested in
+  `tests/test_run_report.py`.
 - `qlora_validate_native.py` — the correctness gates: compares the
   differentiable training forward against exllamav3's own inference forward.
   Run this FIRST on any new model/architecture.
