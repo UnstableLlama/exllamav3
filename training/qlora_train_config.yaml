@@ -2,17 +2,23 @@
 #   python training/qlora_train.py --config training/qlora_train_config.yaml
 #   python training/qlora_train.py --config my.yaml --dry-run   # print the command, don't run
 #
-# One file selects the execution mode:
+# One file selects the training objective:
+#   method: sft   # next-token cross-entropy (the default; qlora_train_native.py)
+#   method: ebft  # Energy-Based Fine-Tuning (qlora_train_ebft.py; see doc/ebft.md)
+# ...and the execution mode:
 #   parallel: single  # one process, one GPU
 #   parallel: split   # one process, layers split across all visible GPUs
 #   parallel: ddp     # launcher execs torchrun + training/qlora_train_native_ddp.py
 #                     # (full model copy per GPU, data-parallel -- fastest when it fits)
+#                     # (sft only; method: ebft is single|split)
 #
-# Keys mirror the CLI flags in training/qlora_train_native.py one-to-one. Use
-# snake_case here; the launcher converts to --kebab-case. Keys marked
-# "single/split only" are rejected under parallel: ddp (and vice versa) so a
-# typo or unsupported knob fails early instead of being ignored. DDP-only
-# torchrun launch settings live under ddp:.
+# Keys mirror the backend CLI flags one-to-one (qlora_train_native.py for sft,
+# qlora_train_ebft.py for ebft). Use snake_case here; the launcher converts to
+# --kebab-case. Keys marked "single/split only" are rejected under parallel: ddp,
+# and keys marked "method: ebft only" are the EBFT objective knobs -- any key the
+# chosen backend can't accept fails early (when set to a non-default value)
+# instead of being silently ignored. DDP-only torchrun launch settings live
+# under ddp:.
 #
 # Every key below is shown at its default, so this file trains the same as a
 # bare CLI run; copy it and change what you need.
@@ -22,6 +28,15 @@
 # ---------------------------------------------------------------------------
 model: /path/to/exl3_model      # directory of the EXL3-quantized model (config.json + safetensors)
 out: out/exl3_qlora_adapter     # adapter output dir (PEFT format; also Ctrl-C / --save-every target)
+
+# ---------------------------------------------------------------------------
+# Training objective
+# ---------------------------------------------------------------------------
+method: sft               # sft: next-token cross-entropy (default). ebft: Energy-Based Fine-Tuning
+                          #   -- on-policy rollouts matched to ground-truth feature statistics (see
+                          #   the "Energy-Based Fine-Tuning" section below and doc/ebft.md). The two
+                          #   arms share model/data/LoRA/optimizer keys, so a paired SFT-vs-EBFT A/B
+                          #   is the same file with only `method` (and `out`/`run_name`) changed
 
 # ---------------------------------------------------------------------------
 # Execution mode / GPU placement
@@ -137,6 +152,40 @@ ga_loss: token            # gradient-accumulation weighting. token: weight each 
                           #   supervised-token share so the step gradient equals one big batch (the
                           #   Oct-2024 HF/Unsloth GA fix). mean: old mean-of-means, for reproducing
                           #   old runs. No-op at grad_accum: 1
+
+# ---------------------------------------------------------------------------
+# Energy-Based Fine-Tuning  (method: ebft only -- ignored under method: sft)
+#
+# EBFT trains the policy so its on-policy rollouts match the FEATURE statistics
+# of ground-truth completions (a frozen copy of the model at init is the feature
+# net), instead of next-token CE. Reward per rollout = whitened alignment to the
+# ground truth minus similarity to sibling rollouts; REINFORCE with an RLOO
+# baseline, plus a small CE term. Defaults below are the reference-code values
+# (Jelassi et al., arXiv:2603.12248). Run qlora_train_ebft.py --self-test on a
+# new model first; the LoRA LR range (1e-5..1e-4) is unvalidated. See doc/ebft.md.
+# ---------------------------------------------------------------------------
+mode: qa                  # qa: instruction/response rows (verifiable-style). pretrain: raw packed
+                          #   text (text_key), the non-verifiable setting
+gen_len: 8                # rollout window G in tokens (paper: 8 code, 4 translation)
+n_samples: 4              # rollouts per anchor (>=2 required for the RLOO baseline; paper: 4)
+anchors: 4                # anchor positions sampled per sequence -> rollout rows/microbatch =
+                          #   batch * anchors * n_samples (the real memory/compute knob: 4*4*4 = 64)
+min_context: 8            # minimum context tokens before an anchor position
+temperature: 0.6          # rollout sampling temperature (paper Table 2: 0.6)
+top_k: 0                  # rollout top-k (0 = off)
+top_p: 1.0                # rollout top-p (1.0 = off)
+align_coef: 1.0           # alignment-to-ground-truth reward weight (reference: 1.0)
+div_coef: 0.5             # diversity (sibling-similarity) reward weight. 0.5 = the paper's alpha=0.5
+                          #   alignment bias; 1.0 = the pure proper-scoring-rule objective
+rl_coef: 1.0              # weight on the REINFORCE term
+ce_coef: 0.03             # CE (gamma) weight on the ground-truth sequences. paper sweeps 0/0.03/0.1
+                          #   and recommends >0 for stability; ce_coef: 0 isolates pure feature-matching
+no_whiten: false          # ablation only: disable feature whitening (paper reports clear degradation)
+whiten_tol: 0.00001       # eigenvalue floor for the whitening pseudo-inverse
+feature_fracs: 0.25,0.5,0.75   # fractional depths of the 3 frozen-feature taps
+adam_betas: 0.9,0.95      # Adam betas for EBFT (paper Table 2); the sft path uses its own default
+no_eval_cfm: false        # by default eval also runs rollouts to report held-out CFM / reward (the
+                          #   paper's headline metric); set true for CE-only eval (faster)
 
 # ---------------------------------------------------------------------------
 # Data
@@ -294,6 +343,13 @@ val_frac: 0.0             # no eval_split? carve this fraction off train as held
 eval_every: 0             # report held-out loss every N steps (0 = only at the end)
 save_best: false          # save only when the PRIMARY held-out loss improves
 run_log: qlora_runs.csv   # CSV run log (one row per run: hyperparams, losses, tok/s, peak VRAM)
+no_report: false          # single/split + ebft: the local run report is the DEFAULT logging path --
+                          #   a self-contained HTML dashboard (config + per-step metrics + evals +
+                          #   summary, inline SVG charts, no account) at <out>/run_report/report.html.
+                          #   true = off. Overlay two runs (e.g. SFT vs EBFT) with:
+                          #   python training/run_report.py <outA> <outB> --labels A,B -o cmp.html
+run_name: null            # title for that report / its compare-legend label (default: basename of
+                          #   `out`). Independent of wandb; not supported under parallel: ddp
 wandb_project: null       # single/split only: log to Weights & Biases under this project (null/
                           #   empty = off). Per-step loss/ema/grad/lr/|dB|/tok-s/epoch + eval
                           #   losses + final summary; run config mirrors the run-log CSV row

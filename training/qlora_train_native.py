@@ -1570,6 +1570,10 @@ def _run_main():
                          "evals, summary; inline charts, no third-party account) "
                          "-- the default shareable dashboard. This turns it off "
                          "for throwaway runs.")
+    ap.add_argument("--run-name", default="",
+                    help="Name for the local run report (report title / compare "
+                         "legend). Default: basename of --out. Independent of "
+                         "wandb; --wandb-run-name still names the wandb run.")
     ap.add_argument("--wandb-project", default="",
                     help="Log the run to Weights & Biases under this project "
                          "(opt-in, OFF by default -- the local report is the "
@@ -2062,7 +2066,8 @@ def _run_main():
         warmup_steps=warmup_steps, targets=" ".join(net.target_modules),
         trainable_params=net.num_trainable(), n_train=len(examples),
         n_val=len(val_examples), n_eval2=len(val2_examples))
-    run_name = args.wandb_run_name or os.path.basename(os.path.normpath(args.out))
+    run_name = (args.run_name or args.wandb_run_name
+                or os.path.basename(os.path.normpath(args.out)))
 
     # Local run report -- the DEFAULT logging path (self-contained HTML, no
     # third-party account). On by default whenever there's an --out to write it

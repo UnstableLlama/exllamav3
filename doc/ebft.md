@@ -146,6 +146,20 @@ python training/qlora_train_ebft.py \
 python training/qlora_infer_native.py --model /path/to/exl3_model --adapter out/exl3_ebft
 ```
 
+Or launch from a YAML config through the shared launcher (`method: ebft`), which
+is how the SFT-vs-EBFT A/B is set up so both arms are one editable pair:
+
+```bash
+python training/qlora_train.py --config semancer_llama1b_ebft.yaml
+# pairs with semancer_llama1b_sft.yaml (identical data/LoRA/optim); overlay the
+# two run reports afterwards:
+python training/run_report.py out/ab_sft out/ab_ebft --labels SFT,EBFT -o out/sft_vs_ebft.html
+```
+
+The EBFT objective knobs are documented in the "Energy-Based Fine-Tuning"
+section of `training/qlora_train_config.yaml`; `method: ebft` forwards them to
+this trainer and rejects sft-only keys early.
+
 Reference-code defaults are baked in: G=8, n=4, temp=0.6, align=1.0, div=0.5,
 ce(γ)=0.03, betas=(0.9,0.95). `--mode pretrain` trains on raw packed text
 (non-verifiable setting). Frozen LM head only; single-process (`--parallel

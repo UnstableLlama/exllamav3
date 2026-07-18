@@ -489,6 +489,9 @@ def _run_main():
     ap.add_argument("--no-report", action="store_true",
                     help="Disable the local run report (default: on when --out is "
                          "set, written to <out>/run_report/report.html).")
+    ap.add_argument("--run-name", default="",
+                    help="Name for the local run report (report title / compare "
+                         "legend). Default: basename of --out.")
     args = ap.parse_args()
 
     from exllamav3.training import backbone as _backbone
@@ -806,7 +809,8 @@ def _run_main():
             trainable_params=net.num_trainable(), n_train=len(examples),
             n_val=len(val_examples))
         report = RunLogger(
-            args.out, os.path.basename(os.path.normpath(args.out)),
+            args.out,
+            args.run_name or os.path.basename(os.path.normpath(args.out)),
             config=run_config)
         _REPORT["rep"] = report
 
