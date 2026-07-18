@@ -21,7 +21,8 @@ r: 16
 alpha: 16
 use_rslora: true
 init_lora: default
-lr: 0.0000125          # << DECIDE: per-method (SFT 1.25e-5) or identical 1e-5 to fully control LR
+lr: 0.00001            # matched to the EBFT arm (1e-5) to control LR: any CE/CFM
+                       # difference is attributable to the objective, not the LR
 weight_decay: 0.01
 scheduler: cosine
 warmup_ratio: 0.03
@@ -51,7 +52,11 @@ targets:
 offload_activations: false   # OFF: 1B@4bpw fits ~5GB VRAM; matches the EBFT arm
                              # (whose offload pool OOM'd the host — see doc/ebft.md).
 attn_impl: auto
-sample_every: 0
+
+# Live sample generations -- matched to the EBFT arm. ~436 examples / batch 4 =
+# ~109 steps/epoch, so every 11 steps is ~a tenth of an epoch (~10 previews).
+sample_every: 11
+sample_prompt: "What is truth?"
 
 # Evaluation
 eval_split: test

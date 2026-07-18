@@ -105,6 +105,8 @@ EBFT_KEYS = {
     # runtime knobs shared with the SFT trainer
     "compute_dtype", "no_grad_ckpt", "attn_impl", "ce_chunk", "head_vocab_chunk",
     "offload_activations", "offload_mode", "use_liger", "dequant_mode",
+    # live sample generations (shared with the SFT trainer)
+    "sample_every", "sample_prompt",
     # local run report
     "no_report", "run_name",
 }

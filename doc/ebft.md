@@ -11,8 +11,10 @@ reference code are full-fine-tuning only).
   **code**, not the appendix, where they differ (see "Two deliberate
   deviations" below).
 - **Built:** Session 39 (2026-07-17). Status: implementation complete +
-  correctness-gated + one 30-step smoke run. **Not yet answered:** does
-  EBFT-LoRA beat SFT-LoRA (needs the A/B — see "Open work").
+  correctness-gated. **First A/B answered (Session 42, 2026-07-18): EBFT-LoRA did
+  NOT beat SFT-LoRA** at 1B / 1 epoch on semancy — SFT won held-out CE decisively
+  and tied CFM. See "Result: first A/B" below. Not a clean win, not a clean
+  refutation either (proxies, untuned EBFT LR, small scale).
 
 ---
 
@@ -56,6 +58,39 @@ but the model + activations comfortably fit VRAM.
 persistent instance, EBFT per-step shape variance). The exact crash step is from
 live observation (~23/28) — the scratchpad log was wiped on reboot, so this is
 inferred from code, not a captured RAM trace.
+
+---
+
+## Result: first EBFT-LoRA vs SFT-LoRA A/B (Session 42)
+
+Llama-3.2-1B @4bpw, semancy, **matched** hyperparameters (r16/α16, rsLoRA, init
+default, lr **1e-5**, 1 epoch / 109 steps, batch 4, 7 dense targets, seq 1024;
+EBFT objective G8/n4/anchors4, temp 0.6, div 0.5, γ 0.03, native rollout
+sampler). Configs `semancer_llama1b_{sft,ebft}.yaml`, overlay `out/sft_vs_ebft.html`.
+
+All three rows measured through the **same EBFT eval path** (fixed 32-example CFM
+subset, seed 12345; CE over the full 116-example test split):
+
+| model | held-out CE ↓ | held-out CFM ↓ |
+|---|---|---|
+| base (no adapter) | 3.765 | 0.901 |
+| **SFT-LoRA** | **3.223** | 0.827 |
+| **EBFT-LoRA** | 3.547 | **0.822** |
+
+**Read:** EBFT's own signature holds — CE **and** CFM both fall over training
+(3.765→3.547 / 0.901→0.822). But it buys no edge over SFT: SFT wins CE by 0.32
+nats and matches EBFT's CFM (0.827 vs 0.822 — inside rollout noise) *without ever
+optimizing CFM*. As a language model this EBFT-LoRA is worse (higher CE), by
+design of γ=0.03.
+
+**Why this isn't a verdict on EBFT:** (1) we compared **CE/CFM proxies**, not the
+paper's actual claim (downstream task accuracy at larger scale / full-FT); (2)
+**EBFT's LoRA LR is unvalidated** (1e-5 = smoke value) — the 1e-5..1e-4 sweep is
+the obvious next lever; (3) single seed, one dataset, 1B/1-epoch. Confidence:
+high on the numbers, medium on the conclusion. SFT's CFM was obtained by a
+same-axis probe (EBFT trainer `--resume out/ab_sft --reset-optimizer --steps 1`;
+its baseline eval reads the SFT-adapter CFM). Next planned: same A/B on
+Qwen3.5-4B @4bpw, identical hyperparameters.
 
 ---
 
@@ -239,11 +274,15 @@ fixed-seed subset; CE eval stays full).
 
 ## Open work (all needs user-approved GPU time — see standing orders in handoff §Session 38)
 
-1. **The real question: EBFT-LoRA vs SFT-LoRA A/B** on the same data
-   (Qwen2.5-1.5B or Llama-1B, OpenCodeInstruct-class). Watch **CFM ↓ AND CE ↓
-   together** — the paper's signature. Consider a γ=0 arm to isolate pure
-   feature-matching (if CE still drops there, cleanest possible confirmation).
-2. **LoRA LR sweep** 1e-5..1e-4 (the one genuinely unknown hyperparameter).
+1. ~~**The real question: EBFT-LoRA vs SFT-LoRA A/B**~~ — **first pass DONE
+   (Session 42): EBFT did not beat SFT at 1B/1-epoch** (see "Result: first A/B"
+   above). Still open: repeat on **Qwen3.5-4B @4bpw** (configs
+   `semancer_qwen35_4b_{sft,ebft}.yaml`, identical hyperparameters) and, if
+   pursuing further, a **γ=0 arm** to isolate pure feature-matching and a
+   **downstream-accuracy** eval instead of the CE/CFM proxies.
+2. **LoRA LR sweep** 1e-5..1e-4 (the one genuinely unknown hyperparameter) —
+   now the highest-value next experiment: EBFT ran at its smoke lr 1e-5, so the
+   Session-42 null result may just be an untuned LR.
 3. ~~**Throughput:** native-generator sampling via `apply_to_native`~~ —
    **DONE Session 41** (`--rollout-sampler native`, 2.06× step + faster eval;
    see the sampler section above and the eval-cost paragraph below). Remaining
@@ -278,5 +317,10 @@ roughly halves the step time and makes eval near-free.
   `scripts/run_ebft_example.sh` (default hyperparameters).
 - Naming collision: arXiv:2402.12419 is an *unrelated* 2024 "EBFT" (sparse-LLM
   block fine-tuning) that *does* mention LoRA — not prior art for this.
-- Live-sample logging (`--sample-every` in the SFT trainer) is **not** wired
-  into the EBFT trainer; add it via `apply_to_native` if wanted.
+- Live-sample generations (`--sample-every N` / `--sample-prompt`, YAML keys of
+  the same name) are wired into the EBFT trainer (Session 42): between steps it
+  installs the current adapter via `apply_to_native()` and generates on the
+  native inference path, reusing the `--rollout-sampler native` generator when
+  present. Same knobs/behavior as the SFT trainer, so both A/B arms print
+  comparable previews. (MoE caveat: like native rollouts, the preview reflects
+  the BASE experts — the trainer warns.)

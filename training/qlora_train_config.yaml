@@ -317,9 +317,13 @@ lora_head: false          # rank-r LoRA on the LM head instead (tiny params; mem
 # ---------------------------------------------------------------------------
 # Sampling / checkpoints / resume
 # ---------------------------------------------------------------------------
-sample_every: 25          # single/split only: generate a live sample every N steps (0 = off; also
-                          #   skips creating the generation KV cache -- a small VRAM saving)
-sample_prompt: Tell me about your day.
+sample_every: 25          # generate a live sample every N steps (0 = off; also skips creating the
+                          #   generation KV cache -- a small VRAM saving). Works for method: sft AND
+                          #   method: ebft (both use the native inference path with the current
+                          #   adapter installed). On method: ebft with rollout_sampler: native it
+                          #   reuses the rollout generator; on MoE LoRA the preview shows the BASE
+                          #   experts (fused MoE kernels bypass the runtime LoRA slots -- it warns)
+sample_prompt: Tell me about your day.   # prompt for the live sample generations
 save_every: 0             # overwrite the adapter at `out` every N steps (0 = only at the end;
                           #   Ctrl-C also saves). Single rolling copy
 checkpoint_every: 0       # every N steps save a RETAINED checkpoint to out/checkpoint-<step>

@@ -75,6 +75,7 @@ from qlora_train_native import (  # noqa: E402
     save_trainer_state, load_trainer_state, restore_optimizer_state,
     build_sft_examples, build_lm_examples,
     build_optimizer, make_lr_scheduler, resolve_steps_and_warmup,
+    format_prompt_and_eot, sample,
     _FAIL_CTX, _log_failure, _REPORT, _finish_report,
 )
 from run_report import RunLogger  # noqa: E402
@@ -629,6 +630,13 @@ def _run_main():
     ap.add_argument("--offload-mode", choices=["async", "sync"], default="async")
     ap.add_argument("--use-liger", action="store_true")
     ap.add_argument("--dequant-mode", choices=["fast", "legacy"], default="fast")
+    # Live sample generations (same knobs / native path as the SFT trainer).
+    ap.add_argument("--sample-every", type=int, default=0,
+                    help="Generate a sample completion every N steps (0 to "
+                         "disable). Uses the native inference path with the "
+                         "current adapter installed (apply_to_native).")
+    ap.add_argument("--sample-prompt", default="Tell me about your day.",
+                    help="Prompt for the live sample generations.")
     ap.add_argument("--no-report", action="store_true",
                     help="Disable the local run report (default: on when --out is "
                          "set, written to <out>/run_report/report.html).")
@@ -682,9 +690,14 @@ def _run_main():
     # allocates its paged cache during loading (same constraint as the SFT
     # trainer's live-sample generator); otherwise generation asserts on a
     # missing k_cache. Only needed for --rollout-sampler native.
+    # A KV cache is needed for the native rollout sampler AND/OR live samples;
+    # either way it must exist before model.load(). One cache serves both (the
+    # rollout sampler sizes it; a live-sample-only run needs only a small one).
     sampler_cache = None
     if args.rollout_sampler == "native":
         sampler_cache = Cache(model, max_num_tokens=args.sampler_cache_tokens)
+    elif args.sample_every:
+        sampler_cache = Cache(model, max_num_tokens=4096)
     if args.parallel == "split":
         load_kwargs = {}
         if args.reserve_per_device is not None:
@@ -739,9 +752,10 @@ def _run_main():
           f"phi taps at blocks {blocks} (of {len(net.blocks)})")
 
     # Optional KV-cached rollout sampler on the native inference path.
+    is_moe_lora = any(w.r > 0 and ".experts." in w.key for w in net._wrappers)
     gen = None
     if args.rollout_sampler == "native":
-        if any(w.r > 0 and ".experts." in w.key for w in net._wrappers):
+        if is_moe_lora:
             raise SystemExit(
                 "--rollout-sampler native is off-policy for routed-expert "
                 "LoRA: the fused MoE inference kernels bypass the runtime "
@@ -751,6 +765,37 @@ def _run_main():
         print(f" -- rollout sampler: native generator (KV-cached, paged prefix "
               f"dedup across sibling rollouts, {args.sampler_cache_tokens} "
               f"cache tokens); scoring stays on the differentiable path")
+
+    # Optional live sample generations (native inference path with the current
+    # adapter installed, exactly like the SFT trainer -- so the two A/B arms
+    # print comparable previews). Reuses the rollout generator/cache when
+    # present, else builds one over the small cache allocated before load().
+    sample_gen = None
+    build_prompt = None
+    if args.sample_every:
+        build_prompt, _ = format_prompt_and_eot(model, tokenizer, args.prompt_format)
+        sample_gen = gen or Generator(model=model, cache=sampler_cache,
+                                      tokenizer=tokenizer)
+        if is_moe_lora:
+            print(" -- note: live samples on routed-expert LoRA reflect the "
+                  "BASE experts (fused MoE kernels bypass the runtime LoRA "
+                  "slots); the preview won't show the adapter's expert deltas.")
+        print(f" -- live samples every {args.sample_every} steps: "
+              f"{args.sample_prompt!r}")
+
+    def live_sample(tag):
+        """Generate one completion from the CURRENT policy (adapter installed
+        in the runtime slots), print it, and restore train state."""
+        net.eval()
+        net.apply_to_native()
+        try:
+            with torch.inference_mode():
+                txt = sample(model, sampler_cache, tokenizer, sample_gen,
+                             build_prompt, args.sample_prompt)
+        finally:
+            net.remove_from_native()
+            net.train()
+        print(f"\n  \U0001f3ad  {tag} {args.sample_prompt}\n     -> {txt}\n")
 
     # 3. Data.
     _FAIL_CTX["phase"] = "build_dataset"
@@ -1007,6 +1052,9 @@ def _run_main():
                 report.log({k: v for k, v in (("eval/held_out", start_val),
                                               ("eval/cfm", em.get("cfm")))
                             if v is not None}, step=0)
+    if args.sample_every:
+        _FAIL_CTX["phase"] = "baseline_sample"
+        live_sample("baseline (step 0):")
 
     t0 = time.time()
     if torch.cuda.is_available():
@@ -1157,6 +1205,9 @@ def _run_main():
                         best_val_step = step
                         if args.save_best:
                             save(f"[best step {step}, val {vl:.4f}]")
+
+            if args.sample_every and step % args.sample_every == 0:
+                live_sample(f"[step {step}]")
 
             if args.save_every and step % args.save_every == 0:
                 save(f"[checkpoint step {step}]")

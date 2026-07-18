@@ -25,7 +25,8 @@ r: 16
 alpha: 16
 use_rslora: true
 init_lora: default     # keeps phi == step-0 policy (the paper's setup); NOT qerr
-lr: 0.00001            # << DECIDE (LR): EBFT 1e-5 (its smoke value), or match SFT exactly
+lr: 0.00001            # matched to the SFT arm (1e-5): controls LR so the A/B
+                       # isolates the objective (EBFT's smoke value too)
 weight_decay: 0.01
 scheduler: cosine
 warmup_ratio: 0.03
@@ -68,6 +69,13 @@ offload_activations: false   # OFF: 1B@4bpw fits ~5GB VRAM; the pinned-buffer
                              # pool grows unbounded under EBFT's per-step shape
                              # variance and OOM'd the host (see doc/ebft.md).
 attn_impl: auto
+
+# Live sample generations -- watch the adapter come alive on a fixed prompt.
+# ~436 examples / batch 4 = ~109 steps/epoch, so every 11 steps is ~a tenth of
+# an epoch (~10 previews/epoch). Uses the native inference path with the current
+# adapter installed; on --rollout-sampler native it reuses the rollout generator.
+sample_every: 11
+sample_prompt: "What is truth?"
 
 # Evaluation (eval also runs rollouts for held-out CFM -- the paper's headline
 # metric -- so each eval costs more than the SFT arm's)

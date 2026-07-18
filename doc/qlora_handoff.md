@@ -4425,6 +4425,50 @@ runtime LoRA), exact sampler has no such caveat.
 
 ---
 
+### Session 42 — EBFT-vs-SFT A/B RUN (first real result: EBFT did not beat SFT at 1B); live-sample generations wired into the EBFT trainer
+
+> 2026-07-18. Launched the paired SFT-vs-EBFT A/B on Llama-3.2-1B @4bpw /
+> semancy, matched hyperparameters (r16/α16, lr **1e-5** both arms, 1 epoch,
+> batch 4), parallel on the two 3090s. Full detail + table in
+> `doc/ebft.md` ("Result: first A/B").
+
+**Result (all via the same EBFT eval path, 32-ex CFM subset seed 12345, full-116 CE):**
+
+| model | held-out CE ↓ | CFM ↓ |
+|---|---|---|
+| base | 3.765 | 0.901 |
+| SFT-LoRA | **3.223** | 0.827 |
+| EBFT-LoRA | 3.547 | **0.822** |
+
+EBFT's internal signature holds (CE **and** CFM both fall), but **it buys no edge
+over SFT**: SFT wins CE by 0.32 nats and ties CFM (0.827 vs 0.822, within rollout
+noise) without ever optimizing it. NOT a verdict on EBFT — we measured CE/CFM
+proxies, not the paper's downstream-accuracy claim; EBFT's LoRA LR (1e-5) is
+untuned; single seed / 1B / 1 epoch. SFT's CFM came from a same-axis probe
+(EBFT trainer `--resume out/ab_sft --reset-optimizer --steps 1`). Next: LR sweep
+is the highest-value experiment; also repeating the A/B on Qwen3.5-4B @4bpw.
+
+**Also built this session — live sample generations in the EBFT trainer:**
+`--sample-every N` / `--sample-prompt` (YAML keys of the same name, forwarded via
+`EBFT_KEYS`). Between steps it installs the current adapter (`apply_to_native()`)
+and generates on the native inference path, reusing the `--rollout-sampler
+native` generator when present; MoE LoRA previews the base experts (warns). Same
+knobs/behavior as the SFT trainer so both A/B arms print comparable previews.
+Both semancer_llama1b A/B YAMLs set `sample_every: 11` (~a tenth of the 109-step
+epoch) / `sample_prompt: "What is truth?"`. Reference config comment corrected
+(was "single/split only"). Files touched: `qlora_train.py` (EBFT_KEYS),
+`qlora_train_ebft.py` (args + cache/generator/live_sample wiring),
+`qlora_train_config.yaml`, both semancer_llama1b YAMLs, `doc/ebft.md`.
+
+**Staged next run (NOT launched):** Qwen3.5-4B @4bpw SFT-vs-EBFT,
+`semancer_qwen35_4b_{sft,ebft}.yaml` — identical hyperparameters to the llama
+A/B, `prompt_format: qwen3.5-nothink`, `offload_activations: false` (EBFT host-OOM
+rule). VRAM watch: 4B (32 layers / hidden 2560) at batch 4 / 64 rollout rows may
+approach 24 GB — if the EBFT arm OOMs, drop `batch` to 2 (rollout rows 32), NOT
+offload.
+
+---
+
 ## 0d. Multi-GPU strategy (rationale)
 
 "Multi-GPU" splits by *goal*, and QLoRA changes which tool fits, because only the
