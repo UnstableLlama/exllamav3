@@ -174,6 +174,14 @@ min_context: 8            # minimum context tokens before an anchor position
 temperature: 0.6          # rollout sampling temperature (paper Table 2: 0.6)
 top_k: 0                  # rollout top-k (0 = off)
 top_p: 1.0                # rollout top-p (1.0 = off)
+rollout_sampler: exact    # exact: gen_len full differentiable re-forwards per row -- zero
+                          #   sampling/scoring mismatch (v1 default). native: KV-cached generator
+                          #   through the runtime-LoRA slots (apply_to_native) with paged prefix
+                          #   dedup across sibling rollouts -- much faster; on-policy modulo
+                          #   inference-kernel numerics; refused for routed-expert LoRA (fused MoE
+                          #   kernels bypass the runtime slots). Scoring stays differentiable
+sampler_cache_tokens: 32768   # paged KV cache size (tokens) for rollout_sampler: native; rows that
+                          #   don't fit at once run in waves (correct, just less parallel)
 align_coef: 1.0           # alignment-to-ground-truth reward weight (reference: 1.0)
 div_coef: 0.5             # diversity (sibling-similarity) reward weight. 0.5 = the paper's alpha=0.5
                           #   alignment bias; 1.0 = the pure proper-scoring-rule objective
@@ -186,6 +194,9 @@ feature_fracs: 0.25,0.5,0.75   # fractional depths of the 3 frozen-feature taps
 adam_betas: 0.9,0.95      # Adam betas for EBFT (paper Table 2); the sft path uses its own default
 no_eval_cfm: false        # by default eval also runs rollouts to report held-out CFM / reward (the
                           #   paper's headline metric); set true for CE-only eval (faster)
+eval_cfm_samples: 0       # cap the CFM eval pass (the expensive rollout part) at a fixed-seed subset
+                          #   of N val examples; 0 = full val set. CE eval always covers the full val
+                          #   set. The full-set pass measured ~half the A/B's wall clock (Session 40)
 
 # ---------------------------------------------------------------------------
 # Data

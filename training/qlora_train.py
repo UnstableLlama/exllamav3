@@ -88,6 +88,7 @@ EBFT_KEYS = {
     "gen_len", "n_samples", "anchors", "min_context", "temperature",
     "top_k", "top_p", "align_coef", "div_coef", "rl_coef", "ce_coef",
     "no_whiten", "whiten_tol", "feature_fracs",
+    "rollout_sampler", "sampler_cache_tokens",
     # optimization
     "lr", "weight_decay", "optim", "adam_betas", "scheduler", "warmup_ratio",
     "warmup_steps", "epochs", "steps", "batch", "grad_accum", "max_grad_norm",
@@ -98,7 +99,7 @@ EBFT_KEYS = {
     "min_response_words",
     # eval / saving
     "eval_split", "eval_dataset", "eval_max_samples", "val_frac", "eval_every",
-    "no_eval_cfm", "save_best", "save_every", "checkpoint_every",
+    "no_eval_cfm", "eval_cfm_samples", "save_best", "save_every", "checkpoint_every",
     "keep_checkpoints", "resume", "reset_optimizer", "run_log", "seed",
     "self_test",
     # runtime knobs shared with the SFT trainer
@@ -117,7 +118,8 @@ EBFT_DEFAULTS = {
     "temperature": 0.6, "top_k": 0, "top_p": 1.0,
     "align_coef": 1.0, "div_coef": 0.5, "rl_coef": 1.0, "ce_coef": 0.03,
     "no_whiten": False, "whiten_tol": 1e-5, "feature_fracs": "0.25,0.5,0.75",
-    "adam_betas": "0.9,0.95", "no_eval_cfm": False,
+    "adam_betas": "0.9,0.95", "no_eval_cfm": False, "eval_cfm_samples": 0,
+    "rollout_sampler": "exact", "sampler_cache_tokens": 32768,
 }
 ALIASES = {"lora_r": "r"}  # DDP backend spells this --lora-r; config uses r.
 

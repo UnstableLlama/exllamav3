@@ -8,8 +8,10 @@
 #   CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 #     python training/qlora_train.py --config semancer_llama1b_ebft.yaml
 #
-# NOTE: EBFT is ~32 s/step on a 1B (the on-policy sampler re-forwards G times),
-# vs seconds/step for the SFT arm. ~436 examples / batch 4 = ~109 steps/epoch.
+# NOTE: with rollout_sampler: native (below) EBFT is ~9 s/step on a 1B and
+# ~32 s/eval, vs ~20 s/step + ~180 s/eval for the exact sampler (Session 41
+# measurements; the SFT arm is still seconds/step). ~436 examples / batch 4 =
+# ~109 steps/epoch.
 
 method: ebft
 model: /mnt/two/weights/meta-llama-Llama-3.2-1B-Instruct/4
@@ -41,6 +43,10 @@ anchors: 4
 temperature: 0.6
 div_coef: 0.5
 ce_coef: 0.03
+rollout_sampler: native  # KV-cached sampling via the runtime-LoRA slots: 2.06x
+                         # step speedup, self-test-verified against the training
+                         # forward (dense model, so no MoE caveat). Set to
+                         # `exact` for a strictly zero-mismatch run.
 
 # Data
 dataset: UnstableLlama/semancy
@@ -64,9 +70,11 @@ offload_activations: false   # OFF: 1B@4bpw fits ~5GB VRAM; the pinned-buffer
 attn_impl: auto
 
 # Evaluation (eval also runs rollouts for held-out CFM -- the paper's headline
-# metric -- so each eval costs more than the SFT arm's; raise eval_every if slow)
+# metric -- so each eval costs more than the SFT arm's)
 eval_split: test
 eval_every: 10
+eval_cfm_samples: 32   # CFM eval on a fixed-seed 32/116 subset (~32 s/eval vs
+                       # ~180 s full-set exact); CE eval still covers all 116
 save_best: true
 run_log: qlora_runs.csv
 

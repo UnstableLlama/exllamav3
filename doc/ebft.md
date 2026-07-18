@@ -105,8 +105,26 @@ depth via the HF `hidden_states` convention the reference critic uses. Features
 running the differentiable forward G times (no KV cache). Wasteful, but the
 rollout is sampled under *exactly* the policy the REINFORCE gradient is later
 computed against (`compute_logps` over the same path) — **zero sampling/scoring
-mismatch**, unlike a vLLM-vs-trainer RLHF stack. Faster alternatives are the
-first throughput lever (see Open work).
+mismatch**, unlike a vLLM-vs-trainer RLHF stack.
+
+**Native KV-cached sampler (Session 41, `--rollout-sampler native`).** Rollouts
+via the exllamav3 Generator through the runtime-LoRA slots (`apply_to_native`
+before each sampling call, removed after): one paged prefill + G single-token
+decode steps instead of G full-prefix re-forwards, and the paged cache dedups
+the shared context across each anchor's n sibling rollouts (one prefill per
+anchor, not per row). Scoring stays on the differentiable path either way.
+On-policy modulo inference-kernel numerics (fused fp16 kernels vs the training
+forward's dequant matmul — self-test measured max |Δlogp| 0.072 nats over the
+training top-20, argmax agreement): the classic RLHF sampler/trainer split
+minus the weight staleness. **Measured (Llama-3.2-1B @4bpw, A/B config): 2.06×
+step speedup** (17.5–22.5 s/step → 8.4–10.9; fwd share 77% → 53%; +1.07 GB VRAM
+for the 32k-token cache, `--sampler-cache-tokens`). **Refused for
+routed-expert LoRA** (fused MoE kernels bypass the runtime slots → rollouts
+would come from the base experts); the exact sampler remains the default and
+the only valid choice for MoE. Generator quirk encoded in the helper: a `Job`
+counts the prefill-position sample toward `max_new_tokens` (N yields N−1
+tokens), so it requests G+1; the KV `Cache` must be constructed *before*
+`model.load()` (same constraint the SFT trainer documents for live samples).
 
 **Anchors-as-rows (v1 choice).** The reference amortizes rollouts across a whole
 sequence with a Quiet-STaR custom attention mask (Appendix F). We instead sample
@@ -212,7 +230,10 @@ single|split`); no packing / `--train-head` / `--train-embeddings`.
 **unvalidated**), `--anchors`/`--n-samples`/`--batch` (rollout rows =
 batch·anchors·n_samples, the real memory/compute knob), `--no-whiten` (ablation
 — paper shows clear degradation without it), `--div-coef` (1.0 = pure
-proper-scoring-rule; 0.5 = the paper's α=0.5 alignment bias).
+proper-scoring-rule; 0.5 = the paper's α=0.5 alignment bias),
+`--rollout-sampler native` (KV-cached sampling, ~2× step, dense models only —
+see Architecture), `--eval-cfm-samples N` (cap the rollout part of eval at a
+fixed-seed subset; CE eval stays full).
 
 ---
 
@@ -223,15 +244,27 @@ proper-scoring-rule; 0.5 = the paper's α=0.5 alignment bias).
    together** — the paper's signature. Consider a γ=0 arm to isolate pure
    feature-matching (if CE still drops there, cleanest possible confirmation).
 2. **LoRA LR sweep** 1e-5..1e-4 (the one genuinely unknown hyperparameter).
-3. **Throughput:** native-generator sampling via `apply_to_native` (already
-   built, needs wiring) — **caveat:** routed-expert LoRA goes off-policy there
-   (fused MoE kernels bypass runtime LoRA); the exact sampler has no such
-   caveat, so MoE must use the exact sampler. Then Appendix-F strided-mask
-   rollouts.
+3. ~~**Throughput:** native-generator sampling via `apply_to_native`~~ —
+   **DONE Session 41** (`--rollout-sampler native`, 2.06× step + faster eval;
+   see the sampler section above and the eval-cost paragraph below). Remaining
+   throughput lever: Appendix-F strided-mask rollouts (amortize all anchors
+   across one sequence; bigger engineering, only worth it post-validation).
 4. **Scale up** only if the A/B validates.
 
-Cost note: A/B over ~5–10k examples is overnight-class at 1–1.5B on one 3090
-(~32 s/step, 8 seq/step, sampler-forward-bound).
+**Eval cost (Session 40 finding, Session 41 fix).** `--eval-cfm` (default on)
+runs the full rollout pipeline over the val set each eval — measured ~180 s
+per eval on the 116-example A/B val set with the exact sampler, ~half the
+quarter-epoch wall clock. Levers now built: the native sampler cuts it to
+~95–103 s, and `--eval-cfm-samples N` caps the CFM pass at a fixed-seed subset
+(same subset every eval AND every run, so trends stay comparable) — N=32
+measured 31–32 s/eval with the CFM trend preserved (capped 0.901→0.866 vs
+full 0.888→0.838 over the same 2 steps). CE eval always covers the full val
+set. The `[eval]` log line now prints eval seconds.
+
+Cost note: with the exact sampler the A/B over ~5–10k examples is
+overnight-class at 1–1.5B on one 3090 (~20–32 s/step, 8 seq/step,
+sampler-forward-bound); `--rollout-sampler native` + `--eval-cfm-samples 32`
+roughly halves the step time and makes eval near-free.
 
 ---
 

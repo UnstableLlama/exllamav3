@@ -79,7 +79,8 @@ from qlora_train_native import (  # noqa: E402
 )
 from run_report import RunLogger  # noqa: E402
 
-from exllamav3 import Config, Model, Tokenizer  # noqa: E402
+from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer  # noqa: E402
+from exllamav3.generator.sampler import ComboSampler  # noqa: E402
 from exllamav3.training.native_llama import NativeLlamaQLoRA  # noqa: E402
 from exllamav3.training.ebft import ebft_rewards, sample_rollouts  # noqa: E402
 
@@ -140,7 +141,66 @@ def extract_features(net, input_ids, attn, positions, blocks):
     return F.normalize(torch.cat(taps, dim=-1), p=2, dim=-1)
 
 
-def ebft_batch(net, batch, pad_id, args, rng, blocks, want_rollouts=False):
+def sample_rollouts_native(gen, ctx_rows, gen_len, args, pad_id, seed):
+    """KV-cached on-policy rollouts through the native inference path.
+
+    The caller must have pushed the current adapter into the runtime LoRA slots
+    (``net.apply_to_native()``) first, so the generator samples the CURRENT
+    policy -- modulo inference-kernel numerics (fused fp16 kernels vs the
+    training forward's dequant matmul): the classic RLHF sampler/trainer split,
+    minus the weight staleness. Scoring stays on the differentiable path
+    (``compute_logps``), same as the exact sampler.
+
+    Speed vs ``sample_rollouts``: one paged prefill + gen_len single-token
+    decode steps instead of gen_len full-prefix re-forwards -- and the paged
+    cache dedups the shared context across each anchor's n sibling rollouts,
+    so the context prefills once per ANCHOR, not once per row.
+
+    NOT valid for routed-expert LoRA (fused MoE kernels bypass the runtime
+    LoRA slots -> rollouts would come from the base experts, off-policy); the
+    trainer refuses that combination at startup.
+
+    Returns the same ``(rows [R, L'], lens [R])`` contract as the exact
+    sampler: right-padded context + exactly gen_len sampled tokens per row.
+    """
+    assert args.temperature > 0.0, \
+        "greedy rollouts collapse the RLOO baseline; use temperature > 0"
+    # Same stack order as the exact sampler: temperature -> top_k -> top_p ->
+    # sample (min_p 0 is a no-op step). No stop conditions: a sampled EOS is
+    # just a token, and every row must return exactly gen_len tokens.
+    sampler = ComboSampler(temperature=args.temperature,
+                           top_k=args.top_k, top_p=args.top_p)
+    ctx_lists = [torch.as_tensor(c, dtype=torch.long).tolist()
+                 for c in ctx_rows]
+    job_idx = {}
+    for i, ctx in enumerate(ctx_lists):
+        # Job counts the sample taken at the prefill position toward its
+        # budget (job.py: max_new_tokens - 1), so N yields N-1 sampled tokens;
+        # ask for gen_len + 1. The exact-count assert below guards this.
+        job = Job(input_ids=torch.tensor([ctx], dtype=torch.long),
+                  max_new_tokens=gen_len + 1, sampler=sampler, seed=seed + i)
+        job_idx[job] = i
+        gen.enqueue(job)
+    out = [[] for _ in ctx_lists]
+    while gen.num_remaining_jobs():
+        for r in gen.iterate():
+            i = job_idx.get(r["job"])
+            if i is None:
+                continue
+            # Tokens stream across events (and the eos event may carry a held
+            # remainder); collect from both spots.
+            for blob in (r, r.get("held") or {}):
+                t = blob.get("token_ids")
+                if t is not None:
+                    out[i] += t.flatten().tolist()
+    for i, toks in enumerate(out):
+        assert len(toks) == gen_len, \
+            f"native rollout {i}: {len(toks)} tokens, wanted {gen_len}"
+    return pad_rows([ctx + out[i] for i, ctx in enumerate(ctx_lists)], pad_id)
+
+
+def ebft_batch(net, batch, pad_id, args, rng, blocks, want_rollouts=False,
+               gen=None):
     """Loss + metrics for one micro-batch of examples.
 
     Returns (loss, metrics) like the other trainers' batch fns; loss is
@@ -165,9 +225,20 @@ def ebft_batch(net, batch, pad_id, args, rng, blocks, want_rollouts=False):
     for bi, a in groups:
         ctx_rows += [batch[bi]["input_ids"][:a]] * n
     ctx_ids, ctx_lens = pad_rows(ctx_rows, pad_id)
-    rows, row_lens = sample_rollouts(
-        net, ctx_ids, ctx_lens, G, temperature=args.temperature,
-        top_k=args.top_k, top_p=args.top_p)
+    if gen is not None:
+        # Native KV-cached sampler: install the current adapter in the runtime
+        # LoRA slots for the duration of the sampling call. try/finally so a
+        # sampler error can't leave stale weights in the inference path.
+        net.apply_to_native()
+        try:
+            rows, row_lens = sample_rollouts_native(
+                gen, ctx_rows, G, args, pad_id, seed=rng.randrange(1 << 31))
+        finally:
+            net.remove_from_native()
+    else:
+        rows, row_lens = sample_rollouts(
+            net, ctx_ids, ctx_lens, G, temperature=args.temperature,
+            top_k=args.top_k, top_p=args.top_p)
 
     # 3. phi features (frozen base = feature network).
     net.eval()
@@ -286,9 +357,12 @@ def reward_self_test():
     print(" -- reward self-test: OK (diversity gating, RLOO baseline, bounds)")
 
 
-def model_self_test(net, batch, pad_id, args, blocks):
+def model_self_test(net, batch, pad_id, args, blocks, gen=None):
     """Model-dependent checks: tap gather correctness, logp agreement between
-    compute_logps and materialized logits, grad isolation."""
+    compute_logps and materialized logits, grad isolation. With ``gen`` (a
+    native Generator, --rollout-sampler native), additionally checks that the
+    inference forward agrees with the training forward and that a full EBFT
+    step through the native sampler is finite."""
     ex = batch[0]
     ids = torch.tensor([ex["input_ids"][:min(len(ex["input_ids"]), 64)]])
     attn = torch.ones_like(ids)
@@ -329,6 +403,53 @@ def model_self_test(net, batch, pad_id, args, blocks):
     print(f" -- model self-test: OK (taps, logps, grads on {len(grads)} adapter tensors; "
           f"step metrics: reward {m['reward']:+.4f}, cfm {m['cfm']:.4f}, "
           f"dup {m['dup']:.2f})")
+    if gen is None:
+        return
+    # (d) native-vs-training forward agreement at the next-token position: the
+    # policy the native sampler draws from should match the policy the
+    # REINFORCE gradient is computed under, up to inference-kernel numerics
+    # (fused fp16 kernels vs dequant matmul). Reported, and loosely asserted:
+    # either the argmax tokens agree or the top-20 logprob gap is small.
+    ctx = torch.as_tensor(ex["input_ids"][:48], dtype=torch.long).tolist()
+    net.apply_to_native()
+    try:
+        job = Job(input_ids=torch.tensor([ctx], dtype=torch.long),
+                  max_new_tokens=1, return_logits=True,
+                  sampler=ComboSampler(temperature=args.temperature))
+        gen.enqueue(job)
+        nat_logits = None
+        while gen.num_remaining_jobs():
+            for r in gen.iterate():
+                for blob in (r, r.get("held") or {}):
+                    if blob.get("logits") is not None:
+                        nat_logits = blob["logits"]
+    finally:
+        net.remove_from_native()
+    assert nat_logits is not None, "native generator returned no logits"
+    with torch.no_grad():
+        tr_logits = net.logits(torch.tensor([ctx], dtype=torch.long),
+                               attention_mask=torch.ones(1, len(ctx),
+                                                         dtype=torch.long))
+    nat = torch.log_softmax(
+        nat_logits.reshape(-1, nat_logits.shape[-1])[-1].float(), dim=-1).cpu()
+    tr = torch.log_softmax(tr_logits[0, -1].float(), dim=-1).cpu()
+    top = tr.topk(20).indices
+    dmax = (nat[top] - tr[top]).abs().max().item()
+    agree = int(nat.argmax()) == int(tr.argmax())
+    assert agree or dmax < 0.25, \
+        (f"native/training forward disagree: argmax {int(nat.argmax())} vs "
+         f"{int(tr.argmax())}, max |dlogp| over training top-20 = {dmax:.4f}")
+    # (e) full EBFT step through the native sampler: finite loss, same metrics
+    # surface as the exact path.
+    loss2, m2 = ebft_batch(net, batch, pad_id, args, random.Random(0), blocks,
+                           gen=gen)
+    assert loss2 is not None and torch.isfinite(loss2), \
+        "EBFT loss (native sampler) not finite"
+    net.zero_grad(set_to_none=True)
+    print(f" -- native-sampler self-test: OK (argmax "
+          f"{'match' if agree else 'MISMATCH (within tol)'}, max |dlogp| "
+          f"top-20 = {dmax:.4f}; native-path step: reward {m2['reward']:+.4f}, "
+          f"cfm {m2['cfm']:.4f}, dup {m2['dup']:.2f})")
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +516,21 @@ def _run_main():
                     help="Rollout sampling temperature (paper Table 2: 0.6).")
     ap.add_argument("--top-k", type=int, default=0)
     ap.add_argument("--top-p", type=float, default=1.0)
+    ap.add_argument("--rollout-sampler", choices=["exact", "native"],
+                    default="exact",
+                    help="exact: gen_len full differentiable re-forwards per "
+                         "row, zero sampling/scoring mismatch (v1 default). "
+                         "native: KV-cached generator through the runtime-LoRA "
+                         "slots (apply_to_native) with paged prefix dedup "
+                         "across sibling rollouts -- much faster, on-policy "
+                         "modulo inference-kernel numerics; refused for "
+                         "routed-expert LoRA (fused MoE kernels bypass the "
+                         "runtime slots). Scoring stays differentiable either "
+                         "way.")
+    ap.add_argument("--sampler-cache-tokens", type=int, default=32768,
+                    help="Paged KV cache size (tokens) for --rollout-sampler "
+                         "native. Rows that don't fit at once run in waves "
+                         "(correct, just less parallel).")
     ap.add_argument("--align-coef", type=float, default=1.0,
                     help="Alignment reward coefficient (reference: 1.0).")
     ap.add_argument("--div-coef", type=float, default=0.5,
@@ -463,6 +599,13 @@ def _run_main():
                          "reward calibration (the paper's headline metric). "
                          "On by default; --no-eval-cfm for CE-only eval.")
     ap.add_argument("--no-eval-cfm", dest="eval_cfm", action="store_false")
+    ap.add_argument("--eval-cfm-samples", type=int, default=0,
+                    help="Cap the CFM eval pass (the expensive rollout part) "
+                         "at a fixed-seed subset of N val examples; 0 = full "
+                         "val set. CE eval always uses the full val set. The "
+                         "full-set CFM pass measured ~half the wall clock of "
+                         "the Session-40 quarter-epoch A/B (116 examples, "
+                         "~3 min/eval).")
     ap.add_argument("--save-best", action="store_true",
                     help="Keep the checkpoint with the best held-out CE.")
     ap.add_argument("--save-every", type=int, default=0)
@@ -535,6 +678,13 @@ def _run_main():
     _FAIL_CTX["phase"] = "load_model"
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
+    # The KV cache must be created BEFORE model.load() so each attention layer
+    # allocates its paged cache during loading (same constraint as the SFT
+    # trainer's live-sample generator); otherwise generation asserts on a
+    # missing k_cache. Only needed for --rollout-sampler native.
+    sampler_cache = None
+    if args.rollout_sampler == "native":
+        sampler_cache = Cache(model, max_num_tokens=args.sampler_cache_tokens)
     if args.parallel == "split":
         load_kwargs = {}
         if args.reserve_per_device is not None:
@@ -587,6 +737,20 @@ def _run_main():
           f"| rl {args.rl_coef} / ce {args.ce_coef} | "
           f"whiten={'off' if args.no_whiten else 'on'} | "
           f"phi taps at blocks {blocks} (of {len(net.blocks)})")
+
+    # Optional KV-cached rollout sampler on the native inference path.
+    gen = None
+    if args.rollout_sampler == "native":
+        if any(w.r > 0 and ".experts." in w.key for w in net._wrappers):
+            raise SystemExit(
+                "--rollout-sampler native is off-policy for routed-expert "
+                "LoRA: the fused MoE inference kernels bypass the runtime "
+                "LoRA slots, so rollouts would come from the BASE experts. "
+                "Use --rollout-sampler exact (or non-expert --targets).")
+        gen = Generator(model=model, cache=sampler_cache, tokenizer=tokenizer)
+        print(f" -- rollout sampler: native generator (KV-cached, paged prefix "
+              f"dedup across sibling rollouts, {args.sampler_cache_tokens} "
+              f"cache tokens); scoring stays on the differentiable path")
 
     # 3. Data.
     _FAIL_CTX["phase"] = "build_dataset"
@@ -665,7 +829,8 @@ def _run_main():
 
     if args.self_test:
         _FAIL_CTX["phase"] = "self_test"
-        model_self_test(net, examples[:args.batch], pad_id, args, blocks)
+        model_self_test(net, examples[:args.batch], pad_id, args, blocks,
+                        gen=gen)
         print(" -- self-test complete; exiting (drop --self-test to train).")
         return
 
@@ -726,11 +891,25 @@ def _run_main():
                            best_val=best_val, best_val_step=best_val_step, ema=ema)
         print(f"{tag} Adapter written to {args.out}")
 
+    # CFM eval subset (--eval-cfm-samples): the rollout pass is the expensive
+    # part of eval; a fixed-seed subset keeps the CFM trend comparable across
+    # evals AND across runs while cutting its cost proportionally. CE eval
+    # always covers the full val set (cheap).
+    cfm_examples = val_examples
+    if (args.eval_cfm and args.eval_cfm_samples
+            and len(val_examples) > args.eval_cfm_samples):
+        keep = sorted(random.Random(12345).sample(
+            range(len(val_examples)), args.eval_cfm_samples))
+        cfm_examples = [val_examples[i] for i in keep]
+        print(f" -- eval CFM capped at {len(cfm_examples)}/{len(val_examples)} "
+              f"val examples (--eval-cfm-samples, fixed-seed subset)")
+
     def evaluate():
         """Held-out CE (nats/token over supervised positions) and, with
         --eval-cfm, rollout-based CFM / reward calibration on the val set."""
         if not val_examples:
             return None, {}
+        ev_t0 = time.time()
         net.eval()
         vrng = random.Random(12345)   # fixed anchors/rollouts across evals
         # Fix the rollout RNG for comparable evals, WITHOUT perturbing the
@@ -757,9 +936,10 @@ def _run_main():
                 ce_num += l.item() * ntok
                 ce_den += ntok
             if args.eval_cfm:
-                for i in range(0, len(val_examples), args.batch):
-                    vb = val_examples[i:i + args.batch]
-                    _, m = ebft_batch(net, vb, pad_id, args, vrng, blocks)
+                for i in range(0, len(cfm_examples), args.batch):
+                    vb = cfm_examples[i:i + args.batch]
+                    _, m = ebft_batch(net, vb, pad_id, args, vrng, blocks,
+                                      gen=gen)
                     if not m:
                         continue
                     for k in ("cfm", "fmw", "reward", "dup"):
@@ -770,7 +950,9 @@ def _run_main():
         if cuda_states is not None:
             torch.cuda.set_rng_state_all(cuda_states)
         ce = ce_num / max(ce_den, 1)
-        return ce, {k: s / c for k, (s, c) in agg.items()}
+        em = {k: s / c for k, (s, c) in agg.items()}
+        em["eval_s"] = time.time() - ev_t0
+        return ce, em
 
     def fmt_eval(vl, em):
         parts = [f"ce {vl:.4f}"]
@@ -782,6 +964,8 @@ def _run_main():
             parts.append(f"reward {em['reward']:+.4f}")
         if "dup" in em:
             parts.append(f"dup {em['dup']:.2f}")
+        if "eval_s" in em:
+            parts.append(f"{em['eval_s']:.0f}s")
         return " | ".join(parts)
 
     bgen = batches()
@@ -886,7 +1070,8 @@ def _run_main():
             timer.mark("data")
             n_micro = 0
             for batch in window:
-                loss, m = ebft_batch(net, batch, pad_id, args, rng, blocks)
+                loss, m = ebft_batch(net, batch, pad_id, args, rng, blocks,
+                                     gen=gen)
                 if loss is None:
                     continue
                 n_micro += 1
@@ -1043,7 +1228,8 @@ def _hparam_note(args):
             f"anchors={args.anchors} temp={args.temperature} "
             f"align={args.align_coef} div={args.div_coef} "
             f"rl={args.rl_coef} ce={args.ce_coef} "
-            f"whiten={0 if args.no_whiten else 1} mode={args.mode}")
+            f"whiten={0 if args.no_whiten else 1} mode={args.mode} "
+            f"sampler={args.rollout_sampler}")
 
 
 if __name__ == "__main__":
