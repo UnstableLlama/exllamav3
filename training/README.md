@@ -22,14 +22,35 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
 ## Files
 
 - `qlora_train.py` + `qlora_train_config.yaml` — the YAML launcher (single
-  command entry point; picks the single-GPU, layer-split, or DDP backend) and
-  its fully-commented reference config.
+  command entry point) and its fully-commented reference config. `method:`
+  picks the objective — `sft` (next-token CE, default) or `ebft` — and
+  `parallel:` picks the single-GPU, layer-split, or DDP backend (`ebft` is
+  single/split only). A paired SFT-vs-EBFT A/B is the same config with only
+  `method` (and `out`/`run_name`) changed; see `semancer_llama1b_{sft,ebft}.yaml`
+  in the repo root for a worked pair.
 - `qlora_train_native.py` — the single-GPU / layer-split SFT trainer (plain
   PyTorch, no transformers). Also home to the shared data/tokenization helpers
   the other trainers import.
 - `qlora_train_native_ddp.py` — the multi-GPU DDP variant (run under
   `torchrun`).
 - `qlora_train_pref.py` — DPO / KTO preference training on the native path.
+- `qlora_train_ebft.py` — Energy-Based Fine-Tuning (EBFT, arXiv:2603.12248):
+  on-policy feature-matching policy gradient. The frozen feature network is
+  the adapter-disabled base (the DPO/KTO reference trick); rollouts use the
+  exact sampler over the differentiable forward; rewards/RLOO live in
+  `exllamav3/training/ebft.py` (reference-faithful to `sjelassi/ebft_openrlhf`,
+  CPU-tested in `tests/test_ebft.py`). Run `--self-test` first on a new
+  model. First known EBFT + LoRA/quantized implementation — treat results
+  as research, compare against an SFT baseline on the same data.
+- `run_report.py` — the default local logging path (replaces wandb for
+  shareable dashboards). Every run with an `--out` streams config + per-step
+  metrics + evals to `<out>/run_report/` and renders a self-contained
+  `report.html` (inline vanilla-JS SVG charts, no CDN, no account) on finish;
+  a crash still renders whatever it logged. Used by both the SFT
+  (`qlora_train_native.py`) and EBFT trainers with a shared metric schema, so
+  SFT-vs-EBFT runs render comparable dashboards. `--no-report` opts out;
+  `--wandb-project` is still available but off by default. CPU-tested in
+  `tests/test_run_report.py`.
 - `qlora_validate_native.py` — the correctness gates: compares the
   differentiable training forward against exllamav3's own inference forward.
   Run this FIRST on any new model/architecture.
@@ -72,5 +93,7 @@ deploy by merge-and-requantize. See the Session 20/21/26/28 notes in
 
 - `doc/qlora_handoff.md` — the full engineering log (per-session results,
   decision records, backlog).
+- `doc/ebft.md` — Energy-Based Fine-Tuning: design decisions, what's verified,
+  how to run, and open work. Standalone context-refresh doc for the EBFT path.
 - `doc/qlora_feasibility.md`, `doc/qlora_multigpu_plan.md`,
   `doc/qlora_optimization_audit.md` — design rationale and plans.

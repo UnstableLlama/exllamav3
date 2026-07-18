@@ -1,11 +1,13 @@
 """
 YAML-driven QLoRA training launcher.
 
-Single command entry point for the native EXL3 QLoRA trainers. The YAML selects
-``parallel: single``, ``parallel: split`` or ``parallel: ddp``; this launcher then
-execs the matching backend with the corresponding command-line arguments. For
-DDP, run this script directly (not under torchrun): it will launch torchrun using
-the ``ddp`` section in the config.
+Single command entry point for the native EXL3 QLoRA trainers. ``method:``
+selects the objective -- ``sft`` (next-token CE, the default) or ``ebft``
+(Energy-Based Fine-Tuning) -- and ``parallel:`` selects ``single``, ``split`` or
+``ddp``; this launcher then execs the matching backend with the corresponding
+command-line arguments. ``method: ebft`` runs the EBFT backend and supports
+``parallel: single|split`` only (no ddp). For DDP, run this script directly (not
+under torchrun): it will launch torchrun using the ``ddp`` section in the config.
 
 Usage:
     python training/qlora_train.py --config training/qlora_train_config.yaml
@@ -25,10 +27,13 @@ from typing import Any
 SCRIPT_DIR = Path(__file__).resolve().parent
 SINGLE_BACKEND = SCRIPT_DIR / "qlora_train_native.py"
 DDP_BACKEND = SCRIPT_DIR / "qlora_train_native_ddp.py"
+EBFT_BACKEND = SCRIPT_DIR / "qlora_train_ebft.py"
+
+METHOD_CHOICES = {"sft", "ebft"}
 
 
 # Config keys that are launcher-only and must not be forwarded to backend scripts.
-LAUNCHER_KEYS = {"ddp", "backend", "config", "parallel"}
+LAUNCHER_KEYS = {"ddp", "backend", "config", "parallel", "method"}
 DDP_LAUNCH_KEYS = {
     "nproc_per_node", "nproc", "standalone", "nnodes", "node_rank",
     "master_addr", "master_port", "rdzv_backend", "rdzv_endpoint", "rdzv_id",
@@ -66,8 +71,54 @@ SINGLE_ONLY_KEYS = {
     "quant_aware", "quant_aware_scale", "quant_aware_ref_model",
     "torch_profile",   # torch.profiler window; DDP backend has no such flag
     "wandb_project", "wandb_run_name", "wandb_entity",  # not mirrored to DDP yet
+    "no_report", "run_name",   # local run report; native single/split + ebft, not DDP
 }
 DDP_ONLY_KEYS = set()
+
+# Keys forwarded to the EBFT backend (qlora_train_ebft.py) when method: ebft.
+# Explicit so an SFT-only knob under method: ebft fails early instead of being
+# silently dropped. ``parallel`` is appended by the launcher, not from here.
+EBFT_KEYS = {
+    # identity / placement
+    "model", "out", "device", "reserve_per_device", "use_per_device",
+    # LoRA / init
+    "r", "alpha", "use_rslora", "targets", "expert_r", "init_lora",
+    "init_svd_niter", "init_ref_model", "init_eva_tokens",
+    # EBFT objective
+    "gen_len", "n_samples", "anchors", "min_context", "temperature",
+    "top_k", "top_p", "align_coef", "div_coef", "rl_coef", "ce_coef",
+    "no_whiten", "whiten_tol", "feature_fracs",
+    # optimization
+    "lr", "weight_decay", "optim", "adam_betas", "scheduler", "warmup_ratio",
+    "warmup_steps", "epochs", "steps", "batch", "grad_accum", "max_grad_norm",
+    # data
+    "mode", "dataset", "dataset_split", "dataset_config", "instruction_key",
+    "context_key", "response_key", "messages_key", "text_key", "prompt_format",
+    "max_samples", "shuffle", "shuffle_seed", "seq_len", "clean_text",
+    "min_response_words",
+    # eval / saving
+    "eval_split", "eval_dataset", "eval_max_samples", "val_frac", "eval_every",
+    "no_eval_cfm", "save_best", "save_every", "checkpoint_every",
+    "keep_checkpoints", "resume", "reset_optimizer", "run_log", "seed",
+    "self_test",
+    # runtime knobs shared with the SFT trainer
+    "compute_dtype", "no_grad_ckpt", "attn_impl", "ce_chunk", "head_vocab_chunk",
+    "offload_activations", "offload_mode", "use_liger", "dequant_mode",
+    # local run report
+    "no_report", "run_name",
+}
+
+# EBFT-only knobs at their reference-code defaults. Mirrors SINGLE_ONLY_DEFAULTS:
+# lets the fully-commented sample config expose the EBFT section at its defaults
+# under method: sft (where these keys aren't forwarded) without tripping the
+# unsupported-key check -- only a non-default EBFT value under sft is an error.
+EBFT_DEFAULTS = {
+    "mode": "qa", "gen_len": 8, "n_samples": 4, "anchors": 4, "min_context": 8,
+    "temperature": 0.6, "top_k": 0, "top_p": 1.0,
+    "align_coef": 1.0, "div_coef": 0.5, "rl_coef": 1.0, "ce_coef": 0.03,
+    "no_whiten": False, "whiten_tol": 1e-5, "feature_fracs": "0.25,0.5,0.75",
+    "adam_betas": "0.9,0.95", "no_eval_cfm": False,
+}
 ALIASES = {"lora_r": "r"}  # DDP backend spells this --lora-r; config uses r.
 
 SINGLE_ONLY_DEFAULTS = {
@@ -97,6 +148,8 @@ SINGLE_ONLY_DEFAULTS = {
     "wandb_project": "",
     "wandb_run_name": "",
     "wandb_entity": "",
+    "no_report": False,
+    "run_name": "",
 }
 
 
@@ -240,54 +293,77 @@ def flatten_config(data: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def validate_config(cfg: dict[str, Any], parallel: str) -> None:
+def validate_config(cfg: dict[str, Any], parallel: str, method: str) -> None:
     # Recognize the full schema in every mode so a full sample config can switch
-    # between single/split/ddp by changing only `parallel`; mode-specific keys are
-    # checked below and may remain present when empty/false.
-    supported = COMMON_KEYS | SINGLE_ONLY_KEYS | DDP_ONLY_KEYS | LAUNCHER_KEYS
+    # between methods/parallel by changing only `method`/`parallel`; keys the
+    # chosen backend does not accept are checked below and may remain present
+    # when empty/false.
+    supported = (COMMON_KEYS | SINGLE_ONLY_KEYS | DDP_ONLY_KEYS
+                 | EBFT_KEYS | LAUNCHER_KEYS)
     unknown = sorted(k for k in cfg if k not in supported)
     if unknown:
         raise SystemExit("Unknown config key(s): " + ", ".join(unknown))
 
-    if parallel == "ddp":
-        bad = []
-        for key in sorted(SINGLE_ONLY_KEYS & set(cfg)):
-            if key == "parallel":
-                continue
-            value = cfg[key]
-            # Allow sample config to expose unsupported false/empty knobs without
-            # making every DDP config delete them.
-            if isinstance(value, (list, tuple, dict)) and not value:
-                continue
-            if key in SINGLE_ONLY_DEFAULTS and value == SINGLE_ONLY_DEFAULTS[key]:
-                continue
-            if not is_default_false(value):
-                bad.append(key)
-        if bad:
-            raise SystemExit(
-                "These config key(s) are only supported by parallel=single|split, "
-                "not ddp: " + ", ".join(bad)
-            )
+    if not cfg.get("model"):
+        raise SystemExit("config must set `model: /path/to/exl3_model`")
+
+    # The set of keys the chosen backend actually accepts.
+    if method == "ebft":
+        allowed, label = EBFT_KEYS, "method: ebft"
+    elif parallel == "ddp":
+        allowed, label = COMMON_KEYS | DDP_ONLY_KEYS, "parallel: ddp"
+    else:
+        allowed, label = COMMON_KEYS | SINGLE_ONLY_KEYS, "parallel: single|split"
+
+    # A key the backend can't accept is an error only if it's set to a non-empty,
+    # non-default value -- a full sample config may leave unsupported knobs at
+    # their empty/false/default so it can switch backends by editing one key.
+    bad = []
+    for key in sorted(set(cfg) - allowed - LAUNCHER_KEYS):
+        value = cfg[key]
+        if isinstance(value, (list, tuple, dict)) and not value:
+            continue
+        if key in SINGLE_ONLY_DEFAULTS and value == SINGLE_ONLY_DEFAULTS[key]:
+            continue
+        if key in EBFT_DEFAULTS and value == EBFT_DEFAULTS[key]:
+            continue
+        if is_default_false(value):
+            continue
+        bad.append(key)
+    if bad:
+        raise SystemExit(
+            f"These config key(s) are not supported by {label}: " + ", ".join(bad))
 
     if parallel != "split":
         for key in ("reserve_per_device", "use_per_device", "split_even"):
             if key in cfg and cfg[key]:
                 raise SystemExit(f"{key} only applies when parallel: split")
 
-    if not cfg.get("model"):
-        raise SystemExit("config must set `model: /path/to/exl3_model`")
-
 
 def build_backend_argv(cfg: dict[str, Any], config_path: Path) -> list[str]:
+    method = str(cfg.get("method", "sft")).lower()
+    if method not in METHOD_CHOICES:
+        raise SystemExit("method must be one of: " + ", ".join(sorted(METHOD_CHOICES)))
     parallel = str(cfg.get("parallel", "single")).lower()
     if parallel not in {"single", "split", "ddp"}:
         raise SystemExit("parallel must be one of: single, split, ddp")
     cfg["parallel"] = parallel
-    validate_config(cfg, parallel)
+    if method == "ebft" and parallel == "ddp":
+        raise SystemExit("method: ebft supports parallel: single|split only (no ddp).")
+    validate_config(cfg, parallel, method)
+
+    # EBFT: exec the EBFT backend, forwarding only the keys it accepts.
+    if method == "ebft":
+        argv: list[str] = [sys.executable, str(EBFT_BACKEND)]
+        append_arg(argv, "parallel", parallel, ddp=False)  # accepts single|split
+        for key in sorted(EBFT_KEYS):
+            if key in cfg:
+                append_arg(argv, key, cfg[key], ddp=False)
+        return argv
 
     ddp = parallel == "ddp"
     backend = DDP_BACKEND if ddp else SINGLE_BACKEND
-    argv: list[str] = [sys.executable, str(backend)]
+    argv = [sys.executable, str(backend)]
 
     if not ddp:
         # qlora_train_native.py accepts --parallel single|split.

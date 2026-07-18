@@ -1,0 +1,63 @@
+# Llama-3.2-1B-Instruct (4bpw) on semancy -- SFT arm of the SFT-vs-EBFT A/B.
+# Pairs with semancer_llama1b_ebft.yaml: identical data / LoRA / optimizer; only
+# the objective differs (next-token CE here, energy-based feature matching there).
+# Both write a self-contained HTML run report to <out>/run_report/report.html.
+# Overlay the two afterwards with:
+#   python training/run_report.py out/ab_sft out/ab_ebft --labels SFT,EBFT -o out/sft_vs_ebft.html
+#
+# Launch:
+#   CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     python training/qlora_train.py --config semancer_llama1b_sft.yaml
+
+method: sft
+model: /mnt/two/weights/meta-llama-Llama-3.2-1B-Instruct/4
+out: out/ab_sft
+run_name: llama1b-semancy-sft
+
+parallel: single
+
+# LoRA / optimization  (matched to the EBFT arm)
+r: 16
+alpha: 16
+use_rslora: true
+init_lora: default
+lr: 0.0000125          # << DECIDE: per-method (SFT 1.25e-5) or identical 1e-5 to fully control LR
+weight_decay: 0.01
+scheduler: cosine
+warmup_ratio: 0.03
+epochs: 1              # << DECIDE (scale): 1 epoch quick, or 2 to match the recent semancer run
+batch: 4
+grad_accum: 1
+max_grad_norm: 1.0
+compute_dtype: bfloat16
+
+# Data
+dataset: UnstableLlama/semancy
+messages_key: messages
+prompt_format: auto
+seq_len: 1024
+pack: false
+shuffle: true
+
+# Trainable modules
+targets:
+  - down_proj
+  - gate_proj
+  - up_proj
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+offload_activations: true
+attn_impl: auto
+sample_every: 0
+
+# Evaluation
+eval_split: test
+eval_every: 10
+save_best: true
+run_log: qlora_runs.csv
+
+# Logging: local HTML run report is on by default (run_name above titles it).
+# No wandb here -- the team entity is broken (CommError on recent runs) and the
+# local report is the shareable dashboard now.

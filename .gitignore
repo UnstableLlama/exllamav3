@@ -1,11 +1,12 @@
 *.egg-info/
 build/
-
+malamus/
 *.pyc
 __pycache__/
 .idea
 venv
 dist
+mala-data/
 
 # produced by `pip install -e .`
 exllamav3_ext.cpython-*.so
@@ -17,3 +18,5 @@ qlora_runs.csv.errors.log
 qlora_runs.csv.*
 # unsloth writes its compiled kernel cache into cwd
 unsloth_compiled_cache/
+# wandb local run artifacts (wandb is now opt-in; the local run_report is default)
+wandb/
