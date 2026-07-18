@@ -94,6 +94,53 @@ Qwen3.5-4B @4bpw, identical hyperparameters.
 
 ---
 
+## Result: Qwen-4B A/B + LR sweep (Session 43)
+
+Qwen3.5-4B @4bpw, semancy, same matched hyperparameters as the 1B A/B (r16/α16,
+rsLoRA, init default, 1 epoch / 109 steps, batch 4, 7 dense targets, seq 1024;
+EBFT G8/n4/anchors4, temp 0.6, div 0.5, γ 0.03, native sampler), plus a **2× LR
+arm for each objective**. Configs `semancer_qwen35_4b_{sft,ebft}[_lr2x].yaml`;
+overlays `out/qwen35_4b_sft_vs_ebft.html`, `out/qwen35_4b_full_sweep.html`.
+
+| run | held-out CE ↓ |
+|---|---|
+| **SFT @2e-5** | **2.272** |
+| SFT @1e-5 | 2.305 |
+| EBFT @1e-5 | 2.637 |
+| EBFT @2e-5 | 2.736 |
+
+**LR-sweep read:** the two objectives want LR in **opposite directions**. SFT
+*improved* at 2× LR (2.305→2.272); EBFT *degraded* (2.637→2.736), and EBFT@2e-5's
+held-out CE actually **rose above baseline at step 10** before recovering — a
+high-LR / high-variance overshoot. So SFT has the wider LR band here; EBFT is the
+LR-sensitive one. (Within each objective the LR ranking is clean — same trainer,
+same eval path.)
+
+**Measurement caveat (unlike S42):** here the SFT CE comes from the *native*
+trainer's eval (`eval_loss`, **macro** = mean over examples) and the EBFT CE from
+the *EBFT* trainer's eval (`evaluate`, **micro** = mean over tokens) — different
+reductions, so the **SFT-vs-EBFT absolute gap is not apples-to-apples** (S42
+avoided this by measuring SFT through the EBFT `--resume` probe). Magnitude is
+bounded, though: the no-adapter **baseline** reads 2.987 (macro) vs 2.952 (micro)
+= only **~0.035 nats** of reduction difference, so it explains at most ~0.035 of
+the 0.33 SFT–EBFT gap. The gap is real; CE also remains SFT's home turf, not
+EBFT's objective nor a downstream-quality measure.
+
+**Paper-recipe finding (Appendix G) — we ran EBFT off-recipe.** The paper runs
+the RL-style methods (EBFT, RLVR) at a **constant lr 1e-6** (warmup 0.03, **no
+decay**); SFT uses lr 1e-5 with warmup+cosine. Our EBFT arms used lr 1e-5/2e-5
+(**10–20× too hot**) *and* cosine-decay-to-0 — so none of the EBFT numbers above
+is really "the paper's EBFT." This matches the data (EBFT wanted lower, steadier
+LR — REINFORCE-variance) and is the next lever, replacing the earlier "sweep LR
+*up*" plan. In our trainer `scheduler: none` = warmup-then-constant (verified in
+`make_lr_scheduler`), so the faithful run is **lr 1e-6, scheduler none**. Caveat:
+at 10× lower LR, 1 epoch underfits (the 1e-5 run was already unconverged), so a
+faithful reproduction needs ~10× the step budget (~8–10 epochs) — user-approved
+GPU time pending; paper's exact step count not yet found. See
+`memory/ebft-paper-lr-recipe.md`.
+
+---
+
 ## What EBFT is, in one paragraph
 
 Instead of next-token CE (SFT) or a scalar verifier reward (RLVR), train the
