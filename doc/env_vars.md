@@ -105,6 +105,23 @@ of using peer-to-peer copies. Workaround for platforms with broken or misreporte
 Rendezvous address and port for the tensor-parallel backend. The port defaults to a free port
 picked at startup.
 
+## Training
+
+### `EXL3_OFFLOAD_POOL_GIB` (default: `4`)
+
+Ceiling (in GiB) on the async activation offloader's free pinned-buffer pool
+(`offload_activations: true`, `offload_mode: async`). The offloader DtoH-copies
+grad-checkpoint activations to pooled pinned host buffers keyed by
+`(shape, dtype)`; a run whose per-step activation shape varies — EBFT (random
+anchors) or *unpacked* SFT (variable sequence length) — mints a new key every
+step, so without a bound the pool grows until the machine OOMs on pinned pages.
+The pool is now an LRU capped by total free bytes: the effective cap is
+`max(this value, 1.5 x the largest single forward pass)`, so a large but
+shape-STABLE run keeps its whole working set pooled (no re-alloc thrash) while
+the cross-pass leak is evicted. Read once per offloader (i.e. per net, at first
+offloaded forward), not at import. Raise it only if a legit shape-stable run is
+re-allocating; lower it to cap host RAM harder on a tight box.
+
 ## Debug
 
 ### `EXLLAMA_DEBUGLOG_<CATEGORY>` (default: unset)

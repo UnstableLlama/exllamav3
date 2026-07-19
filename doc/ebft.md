@@ -47,12 +47,19 @@ llama1b A/B YAMLs.** A 1B @4bpw + LoRA trains in ~5 GB — offload was pure
 downside here. This makes the A/B safe to relaunch after a context refresh.
 Only reach for offload on a model that genuinely doesn't fit.
 
-**Real fix (not built — needs GPU + user sign-off):** bound the pool in
-`offload.py` — evict by total pinned bytes (LRU over shape keys) with a cap, or
-clear the pool at each step/pass boundary. Verify with SFT (shape-stable, must
-stay at steady-state one-buffer-per-shape) *and* EBFT (shape-varying, must not
-grow across steps). Consider a startup warn when `offload_activations` is set
-but the model + activations comfortably fit VRAM.
+**Real fix — BUILT (Session 47).** `offload.py`'s free pool is now an LRU
+(`OrderedDict`, MRU last) bounded by total free bytes. Returning a buffer over
+the cap evicts least-recently-used shape buckets first (respecting each buffer's
+readback event before releasing pinned memory). The effective cap is
+`max(EXL3_OFFLOAD_POOL_GIB≈4 GiB, 1.5 × the largest single forward pass)` — the
+working-set floor lets a large but shape-STABLE run keep its whole pass pooled
+(no re-alloc thrash), while the cross-pass leak of stale shapes is evicted down
+to ~1.5 passes. Verified by `tests/test_offload.py` (GPU): (1) value-exact —
+grads bit-identical with/without offload; (2) bounded — pool peaks ~154 MB over
+40 varying-shape steps (working set ~103 MB) instead of growing ~40×; (3) no
+thrash — a fixed shape stays steady at exactly one pass. **Still pending: a
+real-run RAM watch on the 128B SFT relaunch** to confirm the synthetic result
+holds at scale before treating `offload_activations: true` as safe there again.
 
 **Confidence:** high on the mechanism (pool code read: shape-keyed, no eviction,
 persistent instance, EBFT per-step shape variance). The exact crash step is from

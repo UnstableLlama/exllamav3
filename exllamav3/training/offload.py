@@ -27,6 +27,22 @@ This module does the same with plain CUDA streams, no Triton:
     per saved tensor (~n_blocks x [b, t, d]; ~700 MB host RAM on the 3B
     reference config, the same amount save_on_cpu allocated transiently).
 
+The pool is BOUNDED (S47). The original pool was keyed by (shape, dtype) with
+no cap and no eviction, on the assumption above that "steady state holds one
+buffer per saved tensor". That assumption only holds for SHAPE-STABLE runs
+(packed SFT). Any run whose per-step activation shape varies — EBFT (random
+anchors → different padded rollout length each step) or *unpacked* SFT
+(variable real sequence length each step) — mints a fresh (shape, dtype) key
+every step and orphans the previous step's buffers in the pool forever, so
+pinned host RAM grows without bound until the machine OOMs (pinned pages can't
+swap). This crashed a 1B EBFT run and a 128B unpacked-SFT run. Fix: the free
+pool is an LRU (OrderedDict, MRU last) capped by total free bytes; returning a
+buffer over the cap evicts least-recently-used shape buckets first. The cap is
+``max(max_pool_bytes, 1.5 x largest single pass)`` — the working-set floor lets
+a legitimately large *shape-stable* run keep its whole pass pooled (no thrash),
+while the cross-pass leak (many passes' worth of stale shapes) is evicted down
+to ~1.5 passes. ``EXL3_OFFLOAD_POOL_GIB`` overrides the floor.
+
 Value-exact: copies don't round. A same-seed run must produce bit-identical
 losses to sync offload (and to no offload) — that is the verification gate.
 
@@ -39,7 +55,18 @@ Limitations (both raise clearly rather than corrupt):
 from __future__ import annotations
 from typing import Optional
 import collections
+import os
 import torch
+
+# Free-pool ceiling below which a shape-stable run is never touched. The
+# effective cap is raised to ~1.5x the largest observed single pass so large
+# stable runs don't thrash; this only bounds the cross-pass leak. Override with
+# EXL3_OFFLOAD_POOL_GIB.
+_DEFAULT_POOL_BYTES = 4 * (1 << 30)  # 4 GiB
+
+
+def _nbytes(t: torch.Tensor) -> int:
+    return t.numel() * t.element_size()
 
 
 class _Record:
@@ -63,11 +90,20 @@ class AsyncActivationOffload:
     across steps rather than being rebuilt per forward.
     """
 
-    def __init__(self, min_bytes: int = 1 << 20, prefetch: int = 1):
+    def __init__(self, min_bytes: int = 1 << 20, prefetch: int = 1,
+                 max_pool_bytes: Optional[int] = None):
         self.min_bytes = int(min_bytes)
         self.prefetch = max(0, int(prefetch))
+        if max_pool_bytes is None:
+            gib = os.environ.get("EXL3_OFFLOAD_POOL_GIB")
+            max_pool_bytes = float(gib) * (1 << 30) if gib else _DEFAULT_POOL_BYTES
+        self.max_pool_bytes = int(max_pool_bytes)
         self._streams: dict = {}                       # device index -> Stream
-        self._pool = collections.defaultdict(list)     # (shape, dtype) -> [(cpu, event)]
+        # (shape, dtype) -> [(cpu, event), ...], ordered LRU (most-recent last).
+        self._pool: "collections.OrderedDict" = collections.OrderedDict()
+        self._pool_bytes = 0                           # total free bytes held in the pool
+        self._working_set = 0                          # largest single-pass offloaded bytes seen
+        self._pass_bytes = 0                           # offloaded bytes in the currently open pass
         self._pass_records: Optional[list] = None      # records of the open pass
         self._hooks_ctx = None
 
@@ -82,17 +118,50 @@ class AsyncActivationOffload:
 
     def _get_pinned(self, shape, dtype) -> torch.Tensor:
         """A pinned host buffer, reused once its previous HtoD readback is done."""
-        free = self._pool.get((shape, dtype))
+        key = (shape, dtype)
+        free = self._pool.get(key)
         while free:
             cpu, event = free.pop()
+            self._pool_bytes -= _nbytes(cpu)
             if event is None or event.query():
+                if free:
+                    self._pool.move_to_end(key)        # bucket still live → mark MRU
+                else:
+                    del self._pool[key]
                 return cpu
             # Still in flight (backward hasn't caught up); don't block on it —
             # buffers come back in roughly FIFO order, so the rest of the list
             # is no more likely to be ready. Fall through to a fresh alloc.
             free.append((cpu, event))
+            self._pool_bytes += _nbytes(cpu)
+            self._pool.move_to_end(key)
             break
         return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+
+    def _return_pinned(self, cpu: torch.Tensor, event) -> None:
+        """Return a consumed pinned buffer to the pool, then enforce the cap."""
+        key = (tuple(cpu.shape), cpu.dtype)
+        bucket = self._pool.get(key)
+        if bucket is None:
+            bucket = self._pool[key] = []
+        bucket.append((cpu, event))
+        self._pool.move_to_end(key)                    # just used → MRU
+        self._pool_bytes += _nbytes(cpu)
+        # Effective cap floors at ~1.5x the largest single pass so a large but
+        # shape-stable run keeps its whole working set pooled (no re-alloc
+        # thrash); only the cross-pass leak of stale shapes is evicted.
+        cap = max(self.max_pool_bytes, int(self._working_set * 3 // 2))
+        while self._pool_bytes > cap and self._pool:
+            lru_key = next(iter(self._pool))           # least-recently-used bucket
+            lru = self._pool[lru_key]
+            evict_cpu, evict_event = lru.pop(0)
+            # The event is the last HtoD readback that read this buffer; the
+            # pinned memory can't be released until that copy has finished.
+            if evict_event is not None and not evict_event.query():
+                evict_event.synchronize()
+            self._pool_bytes -= _nbytes(evict_cpu)
+            if not lru:
+                del self._pool[lru_key]
 
     # --- saved_tensors_hooks ------------------------------------------------
 
@@ -100,6 +169,7 @@ class AsyncActivationOffload:
         if (not t.is_cuda) or t.numel() * t.element_size() < self.min_bytes:
             return ("keep", t)
         records = self._pass_records
+        self._pass_bytes += _nbytes(t)
         stream = self._stream(t.device)
         cpu = self._get_pinned(tuple(t.shape), t.dtype)
         stream.wait_stream(torch.cuda.current_stream(t.device))
@@ -161,7 +231,7 @@ class AsyncActivationOffload:
         rec.consumed = True
         rec.gpu = rec.cpu = None
         # The host buffer is reusable once the HtoD has actually read it.
-        self._pool[(tuple(cpu.shape), rec.dtype)].append((cpu, rec.event))
+        self._return_pinned(cpu, rec.event)
         return gpu
 
     # --- context ------------------------------------------------------------
@@ -170,6 +240,7 @@ class AsyncActivationOffload:
         assert self._hooks_ctx is None, \
             "AsyncActivationOffload does not support nested/concurrent passes"
         self._pass_records = []
+        self._pass_bytes = 0
         self._hooks_ctx = torch.autograd.graph.saved_tensors_hooks(
             self._pack, self._unpack)
         self._hooks_ctx.__enter__()
@@ -180,4 +251,7 @@ class AsyncActivationOffload:
         # The records list stays alive via the pack handles inside the autograd
         # graph; backward consumes it after this exit.
         self._pass_records = None
+        # Track the largest pass so the cap can floor at the real working set.
+        if self._pass_bytes > self._working_set:
+            self._working_set = self._pass_bytes
         return ctx.__exit__(*exc)
