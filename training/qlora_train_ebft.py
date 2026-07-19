@@ -75,6 +75,7 @@ from qlora_train_native import (  # noqa: E402
     save_trainer_state, load_trainer_state, restore_optimizer_state,
     build_sft_examples, build_lm_examples,
     build_optimizer, make_lr_scheduler, resolve_steps_and_warmup,
+    compute_even_split_budgets,
     format_prompt_and_eot, sample,
     _FAIL_CTX, _log_failure, _REPORT, _finish_report,
 )
@@ -488,6 +489,18 @@ def _run_main():
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--parallel", choices=["single", "split"], default="single")
     ap.add_argument("--reserve-per-device", nargs="*", type=float, default=None, metavar="GB")
+    ap.add_argument("--split-even", nargs="?", type=float, const=2.0, default=None,
+                    metavar="MARGIN_GB",
+                    help="(split) Balance the layer split across GPUs instead of the "
+                         "default greedy fill-device-0-first: each device is capped to "
+                         "its even share of the model's weight bytes (measured from the "
+                         "safetensors headers) plus any pre-attached KV-cache pages "
+                         "(the rollout sampler's cache allocates during load), "
+                         "plus MARGIN_GB of load-time slack "
+                         "(default 2.0), leaving every card similar training headroom. "
+                         "Raise the margin if loading fails with 'Insufficient VRAM in "
+                         "split'; shrink it if the split comes out lopsided. Mutually "
+                         "exclusive with --reserve-per-device/--use-per-device.")
     ap.add_argument("--use-per-device", nargs="*", type=float, default=None, metavar="GB")
     # LoRA
     ap.add_argument("--r", type=int, default=32)
@@ -698,8 +711,19 @@ def _run_main():
         sampler_cache = Cache(model, max_num_tokens=args.sampler_cache_tokens)
     elif args.sample_every:
         sampler_cache = Cache(model, max_num_tokens=4096)
+    if args.split_even is not None and args.parallel != "split":
+        raise SystemExit("--split-even only applies to --parallel split.")
     if args.parallel == "split":
         load_kwargs = {}
+        if args.split_even is not None:
+            if args.reserve_per_device is not None or args.use_per_device is not None:
+                raise SystemExit("--split-even computes its own per-device budgets; "
+                                 "drop --reserve-per-device/--use-per-device.")
+            budgets = compute_even_split_budgets(model, config, args.split_even)
+            print(f" -- split-even: use_per_device = "
+                  f"[{', '.join(f'{b:.1f}' for b in budgets)}] GB "
+                  f"(even weight shares + {args.split_even:g} GB load margin)")
+            load_kwargs["use_per_device"] = budgets
         if args.reserve_per_device is not None:
             load_kwargs["reserve_per_device"] = args.reserve_per_device
         if args.use_per_device is not None:

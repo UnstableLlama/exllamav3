@@ -82,7 +82,7 @@ DDP_ONLY_KEYS = set()
 # silently dropped. ``parallel`` is appended by the launcher, not from here.
 EBFT_KEYS = {
     # identity / placement
-    "model", "out", "device", "reserve_per_device", "use_per_device",
+    "model", "out", "device", "reserve_per_device", "use_per_device", "split_even",
     # LoRA / init
     "r", "alpha", "use_rslora", "targets", "expert_r", "init_lora",
     "init_svd_niter", "init_ref_model", "init_eva_tokens",

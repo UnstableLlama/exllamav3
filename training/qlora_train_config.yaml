@@ -50,7 +50,8 @@ method: sft               # sft: next-token cross-entropy (default). ebft: Energ
 parallel: single
 device: cuda:0             # single only: the one device to load and train on
 
-# How the SPLIT is placed (split only; the three knobs are mutually exclusive):
+# How the SPLIT is placed (split only, under both method: sft and method: ebft;
+# the three knobs are mutually exclusive):
 #
 # * Default (all three null): greedy autosplit -- packs device 0 until an
 #   allocation fails, then moves to device 1, etc. Simple, but the first

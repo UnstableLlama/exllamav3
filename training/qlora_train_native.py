@@ -1051,20 +1051,49 @@ def compute_even_split_budgets(model, config, margin_gb):
     Approximate by design: the slack lets a realized boundary drift a layer
     or two past the ideal one. A tied-embeddings LM head has no tensors of
     its own in the file, so it's estimated at the embedding's size.
+
+    Caches attached before ``model.load()`` (the live-sample generator's KV
+    cache here, the rollout sampler's in the EBFT trainer) allocate their
+    tensors on each layer's device DURING load, so they compete with the
+    weights for the per-device budget. Each module is therefore weighed as
+    weight bytes + its attached cache/state bytes, via the cache classes'
+    own ``storage_size()`` (exact -- the tensors exist on the meta device
+    before load). This covers paged KV layers AND recurrent per-slot states
+    (SWA ring buffers, GDN states): on a sliding-window model the SWA
+    states dominate -- gemma12b with a 32k-token cache carries ~190 MB per
+    sliding layer (16 batch slots x window), ~7.5 GB total, dwarfing both
+    the 0.5 GB of paged KV and the weight-only budgets that used to be
+    computed here ("Insufficient VRAM in split").
     """
     n = torch.cuda.device_count()
     if n < 2:
         raise SystemExit("--split-even needs >= 2 visible CUDA devices")
 
+    def attached_cache_bytes(module):
+        b = 0
+        for sub in module:
+            layers = list(getattr(sub, "cache_layers", ())) \
+                   + list(getattr(sub, "recurrent_layers", ()))
+            for cl in layers:
+                if hasattr(cl, "storage_size"):
+                    b += cl.storage_size()
+                if hasattr(cl, "overhead_size"):
+                    b += cl.overhead_size()
+        return b
+
     cpu_bytes = [sum(config.stc.get_tensor_sizes(m.key)) for m in model.modules
                  if m.caps.get("prefer_cpu")]
     sizes = []
+    head_bytes = 0
     for m in model.modules:
         if m.caps.get("prefer_cpu"):
             continue
         b = sum(config.stc.get_tensor_sizes(m.key))
         if b == 0 and m.caps.get("logits_output") and cpu_bytes:
             b = max(cpu_bytes)   # tied head: materialized from the embedding
+        if m.caps.get("logits_output"):
+            head_bytes = b
+        b += attached_cache_bytes(m)
         sizes.append(b)
 
     # Smallest capacity that fits the sequence in <= n contiguous chunks.
@@ -1092,9 +1121,22 @@ def compute_even_split_budgets(model, config, margin_gb):
             acc = 0
         acc += s
     budgets.append(acc)
-    # A 0 budget excludes the device entirely (loader treats use=0 as unused),
-    # so a model that balances across fewer than n devices leaves the rest idle.
-    return [b / 1024**3 + margin_gb if b > 0 else 0.0 for b in budgets]
+    # The margin is really a transient estimate: the loader frees each
+    # module's load/dummy-forward temporaries before packing the next one, so
+    # a device stops accepting layers at (cap - transient) -- an oversized
+    # margin makes earlier devices steal layers past their even share. The
+    # LAST device is exempt from that failure mode (it only ever gets the
+    # remainder), and it hosts the largest transient: materializing the
+    # logits head (a tied head is copied out of the CPU embedding at ~2 GB
+    # for a 256k vocab) roughly doubles the head's own footprint while
+    # loading. Give the last device that much extra instead of inflating the
+    # shared margin.
+    budgets = [float(b) / 1024**3 + margin_gb if b > 0 else 0.0 for b in budgets]
+    for i in reversed(range(len(budgets))):
+        if budgets[i] > 0:
+            budgets[i] += float(head_bytes) / 1024**3
+            break
+    return budgets
 
 
 def main():
@@ -1156,7 +1198,8 @@ def _run_main():
                     help="(split) Balance the layer split across GPUs instead of the "
                          "default greedy fill-device-0-first: each device is capped to "
                          "its even share of the model's weight bytes (measured from the "
-                         "safetensors headers) plus MARGIN_GB of load-time slack "
+                         "safetensors headers) plus any pre-attached KV-cache pages, "
+                         "plus MARGIN_GB of load-time slack "
                          "(default 2.0), leaving every card similar training headroom. "
                          "Raise the margin if loading fails with 'Insufficient VRAM in "
                          "split'; shrink it if the split comes out lopsided. Mutually "
