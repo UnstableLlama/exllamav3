@@ -12,7 +12,8 @@ import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "training"))
 from run_report import (  # noqa: E402
-    RunLogger, render_report, compare_reports, REPORT_SUBDIR)
+    RunLogger, render_report, compare_reports, REPORT_SUBDIR,
+    decode_example_docs, start_live_monitor)
 
 
 def _rdir(out):
@@ -206,6 +207,95 @@ def test_static_prerender_compare_no_js():
     print("  static pre-render (compare, no JS): OK")
 
 
+class _FakeTok:
+    """Stands in for exllamav3's Tokenizer: decode(1-D tensor) -> str."""
+    def decode(self, t, decode_special_tokens=False):
+        return " ".join(f"t{i}" for i in t.tolist())
+
+
+def test_decode_example_docs():
+    # Requires torch (CPU only); the rest of this file stays torch-free.
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        print("  decode_example_docs: SKIPPED (no torch)")
+        return
+    tok = _FakeTok()
+    # plain SFT example: masked prompt prefix + supervised response
+    docs = decode_example_docs(tok, {"input_ids": [5, 6, 7, 8],
+                                     "labels": [-100, -100, 7, 8]})
+    assert docs == [{"prompt": "t5 t6", "response": "t7 t8",
+                     "n_prompt": 2, "n_sup": 2}]
+    # packed block: two docs split on seg_ids; trailing pads (label -100 after
+    # the response, inheriting the last doc's seg id) must land in neither span
+    docs = decode_example_docs(tok, {
+        "input_ids": [1, 2, 3, 4, 5, 6, 0, 0],
+        "labels": [-100, 2, 3, -100, 5, 6, -100, -100],
+        "seg_ids": [0, 0, 0, 1, 1, 1, 1, 1]})
+    assert len(docs) == 2
+    assert docs[0] == {"prompt": "t1", "response": "t2 t3",
+                       "n_prompt": 1, "n_sup": 2}
+    assert docs[1] == {"prompt": "t4", "response": "t5 t6",
+                       "n_prompt": 1, "n_sup": 2}
+    print("  decode_example_docs (plain + packed + pad trim): OK")
+
+
+def test_live_monitor_endpoints():
+    import urllib.error
+    import urllib.request
+
+    def get(url):
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                return r.status, r.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8")
+
+    with tempfile.TemporaryDirectory() as out:
+        rep = RunLogger(out, "live-run", config={"lr": 1e-5})
+        rep.log({"train/loss": 2.5}, step=1)
+
+        def batch_fn(s):
+            if not (0 < s <= 10):
+                raise ValueError("step must be in [1, 10]")
+            return {"step": s, "micro_batches": [
+                {"micro": 0, "epoch": 0, "sequences": [
+                    {"index": 0, "docs": [{"prompt": "p", "response": "r",
+                                           "n_prompt": 1, "n_sup": 1}]}]}]}
+
+        srv = start_live_monitor(out, batch_fn=batch_fn, port=0,
+                                 open_browser=False,
+                                 live_info={"total_steps": 10, "first_step": 1,
+                                            "run_name": "live-run"})
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        try:
+            # / -> LIVE config injected (static template default is null)
+            code, html = get(base + "/")
+            assert code == 200
+            assert '"total_steps":10' in html, "LIVE info not injected"
+            assert "/*__LIVE__*/null" not in html, "LIVE left off in live page"
+            assert "__STATIC_TITLE__" not in html, "static tokens not replaced"
+            # /metrics -> the streamed jsonl
+            code, body = get(base + "/metrics")
+            assert code == 200 and '"train/loss": 2.5' in body
+            # /batch -> provider JSON; out-of-range / garbage -> 400
+            code, body = get(base + "/batch?step=3")
+            assert code == 200 and json.loads(body)["step"] == 3
+            assert get(base + "/batch?step=99")[0] == 400
+            assert get(base + "/batch?step=x")[0] == 400
+            assert get(base + "/nope")[0] == 404
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        # the shareable artifact must stay non-live and dataset-free
+        rep.finish(0)
+        with open(os.path.join(_rdir(out), "report.html")) as f:
+            static = f.read()
+        assert "/*__LIVE__*/null" in static, "static report must keep LIVE off"
+        assert "micro_batches" not in _data_of(static), "dataset leaked into report"
+    print("  live monitor endpoints + static stays non-live: OK")
+
+
 if __name__ == "__main__":
     test_full_run_renders()
     test_finish_is_idempotent()
@@ -215,4 +305,6 @@ if __name__ == "__main__":
     test_compare_dedupes_labels()
     test_static_prerender_single_run_no_js()
     test_static_prerender_compare_no_js()
+    test_decode_example_docs()
+    test_live_monitor_endpoints()
     print("ALL RUN_REPORT TESTS PASSED")

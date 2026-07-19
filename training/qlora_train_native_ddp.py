@@ -52,7 +52,8 @@ from qlora_train_native import (  # noqa: E402
     format_prompt_and_eot, sample,
     _FAIL_CTX, _log_failure, _REPORT, _finish_report,
 )
-from run_report import RunLogger  # noqa: E402
+from run_report import (RunLogger, decode_example_docs,  # noqa: E402
+                        start_live_monitor)
 
 from exllamav3 import Config, Model, Tokenizer  # noqa: E402
 from exllamav3.training.native_llama import NativeLlamaQLoRA  # noqa: E402
@@ -323,6 +324,17 @@ def _run_main():
     ap.add_argument("--run-name", default=None,
                     help="Name for the local run report (defaults to the "
                          "basename of --out).")
+    ap.add_argument("--live-report", action="store_true",
+                    help="Serve a LIVE run monitor from rank 0 (localhost http "
+                         "thread, opens the browser at run start): charts "
+                         "redraw as metrics log, plus a step viewer decoding "
+                         "the exact examples any step trains on -- every "
+                         "rank's shard, labeled by rank; past or future steps "
+                         "(deterministic order, simulated on rank 0; nothing "
+                         "written to disk -- report.html stays the dataset-"
+                         "free shareable artifact).")
+    ap.add_argument("--live-report-port", type=int, default=0,
+                    help="Port for --live-report (default 0 = pick a free one).")
     ap.add_argument("--run-log", default="qlora_runs.csv",
                     help="Append one metadata row per run to this CSV (rank 0 only). "
                          "Same schema as the single-GPU arm; failures are recorded "
@@ -660,6 +672,56 @@ def _run_main():
         elif is_main(rank):
             print(f" -- {args.resume} has no trainer_state.pt; resuming weights "
                   f"only (cold optimizer + schedule from step 0).")
+
+    # Live monitor (--live-report, rank 0 only). Mirrors every rank's batches():
+    # shard r = examples[r::world_size] shuffled by a STATEFUL per-rank rng
+    # (Random(1234+r), cumulative shuffles across epochs), so rank 0 simulates
+    # each rank's rng stream, extending the per-epoch permutations lazily as
+    # future steps are browsed. The k-th step of THIS process (a resume
+    # restarts bgen) consumes micro-batches k*ga .. k*ga+ga-1 of every rank's
+    # own stream; shard sizes (and so micro-batches per pass) can differ by
+    # rank, which is why the epoch index is computed per rank.
+    if args.live_report and is_main(rank):
+        if report is None:
+            print(" -- --live-report needs the local report; ignoring "
+                  "(--no-report set or no --out)")
+        else:
+            live_shards = [examples[r::world_size] for r in range(world_size)]
+            live_orders = [{"rng": random.Random(1234 + r),
+                            "order": list(range(len(live_shards[r]))),
+                            "perms": []} for r in range(world_size)]
+
+            def live_perm(r, e):
+                st = live_orders[r]
+                while len(st["perms"]) <= e:
+                    st["rng"].shuffle(st["order"])
+                    st["perms"].append(st["order"][:])
+                return st["perms"][e]
+
+            def live_batch_fn(s):
+                if not (resume_step < s <= args.steps):
+                    raise ValueError(
+                        f"step must be in [{resume_step + 1}, {args.steps}]")
+                mbs = []
+                for r in range(world_size):
+                    mpe = max(1, len(live_shards[r]) // args.batch)
+                    for g in range(args.grad_accum):
+                        m = (s - resume_step - 1) * args.grad_accum + g
+                        e, w = divmod(m, mpe)
+                        seqs = [{"index": r + j * world_size,  # pre-shard index
+                                 "docs": decode_example_docs(
+                                     tokenizer, live_shards[r][j])}
+                                for j in live_perm(r, e)[w * args.batch:
+                                                         (w + 1) * args.batch]]
+                        mbs.append({"micro": g, "epoch": e, "rank": r,
+                                    "sequences": seqs})
+                return {"step": s, "micro_batches": mbs}
+
+            start_live_monitor(
+                args.out, batch_fn=live_batch_fn, port=args.live_report_port,
+                live_info={"total_steps": args.steps,
+                           "first_step": resume_step + 1,
+                           "run_name": run_name})
 
     # |dB| telemetry baseline (rank 0 only -- it's the only rank that logs).
     # Same rationale as the single-GPU arm: with an SVD init the raw ||B|| is

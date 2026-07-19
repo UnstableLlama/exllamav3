@@ -79,7 +79,8 @@ from qlora_train_native import (  # noqa: E402
     format_prompt_and_eot, sample,
     _FAIL_CTX, _log_failure, _REPORT, _finish_report,
 )
-from run_report import RunLogger  # noqa: E402
+from run_report import (RunLogger, decode_example_docs,  # noqa: E402
+                        start_live_monitor)
 
 from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer  # noqa: E402
 from exllamav3.generator.sampler import ComboSampler  # noqa: E402
@@ -656,6 +657,17 @@ def _run_main():
     ap.add_argument("--run-name", default="",
                     help="Name for the local run report (report title / compare "
                          "legend). Default: basename of --out.")
+    ap.add_argument("--live-report", action="store_true",
+                    help="Serve a LIVE run monitor (localhost http thread, opens "
+                         "the browser at run start): charts redraw as metrics "
+                         "log, plus a step viewer decoding the exact examples "
+                         "any step trains on, past or future (deterministic "
+                         "order; computed from memory, never written to disk -- "
+                         "report.html stays the dataset-free shareable file). "
+                         "Anchor positions/rollouts are sampled at train time "
+                         "and are NOT shown; the viewer shows the example text.")
+    ap.add_argument("--live-report-port", type=int, default=0,
+                    help="Port for --live-report (default 0 = pick a free one).")
     args = ap.parse_args()
 
     from exllamav3.training import backbone as _backbone
@@ -1066,6 +1078,45 @@ def _run_main():
             args.run_name or os.path.basename(os.path.normpath(args.out)),
             config=run_config)
         _REPORT["rep"] = report
+
+    # Live monitor (--live-report). Mirrors batches()/the loop: the k-th step
+    # of THIS process (k = step - resume_step - 1; a resume restarts bgen)
+    # consumes micro-batches k*ga .. k*ga+ga-1. batches() reseeds
+    # Random(shuffle_seed) every pass but shuffles the SAME list in place, so
+    # epoch e's permutation is that seeded shuffle applied e+1 times
+    # cumulatively -- replayed lazily as steps are browsed. Rollout anchors are
+    # sampled at train time (stateful rng) and not shown.
+    if args.live_report and report is None:
+        print(" -- --live-report needs the local report; ignoring "
+              "(--no-report set or no --out)")
+    elif args.live_report:
+        live_orders = {"order": list(range(len(examples))), "perms": []}
+        live_mpe = max(1, len(examples) // args.batch)  # micro-batches per pass
+
+        def live_perm(e):
+            while len(live_orders["perms"]) <= e:
+                random.Random(args.shuffle_seed).shuffle(live_orders["order"])
+                live_orders["perms"].append(live_orders["order"][:])
+            return live_orders["perms"][e]
+
+        def live_batch_fn(s):
+            if not (resume_step < s <= args.steps):
+                raise ValueError(f"step must be in [{resume_step + 1}, {args.steps}]")
+            mbs = []
+            for g in range(args.grad_accum):
+                m = (s - resume_step - 1) * args.grad_accum + g
+                e, w = divmod(m, live_mpe)
+                seqs = [{"index": j,
+                         "docs": decode_example_docs(tokenizer, examples[j])}
+                        for j in live_perm(e)[w * args.batch:(w + 1) * args.batch]]
+                mbs.append({"micro": g, "epoch": e, "sequences": seqs})
+            return {"step": s, "micro_batches": mbs}
+
+        start_live_monitor(
+            args.out, batch_fn=live_batch_fn, port=args.live_report_port,
+            live_info={"total_steps": args.steps, "first_step": resume_step + 1,
+                       "run_name": args.run_name
+                       or os.path.basename(os.path.normpath(args.out))})
 
     _FAIL_CTX["phase"] = "baseline_eval"
     if val_examples:

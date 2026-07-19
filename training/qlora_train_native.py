@@ -57,7 +57,8 @@ from exllamav3.training.native_llama import NativeLlamaQLoRA
 # (replaces wandb for shareable dashboards). Same dir on sys.path when this file
 # is run as a script or imported by the other trainers.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from run_report import RunLogger  # noqa: E402
+from run_report import (RunLogger, decode_example_docs,  # noqa: E402
+                        start_live_monitor)
 
 
 class ThroughputMeter:
@@ -1613,6 +1614,19 @@ def _run_main():
                          "evals, summary; inline charts, no third-party account) "
                          "-- the default shareable dashboard. This turns it off "
                          "for throwaway runs.")
+    ap.add_argument("--live-report", action="store_true",
+                    help="Serve a LIVE run monitor from a localhost http thread "
+                         "and open it in the browser at run start: the report "
+                         "page redraws its charts as metrics are logged, plus a "
+                         "step viewer showing the decoded text of the exact "
+                         "examples any step trains on (past or future -- the "
+                         "data order is deterministic, so batches are computed "
+                         "on demand from memory; the dataset is never written "
+                         "to disk or into report.html, which stays the "
+                         "dataset-free shareable artifact). Requires the local "
+                         "report (i.e. not --no-report).")
+    ap.add_argument("--live-report-port", type=int, default=0,
+                    help="Port for --live-report (default 0 = pick a free one).")
     ap.add_argument("--run-name", default="",
                     help="Name for the local run report (report title / compare "
                          "legend). Default: basename of --out. Independent of "
@@ -2120,6 +2134,44 @@ def _run_main():
     if args.out and not args.no_report:
         report = RunLogger(args.out, run_name, config=run_config)
         _REPORT["rep"] = report
+
+    # Live monitor (--live-report): recompute any step's batch on demand. The
+    # mapping mirrors batches()/the loop exactly: the k-th optimizer step
+    # executed IN THIS PROCESS (k = step - resume_step - 1, since a resume
+    # restarts bgen from scratch) consumes micro-batches k*ga .. k*ga+ga-1 of
+    # the stream. batches() reseeds Random(0) every pass but shuffles the SAME
+    # list in place, so epoch e's permutation is that seeded shuffle applied
+    # e+1 times cumulatively -- replayed here lazily as steps are browsed
+    # (verified against the generator in the parity test).
+    if args.live_report and report is None:
+        print(" -- --live-report needs the local report; ignoring (--no-report set)")
+    elif args.live_report:
+        live_orders = {"order": list(range(len(examples))), "perms": []}
+        live_mpe = max(1, len(examples) // args.batch)  # micro-batches per pass
+
+        def live_perm(e):
+            while len(live_orders["perms"]) <= e:
+                random.Random(0).shuffle(live_orders["order"])
+                live_orders["perms"].append(live_orders["order"][:])
+            return live_orders["perms"][e]
+
+        def live_batch_fn(s):
+            if not (resume_step < s <= args.steps):
+                raise ValueError(f"step must be in [{resume_step + 1}, {args.steps}]")
+            mbs = []
+            for g in range(args.grad_accum):
+                m = (s - resume_step - 1) * args.grad_accum + g
+                e, w = divmod(m, live_mpe)
+                seqs = [{"index": j,
+                         "docs": decode_example_docs(tokenizer, examples[j])}
+                        for j in live_perm(e)[w * args.batch:(w + 1) * args.batch]]
+                mbs.append({"micro": g, "epoch": e, "sequences": seqs})
+            return {"step": s, "micro_batches": mbs}
+
+        start_live_monitor(
+            args.out, batch_fn=live_batch_fn, port=args.live_report_port,
+            live_info={"total_steps": args.steps, "first_step": resume_step + 1,
+                       "run_name": run_name})
 
     # Optional wandb run (--wandb-project; OFF by default). Same config so runs
     # are comparable across the CSV, the local report, and wandb.

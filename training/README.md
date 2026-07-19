@@ -51,6 +51,15 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
   SFT-vs-EBFT runs render comparable dashboards. `--no-report` opts out;
   `--wandb-project` is still available but off by default. CPU-tested in
   `tests/test_run_report.py`.
+  `--live-report` (SFT, EBFT, and DDP trainers) additionally serves a LIVE
+  monitor from a localhost http thread and opens it in the browser at run
+  start: the same report page redraws its charts as metrics stream in, plus a
+  step viewer that decodes the exact examples any optimizer step trains on --
+  browsable backward AND forward, since the data order is deterministic and
+  batches are recomputed on demand from the trainer's memory (under DDP, every
+  rank's shard, labeled by rank). Nothing about the dataset is written to disk
+  or into `report.html`: the shareable artifact stays dataset-free, and the
+  live view dies with the trainer process.
 - `qlora_validate_native.py` — the correctness gates: compares the
   differentiable training forward against exllamav3's own inference forward.
   Run this FIRST on any new model/architecture.

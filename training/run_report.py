@@ -27,6 +27,18 @@ for A/B runs (e.g. SFT vs EBFT). Same from the CLI::
     python training/run_report.py <out_dir>                 # (re)render one run
     python training/run_report.py <outA> <outB> -o cmp.html # overlay runs
 
+Live monitor: the trainers' ``--live-report`` flag calls
+:func:`start_live_monitor`, which serves the SAME template from a localhost
+http.server thread with a ``LIVE`` config injected. The live page polls
+``/metrics`` (the growing metrics.jsonl) to redraw charts during the run, and
+adds a training-batch viewer driven by ``/batch?step=N``: the trainer-side
+``batch_fn`` recomputes which examples step N consumes (the data order is
+deterministic given the seed) and decodes their text on demand, so the browser
+can page through past AND future steps. Nothing about the dataset is written to
+disk or into ``report.html`` -- the shareable artifact stays dataset-free; the
+live view exists only while the trainer process (and its in-memory examples)
+is alive.
+
 Drop-in shape mirrors the wandb calls it replaces::
 
     rep = RunLogger(out_dir, run_name, config)     # ~ wandb.init(...)
@@ -483,13 +495,21 @@ def _static_sections(runs_raw):
     }
 
 
-def _write_html(payload, out_path):
+def _render_html(payload, live_info=None):
     html = _HTML_TEMPLATE.replace(
         "/*__DATA__*/", json.dumps(payload, separators=(",", ":")))
+    if live_info is not None:
+        # Static reports keep the template's literal null -> LIVE mode stays off.
+        html = html.replace("/*__LIVE__*/null",
+                            json.dumps(live_info, separators=(",", ":")))
     for token, frag in _static_sections(payload.get("runs") or []).items():
         html = html.replace(token, frag)
+    return html
+
+
+def _write_html(payload, out_path):
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write(html)
+        f.write(_render_html(payload))
     return out_path
 
 
@@ -527,6 +547,146 @@ def compare_reports(out_dirs, output_path=None, labels=None):
     _write_html({"runs": runs}, output_path)
     print(f"[report] {output_path}  ({len(runs)} runs)")
     return output_path
+
+
+# --------------------------------------------------------------------------- #
+# Live monitor (--live-report). A daemon http.server thread inside the trainer
+# process serves the report template in LIVE mode plus two data endpoints. The
+# batch texts are never persisted anywhere -- /batch decodes them on demand from
+# the trainer's in-memory examples, so the on-disk report.html stays shareable
+# without the dataset and the live view dies with the process.
+# --------------------------------------------------------------------------- #
+
+def decode_example_docs(tokenizer, example):
+    """Decode one training example into per-document prompt/response texts.
+
+    ``example`` is a trainer example dict (``input_ids`` / ``labels``, plus
+    ``seg_ids`` for packed blocks, which are split back into their documents
+    here). Per document: ``prompt`` is the masked (-100) prefix, ``response``
+    the supervised tokens; trailing pads (label -100 after the response) fall
+    in neither, so packed-block padding never shows. Returns
+    ``[{prompt, response, n_prompt, n_sup}, ...]``.
+    """
+    import torch  # deferred: the render/CLI paths stay torch-free
+    ids, labels = example["input_ids"], example["labels"]
+    seg = example.get("seg_ids")
+    if seg is None:
+        spans = [(0, len(ids))]
+    else:
+        spans, start = [], 0
+        for i in range(1, len(ids) + 1):
+            if i == len(ids) or seg[i] != seg[i - 1]:
+                spans.append((start, i))
+                start = i
+
+    def dec(t):
+        if not t:
+            return ""
+        return tokenizer.decode(torch.tensor(t, dtype=torch.long),
+                                decode_special_tokens=True)
+
+    docs = []
+    for a, b in spans:
+        s_ids, s_labs = ids[a:b], labels[a:b]
+        sup = [i for i, l in enumerate(s_labs) if l != -100]
+        if not sup:
+            continue  # fully-masked span (shouldn't happen; guard anyway)
+        prompt_ids = s_ids[:sup[0]]
+        resp_ids = [t for t, l in zip(s_ids, s_labs) if l != -100]
+        docs.append({"prompt": dec(prompt_ids), "response": dec(resp_ids),
+                     "n_prompt": len(prompt_ids), "n_sup": len(resp_ids)})
+    return docs
+
+
+def start_live_monitor(out_dir, live_info, batch_fn=None, port=0,
+                       open_browser=True):
+    """Serve the live run monitor for the run logging into ``out_dir``.
+
+    Endpoints (localhost only):
+      * ``/``             -- the report template rendered from current on-disk
+                             data with ``live_info`` injected as the JS LIVE
+                             config ({total_steps, first_step, run_name, ...}).
+      * ``/metrics``      -- raw metrics.jsonl (RunLogger flushes every log(),
+                             so polling this tracks the run in real time).
+      * ``/batch?step=N`` -- JSON from ``batch_fn(N)``: the decoded batch texts
+                             for optimizer step N (past or future). Calls are
+                             serialized with a lock (tokenizer decode runs in
+                             the server thread while training continues).
+
+    Returns the server object (daemon thread; dies with the trainer). A port of
+    0 picks a free one. Failure to open the browser is non-fatal.
+    """
+    import threading
+    import urllib.parse
+    import webbrowser
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    rdir = _report_dir(out_dir)
+    lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):  # keep the training console clean
+            pass
+
+        def _send(self, code, body, ctype):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            try:
+                parsed = urllib.parse.urlsplit(self.path)
+                if parsed.path in ("/", "/index.html"):
+                    payload = {"runs": [_load_run(out_dir)]}
+                    body = _render_html(payload, live_info=live_info)
+                    self._send(200, body.encode("utf-8"),
+                               "text/html; charset=utf-8")
+                elif parsed.path == "/metrics":
+                    try:
+                        with open(os.path.join(rdir, "metrics.jsonl"), "rb") as f:
+                            data = f.read()
+                    except OSError:
+                        data = b""
+                    self._send(200, data, "text/plain; charset=utf-8")
+                elif parsed.path == "/batch":
+                    if batch_fn is None:
+                        self._send(404, b"no batch provider", "text/plain")
+                        return
+                    q = urllib.parse.parse_qs(parsed.query)
+                    try:
+                        step = int(q.get("step", [""])[0])
+                    except (ValueError, IndexError):
+                        self._send(400, b"bad step", "text/plain")
+                        return
+                    try:
+                        with lock:
+                            data = batch_fn(step)
+                    except Exception as exc:
+                        self._send(400, str(exc).encode("utf-8"), "text/plain")
+                        return
+                    self._send(200, json.dumps(data).encode("utf-8"),
+                               "application/json")
+                else:
+                    self._send(404, b"not found", "text/plain")
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # browser navigated away mid-response
+
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True,
+                     name="live-report").start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/"
+    print(f"[live] run monitor at {url} (dies with the trainer; report.html "
+          f"is the shareable artifact)")
+    if open_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    return srv
 
 
 # --------------------------------------------------------------------------- #
@@ -625,6 +785,24 @@ _HTML_TEMPLATE = r"""<!doctype html>
   .resume-panel select, .resume-panel input { font: inherit; font-size: 13px; background: var(--bg);
         color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; }
   .resume-panel input[type=number] { width: 96px; }
+  /* live-monitor batch viewer (hidden unless served with LIVE injected) */
+  #liveBar { margin-top: 8px; font-size: 13px; }
+  .pv-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .pv-bar input[type=number] { width: 92px; font: inherit; font-size: 13px; background: var(--panel);
+        color: var(--fg); border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; }
+  .pv-bar label { display: inline-flex; align-items: center; gap: 5px; }
+  .pv-mbh { color: var(--muted); font-size: 12px; text-transform: uppercase;
+            letter-spacing: .04em; margin: 14px 0 6px; }
+  .pv-seq { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+            padding: 10px 12px; margin-bottom: 8px; max-height: 320px; overflow-y: auto; }
+  .pv-seqh { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+  .pv-doc { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12.5px; line-height: 1.55;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            border-top: 1px dashed var(--border); padding-top: 6px; margin-top: 6px; }
+  .pv-doc:first-of-type { border-top: none; padding-top: 0; margin-top: 0; }
+  .pv-prompt { color: var(--muted); }
+  .pv-resp { color: var(--fg); background: rgba(16,185,129,.14); border-radius: 3px; }
+  .pv-tok { color: var(--muted); font-size: 11px; font-family: inherit; }
 </style>
 </head>
 <body>
@@ -640,8 +818,21 @@ _HTML_TEMPLATE = r"""<!doctype html>
       <span class="sub" id="importMsg"></span>
     </div>
     <div id="resumePanel" class="resume-panel" hidden></div>
+    <div id="liveBar" hidden></div>
   </header>
   <div id="summary">__STATIC_SUMMARY__</div>
+  <div id="liveViewer" hidden>
+    <h2>training data — step viewer</h2>
+    <div class="pv-bar">
+      <button id="pvPrev" class="tbtn" type="button">◀ prev</button>
+      <input id="pvStep" type="number" step="1">
+      <span class="sub" id="pvTotal"></span>
+      <button id="pvNext" class="tbtn" type="button">next ▶</button>
+      <label class="sub"><input id="pvFollow" type="checkbox" checked> follow live</label>
+      <span class="sub" id="pvMsg"></span>
+    </div>
+    <div id="pvBody"></div>
+  </div>
   <h2>metrics</h2>
   <div class="charts" id="charts">__STATIC_CHARTS__</div>
   <h2>config</h2>
@@ -649,6 +840,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
 </div>
 <script>
 const DATA = /*__DATA__*/;
+const LIVE = /*__LIVE__*/null;  // injected by the --live-report server; null in static files
 const PALETTE = ["#3b82f6","#ef4444","#10b981","#f59e0b","#8b5cf6","#ec4899","#14b8a6","#f97316"];
 const BASE_RUNS = (DATA.runs || []);
 let RUNS = BASE_RUNS.slice();  // working set; overlay import appends, reset restores
@@ -1056,6 +1248,124 @@ importInput.addEventListener("change", async ev => {
     msg.textContent = parts.join("  ·  ");
   }
 });
+
+// ---- live-monitor mode: only when served by the trainer's --live-report
+// server (LIVE injected). Polls /metrics to redraw the charts as the run logs,
+// and drives the batch viewer via /batch?step=N -- texts are decoded on demand
+// in the trainer process, so browsing past/future steps costs nothing here and
+// nothing about the dataset ever lands in this file. ----
+if (LIVE && BASE_RUNS.length) {
+  document.getElementById("liveViewer").hidden = false;
+  const liveBar = document.getElementById("liveBar"); liveBar.hidden = false;
+  const pvStep = document.getElementById("pvStep");
+  const pvTotal = document.getElementById("pvTotal");
+  const pvFollow = document.getElementById("pvFollow");
+  const pvMsg = document.getElementById("pvMsg");
+  const pvBody = document.getElementById("pvBody");
+  pvStep.min = LIVE.first_step; pvStep.max = LIVE.total_steps;
+  pvTotal.textContent = "/ " + LIVE.total_steps;
+  let curStep = null;    // newest trained step seen in /metrics
+  let shownStep = null;  // step the viewer currently displays
+  const cache = new Map();
+
+  function setLive(ok) {
+    liveBar.textContent = ok
+      ? "● live — polling the trainer every " + ((LIVE.poll_ms || 2500) / 1000) + "s"
+      : "◌ monitor disconnected (run over or trainer gone) — report.html next to the adapter is the shareable copy";
+    liveBar.style.color = ok ? "#10b981" : "#f59e0b";
+  }
+
+  function renderBatches(data) {
+    clear(pvBody);
+    const mbs = data.micro_batches || [];
+    const nMicro = mbs.reduce((a, mb) => Math.max(a, (mb.micro || 0) + 1), 0);
+    mbs.forEach(mb => {
+      const bits = ["micro-batch " + (mb.micro + 1) + "/" + nMicro,
+                    "data pass " + (mb.epoch + 1)];
+      if (mb.rank !== undefined && mb.rank !== null) bits.push("rank " + mb.rank);
+      pvBody.appendChild(el("div", {class: "pv-mbh", text: bits.join("  ·  ")}));
+      (mb.sequences || []).forEach(sq => {
+        const card = el("div", {class: "pv-seq"});
+        const docs = sq.docs || [];
+        card.appendChild(el("div", {class: "pv-seqh", text:
+          (docs.length > 1 ? "packed block #" + sq.index + " · " + docs.length + " docs"
+                           : "example #" + sq.index)}));
+        docs.forEach(doc => {
+          const d = el("div", {class: "pv-doc"});
+          d.appendChild(el("span", {class: "pv-prompt", text: doc.prompt}));
+          d.appendChild(el("span", {class: "pv-resp", text: doc.response}));
+          d.appendChild(el("span", {class: "pv-tok",
+            text: "  [" + doc.n_prompt + " prompt + " + doc.n_sup + " supervised tok]"}));
+          card.appendChild(d);
+        });
+        pvBody.appendChild(card);
+      });
+    });
+  }
+
+  async function showStep(s) {
+    if (!isFinite(s)) return;
+    s = Math.min(Math.max(Math.round(s), LIVE.first_step), LIVE.total_steps);
+    shownStep = s; pvStep.value = s;
+    let data = cache.get(s);
+    if (!data) {
+      pvMsg.textContent = "loading…";
+      try {
+        const r = await fetch("batch?step=" + s, {cache: "no-store"});
+        if (!r.ok) throw new Error(await r.text());
+        data = await r.json();
+      } catch (e) { pvMsg.textContent = "step " + s + ": " + e.message; return; }
+      cache.set(s, data);
+      if (cache.size > 64) cache.delete(cache.keys().next().value);
+    }
+    pvMsg.textContent = "";
+    if (shownStep === s) renderBatches(data);  // stale response for a superseded step: drop
+  }
+
+  document.getElementById("pvPrev").addEventListener("click", () => {
+    pvFollow.checked = false; showStep((shownStep ?? LIVE.first_step) - 1); });
+  document.getElementById("pvNext").addEventListener("click", () => {
+    pvFollow.checked = false; showStep((shownStep ?? LIVE.first_step - 1) + 1); });
+  pvStep.addEventListener("change", () => {
+    pvFollow.checked = false; showStep(parseInt(pvStep.value, 10)); });
+
+  let lastMetrics = null;
+  async function poll() {
+    let txt;
+    try { txt = await (await fetch("metrics", {cache: "no-store"})).text(); }
+    catch (e) { setLive(false); return; }
+    setLive(true);
+    if (txt !== lastMetrics) {
+      lastMetrics = txt;
+      // Rebuild run 0's series from the jsonl (mirrors the Python _load_run).
+      const series = {};
+      let maxStep = null;
+      txt.split("\n").forEach(line => {
+        line = line.trim(); if (!line) return;
+        let row; try { row = JSON.parse(line); } catch (e) { return; }
+        Object.keys(row).forEach(k => {
+          if (k === "step") return;
+          const v = row[k];
+          if (typeof v !== "number" || !isFinite(v)) return;
+          (series[k] = series[k] || []).push([row.step, v]);
+        });
+        if (row.step !== null && row.step !== undefined
+            && (maxStep === null || row.step > maxStep)) maxStep = row.step;
+      });
+      BASE_RUNS[0].series = series;
+      rerender();
+      if (maxStep !== null && maxStep >= LIVE.first_step) {
+        curStep = Math.min(maxStep, LIVE.total_steps);
+        pvTotal.textContent = "/ " + LIVE.total_steps + " · trained through step " + curStep;
+      }
+    }
+    if (pvFollow.checked && curStep !== null && shownStep !== curStep) showStep(curStep);
+  }
+  setLive(true);
+  showStep(LIVE.first_step);  // future steps are computable before they train
+  poll();
+  setInterval(poll, LIVE.poll_ms || 2500);
+}
 
 // initial paint
 rerender();
