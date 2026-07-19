@@ -1,0 +1,62 @@
+# Mistral-Medium-3.5-128B @ 2.25bpw -- VRAM fit smoke test on 2x3090 (split).
+# Sized in Session 46: ~36.5 GiB text-component weights (vision tower never
+# loads; exllamav3 builds component="text" only), ~18.3 GiB/card after
+# split_even, leaving ~5-6 GiB/card for LoRA + activations + head spike.
+# r16 should fit with margin; r32 all-linear is edge-of-card -- try only
+# after this survives with headroom.
+#
+#   python training/qlora_train.py --config training/experiments/mistral128b_smoke.yaml
+#
+# Watch peak VRAM per card in the step log; the first optimizer step is the
+# moment of truth (Adam state allocates lazily at step 1).
+
+model: /mnt/two/weights/turboderp_Mistral-Medium-3.5-128B-exl3/2.25bpw
+out: out/mistral128b_smoke
+
+method: sft
+parallel: split            # no DDP possible -- model doesn't fit per card
+split_even: 2.0            # raise toward 3.0 if load dies with "Insufficient VRAM in split"
+
+# LoRA -- r16 all-linear (~280M trainable, ~2.1 GiB fp32 params+grads total)
+r: 16
+alpha: 32.0
+
+# Optimization -- tiny run, just enough steps to cross optimizer-state
+# allocation and prove steady state
+lr: 0.0001
+optim: paged_adamw8bit     # 8-bit moments, paged to host on pressure
+scheduler: none
+steps: 20
+batch: 1
+grad_accum: 8              # effective batch 8 via accum, not live activations
+
+# Data -- semancy v4 (648 rows), LOCAL staged jsonl. Do not switch to the
+# UnstableLlama/semancy hub id: its parquet/README config still serves the
+# stale 436-row v2 (S45 finding)
+dataset: mala-data/semancy_v4_train.jsonl
+messages_key: messages
+shuffle: true
+seq_len: 1024              # the 1k-context target
+
+# Compute / VRAM levers
+compute_dtype: bfloat16
+attn_impl: flash
+use_liger: true            # memory-matched to the intended real run; gate numerics
+                           #   with qlora_validate_native.py --use-liger before a long run
+head_vocab_chunk: 16384    # 131k vocab x 12288 hidden: unchunked head reconstruct
+                           #   is a 3+ GB spike on the last card. 32768 OOM'd step 1
+                           #   (1.5 GiB fp32 slice vs 1.0 GiB free on cuda:1); 16384
+                           #   halves it. Launch with
+                           #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True --
+                           #   same OOM showed 1.68 GiB lost to fragmentation
+ce_chunk: 1024
+offload_activations: true  # needed at this size (S46 step-1 OOM without it) -- SFT
+                           #   only; do NOT combine with method: ebft (host-RAM OOM, S41)
+
+# No live samples: skips the generation KV cache (~720 KB/token on this model)
+sample_every: 0
+
+# Eval off for the smoke; save only at the end
+eval_every: 0
+save_every: 0
+run_name: mistral128b_smoke

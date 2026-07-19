@@ -1,0 +1,67 @@
+# Mistral-Medium-3.5-128B @ 2.25bpw -- semancy v4, the real run (Session 46).
+# Recipe = the gemma12b-abliterated run that worked (rslora + pissa, lr 1e-5,
+# cosine), adapted to this model's VRAM reality. The smoke run proved the fit
+# (peak ~21.4/22.1 GiB per card at r16); lr 1e-4 no-warmup diverged by step 3
+# (grads 224 -> 2216), hence the gentle-recipe knobs below.
+#
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     python training/qlora_train.py --config training/experiments/mistral128b_semancy.yaml
+#
+# NOTE: pissa init = ~616 randomized SVDs over dequantized 12288-wide weights;
+# expect a LONG quiet period (possibly 10-30 min) between load and step 1.
+# Not a hang unless VRAM churn stops too.
+
+model: /mnt/two/weights/turboderp_Mistral-Medium-3.5-128B-exl3/2.25bpw
+out: out/mistral128b_semancy
+
+method: sft
+parallel: split
+split_even: 2.0
+
+# LoRA -- r16, NOT the gemma run's r32: r32 all-linear on this 12288-wide model
+# doubles fp32 params+grads (+~1 GiB/card) AND pissa adds frozen A0/B0 offsets;
+# together they'd eat the entire ~2.5 GiB/card headroom the smoke measured.
+# alpha 22.6 matches the gemma recipe's EFFECTIVE rslora scale at r16
+# (gemma: 32/sqrt(32) = 5.66; here: 22.6/sqrt(16) = 5.66).
+r: 16
+alpha: 22.6
+use_rslora: true
+init_lora: pissa
+init_svd_niter: 16
+
+# Optimization -- user-specified: lr 1e-5, cosine, warmup >=5-8 steps
+lr: 0.00001
+scheduler: cosine
+warmup_steps: 10
+weight_decay: 0.01
+epochs: 2.0
+batch: 1
+grad_accum: 2              # eff batch 2 -- mirrors the gemma recipe's optimization
+optim: paged_adamw8bit
+max_grad_norm: 1.0
+
+# Data -- semancy v4 LOCAL jsonl (hub parquet still serves stale v2)
+dataset: mala-data/semancy_v4_train.jsonl
+messages_key: messages
+shuffle: true
+seq_len: 1024
+
+# Compute / VRAM levers -- exactly the smoke-validated set
+compute_dtype: bfloat16
+attn_impl: flash
+use_liger: true            # numerics still unvalidated on mistral3 -- if grads blow
+                           #   up again despite lr 1e-5 + warmup, this is suspect #1;
+                           #   stop and run qlora_validate_native.py --use-liger
+head_vocab_chunk: 16384
+ce_chunk: 1024
+offload_activations: true
+sample_every: 0            # gen KV cache ~720 KB/token on 88 layers; headroom too thin
+
+# Eval / checkpoints -- 648 rows / eff2 = 324 steps/ep, 648 total (~2.5-3 h)
+eval_dataset: mala-data/semancy_test.jsonl
+eval_split: train          # local jsonl loads as split "train" (S45 finding)
+eval_every: 50
+save_best: true
+checkpoint_every: 81       # quarter-epoch
+keep_checkpoints: 4
+run_name: mistral128b_semancy
