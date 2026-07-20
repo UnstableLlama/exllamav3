@@ -4512,6 +4512,32 @@ model; then consider defaulting it to `min(batch, 8)`-style in configs.
 `--eval-batch` peak VRAM ≈ a training micro-batch at the same size — watch on
 the 8k long-context class before using a large N there.
 
+**Also built (same session): `science/qgemm_train_shapes.py`** — the box
+experiment that re-opens (or permanently closes) audit A1's ORIGINAL fix.
+Upstream v1.0.0 shipped "greatly improved GEMM/GEMV performance on Ampere";
+the S30 reason for dropping the fused-GEMM-in-forward plan was that the fused
+kernel was decode-only (`AUTO_RECONSTRUCT_THRESHOLD = 144` — still the v1.1.0
+dispatch; inference reconstructs at prefill shapes). The old
+`science/qgemm_benchmark.py` only sweeps m = 1/4/16; the new script races, at
+m = 16…8192 on real model linears (`--model`; synthetic fallback):
+`ext.exl3_gemm` (preferred + full kernel sweep) vs inference's own
+`reconstruct+hgemm` prefill path vs **what training pays today** (per-call
+bf16 inner reconstruct + the torch-mm Hadamard sandwich,
+`EXL3LoRAHadFunction._base_matmul`) vs the dense-bf16 residency ceiling —
+every arm correctness-gated against an fp32 reference. Verdict column =
+train/fused speedup. **Second lever discovered while writing it:** inference's
+prefill path does the activation Hadamard with dedicated `ext.had_r_128`
+CUDA kernels, while the training sandwich does blockwise torch matmuls —
+that's the S35 88 ms/step `had_transform` bucket. The `train_hadk` arm
+measures exactly that swap in isolation (usable even if the fused GEMM
+loses; the backward adjoint is the same kernel with suh/svh swapped, H^T=H).
+If fused wins at training m: forward + checkpoint-recompute go through the
+fused GEMM (the base is an autograd constant), reconstruct only remains in
+backward — 3→1 reconstructs/linear/step AND the forward had-sandwich
+disappears. Container-only session: script is compile-checked, ext call
+signatures verified against the v1.1.0 sources (`modules/quant/exl3.py`,
+`exl3_gemm.cuh`), NOT yet run on a GPU.
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)
