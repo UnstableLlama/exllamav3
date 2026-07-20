@@ -1558,6 +1558,15 @@ def _run_main():
     ap.add_argument("--eval-every", type=int, default=0,
                     help="Also report held-out loss every N steps (needs "
                          "--val-frac > 0). 0 = only at the end.")
+    ap.add_argument("--eval-batch", type=int, default=1,
+                    help="Examples per eval forward (audit A6). The metric is "
+                         "unchanged at any value -- always the mean of each "
+                         "example's own token-mean loss (per-row reduction; "
+                         "padding contributes nothing) -- batching only cuts "
+                         "eval wall-clock. Default 1 = the historical one-at-a-"
+                         "time loop, numerically matched with the BNB arm; N>1 "
+                         "pads length-sorted groups, so peak VRAM during eval "
+                         "is ~a training micro-batch of the same size.")
     ap.add_argument("--save-best", action="store_true",
                     help="Save the adapter only when held-out loss improves "
                          "(needs --val-frac + --eval-every), so a long run keeps "
@@ -2072,21 +2081,43 @@ def _run_main():
         print(f"{tag} Adapter written to {args.out}")
 
     def eval_loss(exs):
-        # Mean per-example loss over an eval set, one example at a time (no
-        # padding effects). qlora_train_bnb.py computes this identically. Works
-        # for both SFT (completion-masked) and plain-LM (all-supervised) sets.
+        # Mean per-example loss over an eval set. The metric is ALWAYS the mean
+        # of each example's own token-mean loss, for both SFT (completion-
+        # masked) and plain-LM (all-supervised) sets. --eval-batch 1 (default)
+        # evaluates one example per forward, no padding effects --
+        # qlora_train_bnb.py computes this identically. --eval-batch N>1 runs
+        # length-sorted padded groups and reduces per ROW via
+        # compute_loss_per_seq: the same number up to kernel reduction order,
+        # at a fraction of the wall-clock (audit A6).
         if not exs:
             return None
         net.eval()
+        eb = max(1, args.eval_batch)
         total, n = 0.0, 0
         with torch.no_grad():
-            for ex in exs:
-                input_ids, labels, attn, pos_ids, seg_ids = collate([ex], pad_id)
-                l = net.compute_loss(input_ids, labels, attention_mask=attn,
-                                     chunk=args.ce_chunk,
-                                     position_ids=pos_ids, seg_ids=seg_ids)
-                total += l.item()
-                n += 1
+            if eb == 1:
+                for ex in exs:
+                    input_ids, labels, attn, pos_ids, seg_ids = collate([ex], pad_id)
+                    l = net.compute_loss(input_ids, labels, attention_mask=attn,
+                                         chunk=args.ce_chunk,
+                                         position_ids=pos_ids, seg_ids=seg_ids)
+                    total += l.item()
+                    n += 1
+            else:
+                # Length-sorted grouping minimizes padding waste; group order
+                # is irrelevant to the mean.
+                order = sorted(range(len(exs)),
+                               key=lambda i: len(exs[i]["input_ids"]),
+                               reverse=True)
+                for i in range(0, len(order), eb):
+                    group = [exs[j] for j in order[i:i + eb]]
+                    input_ids, labels, attn, pos_ids, seg_ids = collate(group, pad_id)
+                    sums, counts = net.compute_loss_per_seq(
+                        input_ids, labels, attention_mask=attn,
+                        chunk=args.ce_chunk,
+                        position_ids=pos_ids, seg_ids=seg_ids)
+                    total += (sums / counts.clamp(min=1)).sum().item()
+                    n += len(group)
         net.train()
         return total / n
 

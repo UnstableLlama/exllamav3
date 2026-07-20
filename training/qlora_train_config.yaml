@@ -361,6 +361,11 @@ eval2_max_samples: 0
 eval2_max_blocks: 0       # size eval2 to roughly match the primary eval set
 val_frac: 0.0             # no eval_split? carve this fraction off train as held-out instead
 eval_every: 0             # report held-out loss every N steps (0 = only at the end)
+eval_batch: 1             # single/split only: examples per eval forward (both eval sets). The
+                          #   metric is identical at any value (per-row reduction; always the mean
+                          #   of per-example token-mean losses) -- N>1 just cuts eval wall-clock
+                          #   severalfold. 1 = the historical loop, matched with the BNB arm.
+                          #   Eval peak VRAM ~= a training micro-batch of the same size.
 save_best: false          # save only when the PRIMARY held-out loss improves
 run_log: qlora_runs.csv   # CSV run log (one row per run: hyperparams, losses, tok/s, peak VRAM)
 no_report: false          # the local run report is the DEFAULT logging path (all backends; rank 0

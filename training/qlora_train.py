@@ -74,6 +74,7 @@ SINGLE_ONLY_KEYS = {
     "quant_aware", "quant_aware_scale", "quant_aware_ref_model",
     "torch_profile",   # torch.profiler window; DDP backend has no such flag
     "wandb_project", "wandb_run_name", "wandb_entity",  # not mirrored to DDP yet
+    "eval_batch",      # batched held-out eval (audit A6); not mirrored to DDP/EBFT yet
 }
 DDP_ONLY_KEYS = set()
 
@@ -147,6 +148,7 @@ SINGLE_ONLY_DEFAULTS = {
     "wandb_project": "",
     "wandb_run_name": "",
     "wandb_entity": "",
+    "eval_batch": 1,
 }
 
 

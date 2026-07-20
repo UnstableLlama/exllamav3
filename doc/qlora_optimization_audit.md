@@ -85,6 +85,14 @@ half/bf16).
 examples; slow at 285 wikitext blocks on a 31B. Batched eval (per-sequence
 loss reduction) would cut eval wall-clock several-fold — but the batch-1
 definition is matched with the BNB arm, so change both or flag-gate.
+**DONE (2026-07-20), flag-gated:** `--eval-batch N` / `eval_batch:` on the
+single/split trainer (default 1 = the historical loop, BNB-matched).
+`compute_loss_per_seq` reduces per ROW through the fused heads'
+`reduction="none"` (the DPO/KTO seam), so the metric — mean of per-example
+token-mean losses — is unchanged at any batch size; groups are length-sorted
+to minimize padding. CPU parity gates in `tests/test_eval_batched.py` (both
+fused heads, softcap, trainable head, zero-supervision rows). Not yet
+mirrored to the DDP/EBFT arms (launcher rejects a non-default there).
 
 ### Data pipeline
 

@@ -4467,6 +4467,51 @@ rule). VRAM watch: 4B (32 layers / hidden 2560) at batch 4 / 64 rollout rows may
 approach 24 GB — if the EBFT arm OOMs, drop `batch` to 2 (rollout rows 32), NOT
 offload.
 
+### Session 48 — audit A6 CLOSED (code): batched held-out eval (`--eval-batch`), CPU-gated
+
+> 2026-07-20, container-only (no box). Sessions 43–47 (DDP parity, EBFT
+> throughput/configs, report work, v1.1.0 merge) were logged in their commit
+> messages rather than here.
+
+**Why this item:** the S36 wall-clock split showed load + **evals** + save are
+~half the wall on the 109-step run class, and `eval_loss` ran batch-1 (audit
+A6). Flag-gated per the audit so the batch-1 definition stays matched with the
+BNB arm.
+
+**Built:**
+- `NativeLlamaQLoRA.compute_loss_per_seq()` (`native_llama.py`) — per-ROW
+  `(sums, counts)` through the fused heads' `reduction="none"` (the DPO/KTO
+  seam, so the `[tokens, vocab]` logits are never materialized), incl. the
+  vocab-chunked head, softcap, and the trainable/LoRA-head supervised-position
+  path (`index_add_` fold-back). `sums/counts.clamp(min=1)` per row == that
+  row's own batch-1 `compute_loss`; padding (label -100) contributes exactly
+  nothing. Unlike `compute_logps`, `position_ids`/`seg_ids` pass through — a
+  packed eval2 block is one row and sums across its documents the same way
+  batch-1 does.
+- `--eval-batch N` / `eval_batch:` (single/split trainer + YAML launcher key,
+  SINGLE_ONLY with default 1). `eval_loss` batches length-sorted groups
+  (minimizes padding; order irrelevant to the mean) and reduces per row, so
+  the metric — **mean of per-example token-mean losses** — is unchanged at any
+  N, up to kernel reduction order. Both eval sets (primary + eval2) get it.
+  Default 1 = the exact historical loop.
+- CPU gates: `tests/test_eval_batched.py` — batched-vs-batch-1 parity on a
+  mock per-position-lookup net for both fused heads, softcap on both,
+  trainable head, and zero-supervision rows ((0, 0), no NaN). All pass, and
+  the preference / fused-CE / native-llama suites still pass.
+
+**Deliberately NOT done:** no `eval_batch` column in the run-log CSV (it
+can't affect results, and a schema change rotates the mega CSV — see the
+2026-07-14 incident note in `append_run_log`); DDP/EBFT arms not mirrored
+(launcher rejects a non-default `eval_batch` there — backlog #8 territory);
+BNB arm untouched (its batch-1 loop is the matched definition).
+
+**Box items for next session:** time an eval pass at `--eval-batch 8` vs 1 on
+a real config (expect severalfold on the eval slice of wall); confirm
+per-example losses agree to ~1e-3 (bf16 reduction-order noise) on a real
+model; then consider defaulting it to `min(batch, 8)`-style in configs.
+`--eval-batch` peak VRAM ≈ a training micro-batch at the same size — watch on
+the 8k long-context class before using a large N there.
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)

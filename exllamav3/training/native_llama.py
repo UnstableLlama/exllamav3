@@ -1858,6 +1858,86 @@ class NativeLlamaQLoRA(nn.Module):
             softcap=self.final_softcap,
         )
 
+    def compute_loss_per_seq(
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        chunk: int = DEFAULT_CHUNK,
+        ignore_index: int = IGNORE_INDEX,
+        position_ids: Optional[torch.Tensor] = None,
+        seg_ids: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-ROW shifted-CE loss for batched evaluation.
+
+        Returns ``(sums, counts)``: ``sums[b]`` = fp32 sum of the per-token NLL
+        over row ``b``'s supervised positions, ``counts[b]`` = the number of
+        supervised tokens there, so ``sums / counts.clamp(min=1)`` is each
+        row's own token-mean loss -- the exact quantity :meth:`compute_loss`
+        returns for that row evaluated alone. Batching rows therefore preserves
+        the "mean of per-example means" eval definition; right-padding
+        (``ignore_index`` labels) contributes nothing to either output.
+
+        Unlike :meth:`compute_logps`, ``position_ids``/``seg_ids`` pass
+        through: a packed block occupies one row, and its row mean equals the
+        batch-1 :meth:`compute_loss` of that block (the shifted CE sums over
+        all its documents either way). Streams through the fused heads with
+        ``reduction="none"`` -- same memory story as :meth:`compute_loss`,
+        and the trainable/LoRA-head path likewise materializes logits only at
+        supervised positions.
+        """
+        hidden = self.forward(input_ids, attention_mask, position_ids, seg_ids)
+        b, t = labels.shape
+        if (self.train_head or self.lora_head) and not self._adapters_off:
+            # Mirror compute_loss's supervised-position path, keeping each
+            # token's NLL and folding it back onto its batch row.
+            d = hidden.shape[-1]
+            hs = hidden[:, :-1, :].reshape(-1, d)                 # shift
+            lbl = labels[:, 1:].reshape(-1).to(hs.device)
+            valid = lbl != ignore_index
+            counts = valid.view(b, t - 1).sum(dim=-1)
+            if not bool(valid.any()):
+                return (torch.zeros(b, dtype=torch.float32, device=hs.device),
+                        counts)
+            w = self.head_weight if self.train_head else self.lm_head_weight_fn()()
+            if torch.is_inference(w):
+                w = w.clone()
+            row = torch.arange(b, device=hs.device).repeat_interleave(t - 1)
+            row = row[valid].to(w.device)
+            hs = backbone.to_device(hs[valid], w.device).to(w.dtype)
+            logits = hs @ w
+            if self.lora_head:
+                logits = logits + self._module_lora_scale * (
+                    (hs @ self.head_lora_a) @ self.head_lora_b)
+            if self.final_softcap:
+                logits = logits.div_(self.final_softcap).tanh_() * self.final_softcap
+            nll = F.cross_entropy(logits, lbl[valid].to(w.device),
+                                  reduction="none")
+            sums = torch.zeros(b, dtype=torch.float32, device=w.device)
+            sums.index_add_(0, row, nll.float())
+            return sums, counts.to(w.device)
+        hidden = backbone.to_device(hidden, self._head_device)
+        labels = labels.to(hidden.device)
+        if self.head_vocab_chunk > 0 and self._head_slice is not None:
+            slice_fn, vocab_size, granularity = self._head_slice
+            nll = fused_linear_cross_entropy_vocab_chunked(
+                hidden, slice_fn, labels, vocab_size,
+                vocab_chunk=self.head_vocab_chunk, token_chunk=chunk,
+                ignore_index=ignore_index, granularity=granularity, shift=True,
+                softcap=self.final_softcap, reduction="none",
+            )
+        else:
+            nll = fused_linear_cross_entropy(
+                hidden, self.lm_head_weight_fn(), labels,
+                chunk=chunk, ignore_index=ignore_index, shift=True,
+                softcap=self.final_softcap, reduction="none",
+            )
+        # Ignored (masked / padded) positions carry an exact 0 in the
+        # per-token NLL, so the row sum is the supervised-token sum.
+        sums = nll.view(b, t - 1).float().sum(dim=-1)
+        counts = (labels[:, 1:] != ignore_index).sum(dim=-1)
+        return sums, counts
+
     # --- EBFT feature taps ---------------------------------------------------
 
     def feature_block_indices(self, fracs=(0.25, 0.50, 0.75)) -> list[int]:
