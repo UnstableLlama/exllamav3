@@ -1,10 +1,12 @@
 """
-Preference-optimization losses (DPO / KTO) for QLoRA-on-EXL3.
+Preference-optimization losses (DPO / KTO / SimPO) for QLoRA-on-EXL3.
 
 Pure-torch loss functions over per-sequence completion log-probabilities, as
-produced by ``NativeLlamaQLoRA.compute_logps`` (policy) and the same call under
+produced by ``NativeLlamaQLoRA.compute_logps`` (policy) and -- for the
+reference-based objectives -- the same call under
 ``NativeLlamaQLoRA.adapters_disabled()`` (the frozen-base reference model --
-the PEFT disable-adapter trick, so no second model is ever loaded).
+the PEFT disable-adapter trick, so no second model is ever loaded). SimPO is
+reference-free: it needs the policy logps and completion token counts only.
 
 Semantics follow HuggingFace TRL's stable trainers so hyperparameters and
 results transfer directly:
@@ -16,6 +18,12 @@ results transfer directly:
     promoted to TRL's stable API in huggingface/trl#6175, with the batch-level
     KL estimate from mismatched prompt/completion pairs and the
     ``apo_zero_unpaired`` variant (D'Oosterlinck et al. 2024).
+  * SimPO -- ``trl.CPOTrainer`` with ``loss_type="simpo"`` (Meng et al. 2024,
+    arXiv:2405.14734): reference-free, length-normalized rewards
+    ``beta * mean-per-token logp`` with a target margin ``gamma``
+    (TRL's ``simpo_gamma``). TRL's optional ``cpo_alpha`` NLL-on-chosen mix
+    (CPO, Xu et al. 2024, arXiv:2401.08417) is applied by the trainer, not
+    here.
 
 Credit: the formulations here are adapted from HuggingFace TRL
 (https://github.com/huggingface/trl, Copyright The HuggingFace Team,
@@ -86,6 +94,46 @@ def dpo_loss(
 
     chosen_rewards = (beta * chosen_logratios).detach()
     rejected_rewards = (beta * rejected_logratios).detach()
+    return losses, chosen_rewards, rejected_rewards
+
+
+def simpo_loss(
+    policy_chosen_logps: torch.Tensor,    # [b] SUMMED completion logps
+    policy_rejected_logps: torch.Tensor,  # [b]
+    chosen_counts: torch.Tensor,          # [b] completion token counts
+    rejected_counts: torch.Tensor,        # [b]
+    beta: float = 2.0,
+    gamma: float = 0.5,
+    label_smoothing: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Simple Preference Optimization loss over paired (chosen, rejected) rows
+    (SimPO, Meng et al. 2024, arXiv:2405.14734; TRL ``CPOTrainer`` with
+    ``loss_type="simpo"`` semantics).
+
+    REFERENCE-FREE: the implicit reward is the length-normalized policy
+    logprob ``beta * logps / |y|`` -- no frozen-base forward is involved.
+    Inputs are the SUMMED completion logps and token counts exactly as
+    returned by ``compute_logps``; normalization happens here.
+
+    The loss is ``-log σ(beta·Δ̄ - gamma)`` with ``Δ̄`` the difference of the
+    per-token mean logps and ``gamma`` the target reward margin (TRL's
+    ``simpo_gamma``; the paper's γ). ``label_smoothing`` ε > 0 gives the
+    cDPO-style robust form (matching TRL's CPO sigmoid smoothing):
+    ``-(1-ε)·log σ(beta·Δ̄ - gamma) - ε·log σ(-(beta·Δ̄ - gamma))``.
+
+    Returns ``(losses, chosen_rewards, rejected_rewards)``, each ``[b]``;
+    rewards are ``beta * mean-per-token logp``, detached (logging/accuracy
+    only). Note the step-0 loss has NO fixed anchor (unlike DPO's ln 2): with
+    zero margin it sits at ``-log σ(-gamma)``, and the actual value depends on
+    the data through Δ̄.
+    """
+    chosen_avg = policy_chosen_logps / chosen_counts.clamp(min=1)
+    rejected_avg = policy_rejected_logps / rejected_counts.clamp(min=1)
+    logits = beta * (chosen_avg - rejected_avg) - gamma
+    losses = (-(1.0 - label_smoothing) * F.logsigmoid(logits)
+              - label_smoothing * F.logsigmoid(-logits))
+    chosen_rewards = (beta * chosen_avg).detach()
+    rejected_rewards = (beta * rejected_avg).detach()
     return losses, chosen_rewards, rejected_rewards
 
 

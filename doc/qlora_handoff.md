@@ -125,8 +125,10 @@ bpw; ~50 GB on a 27B). Numbering below unchanged.
    fused softcap head removed the output-card logit spike).
 8. **Mirror newer features into the DDP arm** (A/B/C VRAM levers, `--optim`,
    SVD inits, preference training — the last also needs a cross-rank
-   all-reduce for KTO's KL estimate) and **wire `qlora_train_pref.py` into the
-   YAML launcher**.
+   all-reduce for KTO's KL estimate; simpo needs nothing extra, Session 48).
+   **Wiring `qlora_train_pref.py` into the YAML launcher is DONE (Session 48):**
+   `method: dpo|kto|simpo` + a `qlora_train_pref_config.yaml` template,
+   single/split only. What remains under this item is the DDP preference arm.
 9. **Query-tiled big-head attention** + drop the pointless GQA
    `repeat_interleave` in the `sdpa` branch (Session 8 #1/#2; only bites at
    8k+ context on head_dim-512 layers).
@@ -4466,6 +4468,101 @@ A/B, `prompt_format: qwen3.5-nothink`, `offload_activations: false` (EBFT host-O
 rule). VRAM watch: 4B (32 layers / hidden 2560) at batch 4 / 64 rollout rows may
 approach 24 GB — if the EBFT arm OOMs, drop `batch` to 2 (rollout rows 32), NOT
 offload.
+
+---
+
+### Session 48 — SimPO (`--method simpo`): reference-free preference training
+
+> 2026-07-22. Branch `claude/simpo-implementation-wvfd3x`. Container-verified
+> (all preference/fused_ce/qlora_grad/lora_init CPU suites pass, incl. three
+> new SimPO tests, plus a stub-import smoke of the trainer-level batch fn);
+> **nothing box-verified yet** — smoke list below. Extends the Session-16
+> DPO/KTO preference stack with a third method; no shared code paths changed
+> (pure addition: one loss fn, one batch fn, CLI wiring).
+
+**Why SimPO** (Meng et al. 2024, arXiv:2405.14734): reference-FREE preference
+optimization — the implicit reward is the length-normalized policy logprob
+`β·logπ(y|x)/|y|` with a target margin γ, so there is **no frozen-base
+forward at all**. On our stack that means a SimPO step is ~half the compute
+of a DPO step on the same pairs (DPO = one 2b-row policy forward + one 2b-row
+no-grad reference forward; SimPO = the policy forward only) with SFT's exact
+VRAM story. The length normalization is also the paper's answer to DPO's
+length-exploitation bias. TRL implements it inside `CPOTrainer`
+(`loss_type="simpo"`, γ = `simpo_gamma`); we follow those semantics.
+
+**What was built:**
+- `exllamav3/training/preference.py` — `simpo_loss(policy_chosen_logps,
+  policy_rejected_logps, chosen_counts, rejected_counts, beta, gamma,
+  label_smoothing)`: takes the SUMMED logps + counts exactly as
+  `compute_logps` returns them, normalizes inside, loss
+  `-log σ(β·Δ̄ − γ)` with cDPO-style smoothing; rewards = `β·avg logp`,
+  detached. Counts clamped `min=1`.
+- `training/qlora_train_pref.py` — `--method simpo`. Shares the DPO data
+  format/keys and the chosen-block/rejected-block single policy forward;
+  skips the reference forward entirely. New knobs: `--gamma` (default 0.5 =
+  TRL's `simpo_gamma`; paper range 0.5–1.6, scaled with β) and
+  `--sft-weight` (TRL `CPOTrainer`'s `cpo_alpha`: adds the batch-token-mean
+  NLL of the CHOSEN completions — 0 = pure-paper SimPO (default), >0 = the
+  CPO-SimPO mix; logged as `nll` in the step line/eval when on).
+  `--label-smoothing` applies. **`--beta` now defaults per-method**: 0.1 for
+  dpo/kto (unchanged), **2.0 for simpo** (the paper's 2.0–2.5 — note TRL's
+  `CPOConfig` still defaults β=0.1, so pass β explicitly for TRL parity;
+  flag help documents this). Step line shows `acc`/`margin` (+`nll`);
+  run-log `arm=exl3-simpo`, hyperparams in `notes` (**no CSV roll**). The
+  qerr reference-mismatch note is suppressed for simpo (no reference → no
+  mismatch); the ln-2 step-0 anchor does NOT exist for simpo (zero-margin
+  anchor is `-log σ(−γ)`, actual step-0 loss is data-dependent — comment at
+  the baseline eval).
+- `tests/test_preference.py` — `simpo_loss` vs hand formula (+ smoothing,
+  γ anchor incl. the γ=0 ⇒ ln 2 special case, zero-count clamp), a
+  **length-invariance** test (scaling summed logp and count together leaves
+  the loss unchanged — the point of the method), gradient direction.
+- Docs: fork README (what's-in-the-box + credits — SimPO/CPO papers,
+  `CPOTrainer` attribution), `training/README.md`.
+
+**Box list for next session:**
+1. Forward gate unchanged (nothing about the validated forward changed), then
+   a **SimPO smoke** on the Session-29 setup: Llama-3.2-3B,
+   `--dataset trl-lib/ultrafeedback_binarized`, `--inspect 3` first, then ~20
+   steps at defaults (β 2.0 / γ 0.5, `--lr 5e-6`-ish). Expect rising
+   `acc`/`margin`; per-step wall time clearly BELOW the Session-29 DPO run's
+   (no reference forward) is the cheap confirmation the reference is really
+   gone.
+2. The interesting A/B for backlog #2: **SimPO vs DPO on the same pairs +
+   held-out eval** (same-seed, eval split ON per the standing rules). SimPO's
+   pitch is equal-or-better alignment at half the step cost; γ ∈ {0.5, 1.0}
+   is the paper's main sensitivity.
+3. If DDP preference training (backlog #8) ever lands, note simpo is the
+   EASY arm: no reference forward and no KL estimate → no cross-rank
+   all-reduce needed beyond the usual grad sync.
+
+**Also this session — preference training wired into the YAML launcher (the
+other half of backlog #8).** `qlora_train.py` gained `method: dpo|kto|simpo`
+(alongside `sft`/`ebft`): a `PREF_METHODS` set, a `PREF_BACKEND`, and an
+explicit `PREF_KEYS`/`PREF_DEFAULTS` pair mirroring the `EBFT_KEYS`/
+`EBFT_DEFAULTS` pattern (the whole objective knob set forwarded — the backend
+defines every method's flags on one parser, so it ignores the ones it doesn't
+use; `PREF_DEFAULTS` lets a full config carry the preference section at
+defaults under `method: sft|ebft` without tripping the unsupported-key check).
+The launcher execs `qlora_train_pref.py` with `--method` + `--parallel`
+prepended; `parallel: ddp` under a preference method errors early (single/split
+only, same as ebft). New knobs surfaced as flat config keys: `beta` (null →
+per-method default), `gamma`, `sft_weight`, `dpo_loss`, `kto_loss`,
+`desirable_weight`/`undesirable_weight`, `label_smoothing`, and the preference
+data columns (`prompt_key`/`chosen_key`/`rejected_key`/`completion_key`/
+`label_key`, plus `dataset_config`). Files: `qlora_train.py`, a documented
+preference section added to `qlora_train_config.yaml` (at defaults, so the sft
+path is untouched), and a new ready-to-run `qlora_train_pref_config.yaml`
+(switch `method` between the three). Verified by `--dry-run` across all five
+methods (the emitted `qlora_train_pref.py` command is correct for dpo/kto/simpo,
+`parallel: split` works, `parallel: ddp`/an unsupported SFT knob like `pack`
+both error, and the sft/ebft dry-runs are byte-unchanged from before). NOTE the
+big reference config still does NOT one-key-switch to a preference method (it
+carries SFT data keys like `instruction_key`/`response_key` the preference
+backend rejects) — but it never one-key-switched to `ebft` either, which is
+why the dedicated `qlora_train_pref_config.yaml` / `semancer_*_ebft.yaml`
+templates exist. Remaining on backlog #8: the DDP preference arm itself (KTO's
+KL all-reduce; simpo needs nothing extra).
 
 ---
 

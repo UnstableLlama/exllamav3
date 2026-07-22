@@ -202,6 +202,18 @@ eval_cfm_samples: 0       # cap the CFM eval pass (the expensive rollout part) a
                           #   set. The full-set pass measured ~half the A/B's wall clock (Session 40)
 
 # ---------------------------------------------------------------------------
+# Preference optimization  (method: dpo | kto | simpo)
+#
+# Not configured here: preference training needs a preference-shaped dataset
+# (chosen/rejected columns for dpo|simpo, prompt/completion/label for kto),
+# which this file's SFT instruction/response Data section does not provide. Use
+# the dedicated, ready-to-run template, which documents every objective knob
+# (beta, gamma, sft_weight, dpo_loss, kto_loss, desirable/undesirable_weight):
+#   python training/qlora_train.py --config training/qlora_train_pref_config.yaml
+# ---------------------------------------------------------------------------
+dataset_config: null      # HF dataset config/subset name for `dataset` (used by ebft + preference)
+
+# ---------------------------------------------------------------------------
 # Data
 #
 # The loader is dataset-agnostic: either point the three *_key columns at an
