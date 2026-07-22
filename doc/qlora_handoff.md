@@ -125,8 +125,10 @@ bpw; ~50 GB on a 27B). Numbering below unchanged.
    fused softcap head removed the output-card logit spike).
 8. **Mirror newer features into the DDP arm** (A/B/C VRAM levers, `--optim`,
    SVD inits, preference training — the last also needs a cross-rank
-   all-reduce for KTO's KL estimate; simpo needs nothing extra, Session 48)
-   and **wire `qlora_train_pref.py` into the YAML launcher**.
+   all-reduce for KTO's KL estimate; simpo needs nothing extra, Session 48).
+   **Wiring `qlora_train_pref.py` into the YAML launcher is DONE (Session 48):**
+   `method: dpo|kto|simpo` + a `qlora_train_pref_config.yaml` template,
+   single/split only. What remains under this item is the DDP preference arm.
 9. **Query-tiled big-head attention** + drop the pointless GQA
    `repeat_interleave` in the `sdpa` branch (Session 8 #1/#2; only bites at
    8k+ context on head_dim-512 layers).
@@ -4533,6 +4535,34 @@ length-exploitation bias. TRL implements it inside `CPOTrainer`
 3. If DDP preference training (backlog #8) ever lands, note simpo is the
    EASY arm: no reference forward and no KL estimate → no cross-rank
    all-reduce needed beyond the usual grad sync.
+
+**Also this session — preference training wired into the YAML launcher (the
+other half of backlog #8).** `qlora_train.py` gained `method: dpo|kto|simpo`
+(alongside `sft`/`ebft`): a `PREF_METHODS` set, a `PREF_BACKEND`, and an
+explicit `PREF_KEYS`/`PREF_DEFAULTS` pair mirroring the `EBFT_KEYS`/
+`EBFT_DEFAULTS` pattern (the whole objective knob set forwarded — the backend
+defines every method's flags on one parser, so it ignores the ones it doesn't
+use; `PREF_DEFAULTS` lets a full config carry the preference section at
+defaults under `method: sft|ebft` without tripping the unsupported-key check).
+The launcher execs `qlora_train_pref.py` with `--method` + `--parallel`
+prepended; `parallel: ddp` under a preference method errors early (single/split
+only, same as ebft). New knobs surfaced as flat config keys: `beta` (null →
+per-method default), `gamma`, `sft_weight`, `dpo_loss`, `kto_loss`,
+`desirable_weight`/`undesirable_weight`, `label_smoothing`, and the preference
+data columns (`prompt_key`/`chosen_key`/`rejected_key`/`completion_key`/
+`label_key`, plus `dataset_config`). Files: `qlora_train.py`, a documented
+preference section added to `qlora_train_config.yaml` (at defaults, so the sft
+path is untouched), and a new ready-to-run `qlora_train_pref_config.yaml`
+(switch `method` between the three). Verified by `--dry-run` across all five
+methods (the emitted `qlora_train_pref.py` command is correct for dpo/kto/simpo,
+`parallel: split` works, `parallel: ddp`/an unsupported SFT knob like `pack`
+both error, and the sft/ebft dry-runs are byte-unchanged from before). NOTE the
+big reference config still does NOT one-key-switch to a preference method (it
+carries SFT data keys like `instruction_key`/`response_key` the preference
+backend rejects) — but it never one-key-switched to `ebft` either, which is
+why the dedicated `qlora_train_pref_config.yaml` / `semancer_*_ebft.yaml`
+templates exist. Remaining on backlog #8: the DDP preference arm itself (KTO's
+KL all-reduce; simpo needs nothing extra).
 
 ---
 

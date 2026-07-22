@@ -202,6 +202,56 @@ eval_cfm_samples: 0       # cap the CFM eval pass (the expensive rollout part) a
                           #   set. The full-set pass measured ~half the A/B's wall clock (Session 40)
 
 # ---------------------------------------------------------------------------
+# Preference optimization  (method: dpo | kto | simpo -- ignored otherwise)
+#
+# Trains a LoRA adapter with a preference objective instead of next-token CE,
+# on the same native forward (qlora_train_pref.py). single|split only (no ddp).
+# The knobs below are exposed here for reference; a preference run also needs a
+# preference-shaped dataset (chosen/rejected columns for dpo|simpo, or
+# prompt/completion/label for kto), which the SFT `instruction/response` keys in
+# the Data section below do NOT provide -- so start from the dedicated,
+# ready-to-run template instead of switching this file's method:
+#   python training/qlora_train.py --config training/qlora_train_pref_config.yaml
+#
+# Methods:
+#   dpo   -- paired chosen/rejected; frozen quantized base is the reference
+#            model via the adapter-disable trick (no second model copy).
+#   kto   -- UNPAIRED prompt/completion + a desirable/undesirable label; also
+#            reference-based. Needs batch >= 2 (KL reference point is estimated
+#            from mismatched pairs in the micro-batch).
+#   simpo -- paired chosen/rejected, REFERENCE-FREE (length-normalized reward
+#            with a target margin gamma). No reference forward -> ~half a dpo
+#            step's compute, SFT's VRAM story.
+#
+# Preference LRs run ~10-100x BELOW SFT (lr: above; 5e-6 .. 5e-5 is typical).
+# ---------------------------------------------------------------------------
+beta: null                # inverse temperature on the (log-)reward. null picks the per-method
+                          #   default: 0.1 for dpo/kto (TRL default), 2.0 for simpo (the paper's
+                          #   2.0-2.5 range -- note TRL's CPOConfig still defaults 0.1)
+label_smoothing: 0.0      # (dpo sigmoid / simpo) cDPO-style robust label-flip probability
+gamma: 0.5                # (simpo) target reward margin on the length-normalized logp difference
+                          #   (TRL's simpo_gamma; paper range 0.5-1.6, scaled with beta)
+sft_weight: 0.0           # (simpo) weight of an added NLL loss on the CHOSEN completions (TRL
+                          #   CPOTrainer's cpo_alpha). 0 = pure SimPO; >0 = the CPO-SimPO mix
+dpo_loss: sigmoid         # (dpo) sigmoid (default; + label_smoothing = cDPO) | hinge (SLiC) |
+                          #   ipo (length-normalized)
+kto_loss: kto             # (kto) kto (batch-KL reference point, needs batch >= 2) |
+                          #   apo_zero_unpaired (no KL term)
+desirable_weight: 1.0     # (kto) loss weight on desirable examples (lambda_D)
+undesirable_weight: 1.0   # (kto) loss weight on undesirable examples (lambda_U)
+# Preference DATA columns (see the dedicated template above for a full example):
+prompt_key: prompt        # prompt column (string, or a TRL-conversational message list)
+chosen_key: chosen        # (dpo/simpo) preferred-completion column
+rejected_key: rejected    # (dpo/simpo) dispreferred-completion column
+completion_key: completion   # (kto) the single-completion column
+label_key: label          # (kto) bool/int column; truthy = desirable
+# dataset / dataset_split / seq_len / prompt_format / max_samples / shuffle /
+# eval_split / val_frac / lr / optim / r / alpha / init_lora / ... are shared
+# with the sections above. Note dataset_config below is also read by preference
+# runs (HF dataset config name for the paired/labeled set).
+dataset_config: null      # HF dataset config/subset name for `dataset` (preference + ebft)
+
+# ---------------------------------------------------------------------------
 # Data
 #
 # The loader is dataset-agnostic: either point the three *_key columns at an

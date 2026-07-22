@@ -1,0 +1,133 @@
+# EXL3 preference-optimization config (DPO / KTO / SimPO) -- ready to run.
+#   python training/qlora_train.py --config training/qlora_train_pref_config.yaml
+#   python training/qlora_train.py --config training/qlora_train_pref_config.yaml --dry-run
+#
+# One backend (qlora_train_pref.py) serves all three methods; switch with the
+# `method` key below. Keys mirror the backend CLI flags one-to-one (snake_case
+# here; the launcher converts to --kebab-case). Preference training is
+# single|split only (no ddp). Verify a NEW dataset once with `inspect: 3` -- it
+# decodes the first N built examples (prompt / chosen / rejected spans, or
+# prompt / completion / label) and exits without training.
+
+# ---------------------------------------------------------------------------
+# Required
+# ---------------------------------------------------------------------------
+model: /path/to/exl3_model         # directory of the EXL3-quantized model
+out: out/exl3_pref_adapter         # adapter output dir (PEFT format)
+
+# ---------------------------------------------------------------------------
+# Objective
+# ---------------------------------------------------------------------------
+method: dpo               # dpo: paired chosen/rejected, frozen base = reference (adapter-disable
+                          #   trick, no second model copy).
+                          # kto: UNPAIRED prompt/completion + desirable/undesirable label; also
+                          #   reference-based; needs batch >= 2 (KL point from mismatched pairs).
+                          # simpo: paired chosen/rejected, REFERENCE-FREE (length-normalized reward
+                          #   + target margin gamma) -- no reference forward, ~half a dpo step
+parallel: single          # single: one GPU (`device`). split: layers autosplit across all visible
+                          #   GPUs (then set reserve_per_device / use_per_device if needed)
+device: cuda:0
+
+beta: null                # inverse temperature. null = per-method default: 0.1 for dpo/kto, 2.0
+                          #   for simpo (the paper's 2.0-2.5; TRL's CPOConfig still defaults 0.1)
+label_smoothing: 0.0      # (dpo sigmoid / simpo) cDPO-style robust label-flip probability
+
+# --- dpo-only ---
+dpo_loss: sigmoid         # sigmoid (default; + label_smoothing = cDPO) | hinge (SLiC) | ipo
+# --- kto-only (method: kto) ---
+kto_loss: kto             # kto (batch-KL reference point, needs batch >= 2) | apo_zero_unpaired
+desirable_weight: 1.0     # loss weight lambda_D on desirable rows
+undesirable_weight: 1.0   # loss weight lambda_U on undesirable rows
+# --- simpo-only (method: simpo) ---
+gamma: 0.5                # target reward margin (TRL simpo_gamma; paper 0.5-1.6, scales with beta)
+sft_weight: 0.0           # add an NLL loss on the chosen completions (TRL cpo_alpha). 0 = pure
+                          #   SimPO; >0 = the CPO-SimPO mix
+
+# ---------------------------------------------------------------------------
+# LoRA adapter + init  (same knobs as the SFT config)
+# ---------------------------------------------------------------------------
+r: 32
+alpha: 32.0               # preference recipes commonly use alpha = r (scale 1.0)
+use_rslora: false
+targets: null             # null = default attn+mlp projections; MoE routed experts opt in via
+                          #   [q_proj ... expert_gate_proj expert_up_proj expert_down_proj]
+expert_r: null
+init_lora: default        # default | pissa | qerr | eva. pissa/eva/default keep reference == step-0
+                          #   policy exactly (dpo baseline loss = ln 2). qerr does not (dpo/kto only;
+                          #   simpo is reference-free so the caveat never applies)
+init_svd_niter: 16
+init_ref_model: null      # ORIGINAL unquantized HF model dir (required by init_lora: qerr)
+init_eva_tokens: 65536
+
+# ---------------------------------------------------------------------------
+# Optimization  (preference LRs run ~10-100x BELOW SFT)
+# ---------------------------------------------------------------------------
+lr: 5.0e-6                # TRL DPO default 1e-6; 5e-6 .. 5e-5 is a common LoRA range
+weight_decay: 0.01
+optim: adamw              # adamw | adamw8bit | paged_adamw8bit
+scheduler: cosine         # none | linear | cosine
+warmup_ratio: 0.1
+warmup_steps: 0
+epochs: 1.0               # >0: derive steps to cover this many passes (steps ignored)
+steps: 1000
+batch: 2                  # examples per micro-batch. A dpo/simpo PAIR is 2 sequences (chosen +
+                          #   rejected share one forward); kto's KL estimate needs batch >= 2
+grad_accum: 8             # batch x grad_accum = effective batch; raise this (not batch) when tight
+max_grad_norm: 1.0
+
+# ---------------------------------------------------------------------------
+# Data
+#
+# dpo/simpo: paired rows -> prompt_key / chosen_key / rejected_key (TRL
+#   "explicit prompt" format; a plain string OR a conversational message list
+#   is accepted for each). e.g. trl-lib/ultrafeedback_binarized.
+# kto: unpaired rows -> prompt_key / completion_key / label_key (truthy =
+#   desirable). e.g. trl-lib/kto-mix-14k.
+# `dataset` takes a HF Hub id or a local .jsonl/.json/.parquet/.csv path.
+# ---------------------------------------------------------------------------
+dataset: trl-lib/ultrafeedback_binarized
+dataset_split: train
+dataset_config: null      # HF dataset config/subset name (null = default)
+prompt_key: prompt
+chosen_key: chosen        # (dpo/simpo)
+rejected_key: rejected    # (dpo/simpo)
+completion_key: completion   # (kto)
+label_key: label          # (kto) truthy = desirable
+prompt_format: auto       # model's native chat template; or mistral / llama3 / qwen3.5 /
+                          #   qwen3.5-nothink / gemma4-nothink / chatml / metharme
+max_samples: 0            # 0 = all source rows
+shuffle: false
+shuffle_seed: 0
+seq_len: 1024             # max prompt+completion tokens; completion tail truncated, prompt-only
+                          #   overflow rows skipped
+inspect: 0                # decode the first N built examples and exit (set 3 to sanity-check a set)
+
+# ---------------------------------------------------------------------------
+# Compute / VRAM levers  (subset shared with the SFT trainer)
+# ---------------------------------------------------------------------------
+compute_dtype: bfloat16
+no_grad_ckpt: false
+attn_impl: auto
+ce_chunk: 1024
+head_vocab_chunk: 0       # big-vocab models: reconstruct the frozen head in vocab chunks (try 32768)
+offload_activations: false
+offload_mode: async
+use_liger: false
+dequant_mode: fast        # fast (default) | legacy
+dequant_cache: false
+
+# ---------------------------------------------------------------------------
+# Eval / checkpoints / run log
+# ---------------------------------------------------------------------------
+eval_split: null          # held-out split of the dataset (e.g. test) for pref-loss + reward metrics
+eval_dataset: null        # defaults to `dataset`
+eval_max_samples: 0
+val_frac: 0.0             # no eval_split? carve this fraction off train as held-out instead
+eval_every: 0             # report held-out pref-loss every N steps (0 = only at the end)
+save_best: false          # keep the checkpoint with the best held-out pref-loss (needs eval)
+save_every: 0             # overwrite the adapter at `out` every N steps (0 = end only; Ctrl-C saves)
+checkpoint_every: 0       # retained checkpoints to out/checkpoint-<step>
+keep_checkpoints: 0
+resume: null              # checkpoint dir to resume (optimizer + scheduler + data position)
+reset_optimizer: false
+run_log: qlora_runs.csv   # CSV run log (arm = exl3-dpo|exl3-kto|exl3-simpo)

@@ -23,11 +23,14 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
 
 - `qlora_train.py` + `qlora_train_config.yaml` — the YAML launcher (single
   command entry point) and its fully-commented reference config. `method:`
-  picks the objective — `sft` (next-token CE, default) or `ebft` — and
-  `parallel:` picks the single-GPU, layer-split, or DDP backend (`ebft` is
+  picks the objective — `sft` (next-token CE, default), `ebft`, or a preference
+  objective `dpo` / `kto` / `simpo` — and `parallel:` picks the single-GPU,
+  layer-split, or DDP backend (`ebft` and the preference methods are
   single/split only). A paired SFT-vs-EBFT A/B is the same config with only
   `method` (and `out`/`run_name`) changed; see `semancer_llama1b_{sft,ebft}.yaml`
-  in the repo root for a worked pair.
+  in the repo root for a worked pair. The preference methods need a
+  preference-shaped dataset, so they get their own ready-to-run template,
+  `qlora_train_pref_config.yaml` (switch `method` between `dpo`/`kto`/`simpo`).
 - `qlora_train_native.py` — the single-GPU / layer-split SFT trainer (plain
   PyTorch, no transformers). Also home to the shared data/tokenization helpers
   the other trainers import.

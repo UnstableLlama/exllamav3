@@ -2,12 +2,23 @@
 YAML-driven QLoRA training launcher.
 
 Single command entry point for the native EXL3 QLoRA trainers. ``method:``
-selects the objective -- ``sft`` (next-token CE, the default) or ``ebft``
-(Energy-Based Fine-Tuning) -- and ``parallel:`` selects ``single``, ``split`` or
-``ddp``; this launcher then execs the matching backend with the corresponding
-command-line arguments. ``method: ebft`` runs the EBFT backend and supports
-``parallel: single|split`` only (no ddp). For DDP, run this script directly (not
-under torchrun): it will launch torchrun using the ``ddp`` section in the config.
+selects the objective -- ``sft`` (next-token CE, the default), ``ebft``
+(Energy-Based Fine-Tuning), or a preference objective ``dpo`` / ``kto`` /
+``simpo`` -- and ``parallel:`` selects ``single``, ``split`` or ``ddp``; this
+launcher then execs the matching backend with the corresponding command-line
+arguments. ``method: ebft`` and the preference methods run their own backends
+and support ``parallel: single|split`` only (no ddp). For DDP, run this script
+directly (not under torchrun): it will launch torchrun using the ``ddp`` section
+in the config.
+
+The preference methods share the ``qlora_train_pref.py`` backend: ``dpo`` and
+``simpo`` want paired ``chosen``/``rejected`` data (keys
+``prompt_key``/``chosen_key``/``rejected_key``), ``kto`` wants unpaired
+``prompt``/``completion``/``label`` rows. Objective knobs (``beta``, ``gamma``,
+``sft_weight``, ``dpo_loss``, ``kto_loss``, ``desirable_weight`` /
+``undesirable_weight``, ``label_smoothing``) are exposed as flat config keys;
+leave the ones for other methods at their defaults. Note ``beta`` left null
+picks the backend's per-method default (0.1 for dpo/kto, 2.0 for simpo).
 
 Usage:
     python training/qlora_train.py --config training/qlora_train_config.yaml
@@ -28,8 +39,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SINGLE_BACKEND = SCRIPT_DIR / "qlora_train_native.py"
 DDP_BACKEND = SCRIPT_DIR / "qlora_train_native_ddp.py"
 EBFT_BACKEND = SCRIPT_DIR / "qlora_train_ebft.py"
+PREF_BACKEND = SCRIPT_DIR / "qlora_train_pref.py"
 
-METHOD_CHOICES = {"sft", "ebft"}
+# Preference-optimization methods share one backend (qlora_train_pref.py).
+PREF_METHODS = {"dpo", "kto", "simpo"}
+METHOD_CHOICES = {"sft", "ebft"} | PREF_METHODS
 
 
 # Config keys that are launcher-only and must not be forwarded to backend scripts.
@@ -111,6 +125,63 @@ EBFT_KEYS = {
     "sample_every", "sample_prompt",
     # local run report
     "no_report", "run_name",
+}
+
+# Keys forwarded to the preference backend (qlora_train_pref.py) when method is
+# dpo|kto|simpo. Explicit, like EBFT_KEYS, so an unsupported knob under a
+# preference method fails early instead of being silently dropped. ``method``
+# and ``parallel`` are appended by the launcher, not from here. NOTE the
+# preference backend defines EVERY objective's knobs on one argparser, so
+# forwarding the whole set is safe: a method ignores the flags it doesn't use
+# (e.g. --gamma under dpo). It is single/split only -- no ddp, no packing, no
+# trainable embed/head, no eval2/messages/instruction dataset shapes.
+PREF_KEYS = {
+    # identity / placement
+    "model", "out", "device", "reserve_per_device", "use_per_device",
+    # LoRA / init
+    "r", "alpha", "use_rslora", "targets", "expert_r", "init_lora",
+    "init_svd_niter", "init_ref_model", "init_eva_tokens",
+    # preference objective (all methods' knobs live on one parser)
+    "beta", "label_smoothing", "gamma", "sft_weight",
+    "dpo_loss", "kto_loss", "desirable_weight", "undesirable_weight",
+    # optimization
+    "lr", "weight_decay", "optim", "scheduler", "warmup_ratio",
+    "warmup_steps", "epochs", "steps", "batch", "grad_accum", "max_grad_norm",
+    # data
+    "dataset", "dataset_split", "dataset_config", "prompt_key",
+    "chosen_key", "rejected_key", "completion_key", "label_key",
+    "prompt_format", "max_samples", "shuffle", "shuffle_seed", "seq_len",
+    "inspect",
+    # eval / saving
+    "eval_split", "eval_dataset", "eval_max_samples", "val_frac", "eval_every",
+    "save_best", "save_every", "checkpoint_every", "keep_checkpoints",
+    "resume", "reset_optimizer", "run_log",
+    # runtime knobs shared with the SFT trainer
+    "compute_dtype", "no_grad_ckpt", "attn_impl", "ce_chunk",
+    "head_vocab_chunk", "offload_activations", "offload_mode", "use_liger",
+    "dequant_mode", "dequant_cache",
+}
+
+# Preference-only knobs at the backend's argparse defaults. Mirrors
+# EBFT_DEFAULTS: lets a full sample config carry the preference section at its
+# defaults under method: sft|ebft (where these keys aren't forwarded) without
+# tripping the unsupported-key check -- only a non-default preference value
+# under a non-preference method is an error. ``beta`` defaults to None in the
+# backend (it then picks 0.1 for dpo/kto, 2.0 for simpo), so leave it null.
+PREF_DEFAULTS = {
+    "beta": None,
+    "label_smoothing": 0.0,
+    "gamma": 0.5,
+    "sft_weight": 0.0,
+    "dpo_loss": "sigmoid",
+    "kto_loss": "kto",
+    "desirable_weight": 1.0,
+    "undesirable_weight": 1.0,
+    "prompt_key": "prompt",
+    "chosen_key": "chosen",
+    "rejected_key": "rejected",
+    "completion_key": "completion",
+    "label_key": "label",
 }
 
 # EBFT-only knobs at their reference-code defaults. Mirrors SINGLE_ONLY_DEFAULTS:
@@ -296,7 +367,7 @@ def validate_config(cfg: dict[str, Any], parallel: str, method: str) -> None:
     # chosen backend does not accept are checked below and may remain present
     # when empty/false.
     supported = (COMMON_KEYS | SINGLE_ONLY_KEYS | DDP_ONLY_KEYS
-                 | EBFT_KEYS | LAUNCHER_KEYS)
+                 | EBFT_KEYS | PREF_KEYS | LAUNCHER_KEYS)
     unknown = sorted(k for k in cfg if k not in supported)
     if unknown:
         raise SystemExit("Unknown config key(s): " + ", ".join(unknown))
@@ -305,7 +376,13 @@ def validate_config(cfg: dict[str, Any], parallel: str, method: str) -> None:
         raise SystemExit("config must set `model: /path/to/exl3_model`")
 
     # The set of keys the chosen backend actually accepts.
-    if method == "ebft":
+    if method in PREF_METHODS:
+        allowed, label = PREF_KEYS, f"method: {method}"
+        if not cfg.get("dataset"):
+            raise SystemExit(f"method: {method} requires `dataset:` "
+                             "(a paired chosen/rejected set for dpo/simpo, or a "
+                             "prompt/completion/label set for kto)")
+    elif method == "ebft":
         allowed, label = EBFT_KEYS, "method: ebft"
     elif parallel == "ddp":
         allowed, label = COMMON_KEYS | DDP_ONLY_KEYS, "parallel: ddp"
@@ -323,6 +400,8 @@ def validate_config(cfg: dict[str, Any], parallel: str, method: str) -> None:
         if key in SINGLE_ONLY_DEFAULTS and value == SINGLE_ONLY_DEFAULTS[key]:
             continue
         if key in EBFT_DEFAULTS and value == EBFT_DEFAULTS[key]:
+            continue
+        if key in PREF_DEFAULTS and value == PREF_DEFAULTS[key]:
             continue
         if is_default_false(value):
             continue
@@ -347,6 +426,10 @@ def build_backend_argv(cfg: dict[str, Any], config_path: Path) -> list[str]:
     cfg["parallel"] = parallel
     if method == "ebft" and parallel == "ddp":
         raise SystemExit("method: ebft supports parallel: single|split only (no ddp).")
+    if method in PREF_METHODS and parallel == "ddp":
+        raise SystemExit(f"method: {method} supports parallel: single|split only "
+                         "(no ddp -- KTO's KL estimate would need a cross-rank "
+                         "all-reduce; see backlog #8).")
     validate_config(cfg, parallel, method)
 
     # EBFT: exec the EBFT backend, forwarding only the keys it accepts.
@@ -354,6 +437,17 @@ def build_backend_argv(cfg: dict[str, Any], config_path: Path) -> list[str]:
         argv: list[str] = [sys.executable, str(EBFT_BACKEND)]
         append_arg(argv, "parallel", parallel, ddp=False)  # accepts single|split
         for key in sorted(EBFT_KEYS):
+            if key in cfg:
+                append_arg(argv, key, cfg[key], ddp=False)
+        return argv
+
+    # Preference optimization (dpo|kto|simpo): exec the preference backend,
+    # forwarding --method + only the keys it accepts.
+    if method in PREF_METHODS:
+        argv = [sys.executable, str(PREF_BACKEND)]
+        append_arg(argv, "method", method, ddp=False)
+        append_arg(argv, "parallel", parallel, ddp=False)  # accepts single|split
+        for key in sorted(PREF_KEYS):
             if key in cfg:
                 append_arg(argv, key, cfg[key], ddp=False)
         return argv
