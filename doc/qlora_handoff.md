@@ -125,8 +125,8 @@ bpw; ~50 GB on a 27B). Numbering below unchanged.
    fused softcap head removed the output-card logit spike).
 8. **Mirror newer features into the DDP arm** (A/B/C VRAM levers, `--optim`,
    SVD inits, preference training — the last also needs a cross-rank
-   all-reduce for KTO's KL estimate) and **wire `qlora_train_pref.py` into the
-   YAML launcher**.
+   all-reduce for KTO's KL estimate; simpo needs nothing extra, Session 48)
+   and **wire `qlora_train_pref.py` into the YAML launcher**.
 9. **Query-tiled big-head attention** + drop the pointless GQA
    `repeat_interleave` in the `sdpa` branch (Session 8 #1/#2; only bites at
    8k+ context on head_dim-512 layers).
@@ -4466,6 +4466,73 @@ A/B, `prompt_format: qwen3.5-nothink`, `offload_activations: false` (EBFT host-O
 rule). VRAM watch: 4B (32 layers / hidden 2560) at batch 4 / 64 rollout rows may
 approach 24 GB — if the EBFT arm OOMs, drop `batch` to 2 (rollout rows 32), NOT
 offload.
+
+---
+
+### Session 48 — SimPO (`--method simpo`): reference-free preference training
+
+> 2026-07-22. Branch `claude/simpo-implementation-wvfd3x`. Container-verified
+> (all preference/fused_ce/qlora_grad/lora_init CPU suites pass, incl. three
+> new SimPO tests, plus a stub-import smoke of the trainer-level batch fn);
+> **nothing box-verified yet** — smoke list below. Extends the Session-16
+> DPO/KTO preference stack with a third method; no shared code paths changed
+> (pure addition: one loss fn, one batch fn, CLI wiring).
+
+**Why SimPO** (Meng et al. 2024, arXiv:2405.14734): reference-FREE preference
+optimization — the implicit reward is the length-normalized policy logprob
+`β·logπ(y|x)/|y|` with a target margin γ, so there is **no frozen-base
+forward at all**. On our stack that means a SimPO step is ~half the compute
+of a DPO step on the same pairs (DPO = one 2b-row policy forward + one 2b-row
+no-grad reference forward; SimPO = the policy forward only) with SFT's exact
+VRAM story. The length normalization is also the paper's answer to DPO's
+length-exploitation bias. TRL implements it inside `CPOTrainer`
+(`loss_type="simpo"`, γ = `simpo_gamma`); we follow those semantics.
+
+**What was built:**
+- `exllamav3/training/preference.py` — `simpo_loss(policy_chosen_logps,
+  policy_rejected_logps, chosen_counts, rejected_counts, beta, gamma,
+  label_smoothing)`: takes the SUMMED logps + counts exactly as
+  `compute_logps` returns them, normalizes inside, loss
+  `-log σ(β·Δ̄ − γ)` with cDPO-style smoothing; rewards = `β·avg logp`,
+  detached. Counts clamped `min=1`.
+- `training/qlora_train_pref.py` — `--method simpo`. Shares the DPO data
+  format/keys and the chosen-block/rejected-block single policy forward;
+  skips the reference forward entirely. New knobs: `--gamma` (default 0.5 =
+  TRL's `simpo_gamma`; paper range 0.5–1.6, scaled with β) and
+  `--sft-weight` (TRL `CPOTrainer`'s `cpo_alpha`: adds the batch-token-mean
+  NLL of the CHOSEN completions — 0 = pure-paper SimPO (default), >0 = the
+  CPO-SimPO mix; logged as `nll` in the step line/eval when on).
+  `--label-smoothing` applies. **`--beta` now defaults per-method**: 0.1 for
+  dpo/kto (unchanged), **2.0 for simpo** (the paper's 2.0–2.5 — note TRL's
+  `CPOConfig` still defaults β=0.1, so pass β explicitly for TRL parity;
+  flag help documents this). Step line shows `acc`/`margin` (+`nll`);
+  run-log `arm=exl3-simpo`, hyperparams in `notes` (**no CSV roll**). The
+  qerr reference-mismatch note is suppressed for simpo (no reference → no
+  mismatch); the ln-2 step-0 anchor does NOT exist for simpo (zero-margin
+  anchor is `-log σ(−γ)`, actual step-0 loss is data-dependent — comment at
+  the baseline eval).
+- `tests/test_preference.py` — `simpo_loss` vs hand formula (+ smoothing,
+  γ anchor incl. the γ=0 ⇒ ln 2 special case, zero-count clamp), a
+  **length-invariance** test (scaling summed logp and count together leaves
+  the loss unchanged — the point of the method), gradient direction.
+- Docs: fork README (what's-in-the-box + credits — SimPO/CPO papers,
+  `CPOTrainer` attribution), `training/README.md`.
+
+**Box list for next session:**
+1. Forward gate unchanged (nothing about the validated forward changed), then
+   a **SimPO smoke** on the Session-29 setup: Llama-3.2-3B,
+   `--dataset trl-lib/ultrafeedback_binarized`, `--inspect 3` first, then ~20
+   steps at defaults (β 2.0 / γ 0.5, `--lr 5e-6`-ish). Expect rising
+   `acc`/`margin`; per-step wall time clearly BELOW the Session-29 DPO run's
+   (no reference forward) is the cheap confirmation the reference is really
+   gone.
+2. The interesting A/B for backlog #2: **SimPO vs DPO on the same pairs +
+   held-out eval** (same-seed, eval split ON per the standing rules). SimPO's
+   pitch is equal-or-better alignment at half the step cost; γ ∈ {0.5, 1.0}
+   is the paper's main sensitivity.
+3. If DDP preference training (backlog #8) ever lands, note simpo is the
+   EASY arm: no reference forward and no KL estimate → no cross-rank
+   all-reduce needed beyond the usual grad sync.
 
 ---
 

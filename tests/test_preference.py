@@ -1,14 +1,15 @@
 """
-CPU tests for preference training (DPO / KTO) support:
+CPU tests for preference training (DPO / KTO / SimPO) support:
 
   * the fused CE heads' ``reduction="none"`` per-token mode (the streaming
     building block for per-sequence logprobs) -- parity vs
     ``F.cross_entropy(reduction='none')``, vector-grad_output backward parity,
     gradcheck, and single-shot vs vocab-chunked agreement;
   * per-row completion logprob sums (the ``compute_logps`` core);
-  * ``dpo_loss`` / ``kto_loss`` formulas vs hand-written references (TRL
-    semantics: sigmoid + label smoothing, hinge, ipo; KTO KL clamp, weights,
-    apo_zero_unpaired) and the mismatched-pair KL rotation;
+  * ``dpo_loss`` / ``kto_loss`` / ``simpo_loss`` formulas vs hand-written
+    references (TRL semantics: sigmoid + label smoothing, hinge, ipo; KTO KL
+    clamp, weights, apo_zero_unpaired; SimPO gamma margin, length
+    normalization/invariance) and the mismatched-pair KL rotation;
   * ``DiffLinear.adapter_enabled`` -- the reference-model view is the PURE
     frozen base (LoRA term AND pissa offset off) -- plus the
     ``adapters_disabled()`` context manager's flag handling.
@@ -58,6 +59,7 @@ DiffLinear = _nl.DiffLinear
 NativeLlamaQLoRA = _nl.NativeLlamaQLoRA
 dpo_loss = _pref.dpo_loss
 kto_loss = _pref.kto_loss
+simpo_loss = _pref.simpo_loss
 mismatched_kl_shift = _pref.mismatched_kl_shift
 
 
@@ -263,6 +265,80 @@ def test_dpo_gradient_direction():
 
 
 # ----------------------------------------------------------------------------
+# SimPO loss
+# ----------------------------------------------------------------------------
+
+def test_simpo_formula():
+    """simpo_loss vs the hand-written TRL CPOTrainer(loss_type='simpo') form:
+    -log sigmoid(beta * (avg_c - avg_r) - gamma), rewards = beta * avg logp
+    (detached), cDPO-style label smoothing."""
+    torch.manual_seed(10)
+    b, beta, gamma = 8, 2.0, 0.7
+    nc = torch.randint(3, 30, (b,))
+    nr = torch.randint(3, 30, (b,))
+    pc = -torch.rand(b) * nc          # plausible summed logps (negative)
+    pr = -torch.rand(b) * nr
+
+    losses, cr, rr = simpo_loss(pc, pr, nc, nr, beta=beta, gamma=gamma)
+    avg_c, avg_r = pc / nc, pr / nr
+    logits = beta * (avg_c - avg_r) - gamma
+    assert torch.allclose(losses, -F.logsigmoid(logits), atol=1e-7), \
+        "SimPO loss mismatch"
+    assert torch.allclose(cr, beta * avg_c) and torch.allclose(rr, beta * avg_r)
+    assert not cr.requires_grad and not rr.requires_grad
+
+    # Label smoothing: epsilon-weighted flipped term.
+    eps = 0.1
+    losses_ls, _, _ = simpo_loss(pc, pr, nc, nr, beta=beta, gamma=gamma,
+                                 label_smoothing=eps)
+    ref_ls = -(1 - eps) * F.logsigmoid(logits) - eps * F.logsigmoid(-logits)
+    assert torch.allclose(losses_ls, ref_ls, atol=1e-7), "smoothed SimPO mismatch"
+
+    # Zero avg-logp margin -> loss is exactly -log sigmoid(-gamma) (the only
+    # fixed anchor SimPO has; note it is NOT ln 2 unless gamma == 0).
+    l0, _, _ = simpo_loss(pc, pc, nc, nc, beta=beta, gamma=gamma)
+    anchor = -F.logsigmoid(torch.tensor(-gamma))
+    assert torch.allclose(l0, anchor.expand_as(l0), atol=1e-7), "gamma anchor"
+    lg0, _, _ = simpo_loss(pc, pc, nc, nc, beta=beta, gamma=0.0)
+    ln2 = float(torch.log(torch.tensor(2.0)))
+    assert torch.allclose(lg0, torch.full_like(lg0, ln2), atol=1e-7)
+
+    # Zero counts must clamp, not divide by zero.
+    z = torch.zeros(b, dtype=torch.long)
+    lz, _, _ = simpo_loss(pc, pr, z, z, beta=beta, gamma=gamma)
+    assert torch.isfinite(lz).all(), "zero-count clamp failed"
+    print("[pref] SimPO formula + smoothing + gamma anchor PASSED")
+
+
+def test_simpo_length_invariance():
+    """The whole point of SimPO's normalization: scaling a completion's summed
+    logp and token count by the same factor leaves the loss unchanged (a
+    longer completion with the same per-token quality scores the same)."""
+    torch.manual_seed(11)
+    b = 6
+    nc = torch.randint(3, 30, (b,))
+    nr = torch.randint(3, 30, (b,))
+    pc, pr = -torch.rand(b) * nc, -torch.rand(b) * nr
+    l1, _, _ = simpo_loss(pc, pr, nc, nr, beta=2.0, gamma=0.5)
+    l2, _, _ = simpo_loss(3 * pc, 5 * pr, 3 * nc, 5 * nr, beta=2.0, gamma=0.5)
+    assert torch.allclose(l1, l2, atol=1e-6), "length invariance broken"
+    print("[pref] SimPO length invariance PASSED")
+
+
+def test_simpo_gradient_direction():
+    """The gradient pushes chosen logps UP and rejected logps DOWN; no
+    reference tensors are involved anywhere in the graph."""
+    pc = torch.zeros(4, requires_grad=True)
+    pr = torch.zeros(4, requires_grad=True)
+    counts = torch.full((4,), 10)
+    losses, _, _ = simpo_loss(pc, pr, counts, counts, beta=2.0, gamma=0.5)
+    losses.mean().backward()
+    assert torch.all(pc.grad < 0), "chosen grad should be negative (ascent on logp)"
+    assert torch.all(pr.grad > 0), "rejected grad should be positive"
+    print("[pref] SimPO gradient direction PASSED")
+
+
+# ----------------------------------------------------------------------------
 # KTO loss
 # ----------------------------------------------------------------------------
 
@@ -440,6 +516,9 @@ def main():
         test_dpo_sigmoid,
         test_dpo_hinge_ipo,
         test_dpo_gradient_direction,
+        test_simpo_formula,
+        test_simpo_length_invariance,
+        test_simpo_gradient_direction,
         test_kto_formula,
         test_kto_apo_and_empty_subsets,
         test_mismatched_kl_shift,

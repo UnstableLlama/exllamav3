@@ -33,7 +33,12 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
   the other trainers import.
 - `qlora_train_native_ddp.py` — the multi-GPU DDP variant (run under
   `torchrun`).
-- `qlora_train_pref.py` — DPO / KTO preference training on the native path.
+- `qlora_train_pref.py` — DPO / KTO / SimPO preference training on the native
+  path. DPO/KTO use the adapter-disabled base as the frozen reference (no
+  second model copy); SimPO (`--method simpo`) is reference-free —
+  length-normalized rewards with a target margin `--gamma`, no reference
+  forward at all (roughly half the compute of a DPO step), optional
+  `--sft-weight` NLL mix (CPO-SimPO).
 - `qlora_train_ebft.py` — Energy-Based Fine-Tuning (EBFT, arXiv:2603.12248):
   on-policy feature-matching policy gradient. The frozen feature network is
   the adapter-disabled base (the DPO/KTO reference trick); rollouts use the
