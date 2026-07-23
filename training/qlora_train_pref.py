@@ -262,9 +262,13 @@ def dpo_batch_metrics(net, batch, pad_id, args):
         loss_type=args.dpo_loss,
         chosen_counts=counts[:b], rejected_counts=counts[b:])
     loss = losses.mean()
+    nll = (-pol_logps[:b] / counts[:b].clamp(min=1)).mean()   # mean-token NLL on chosen
+    if args.rpo_alpha > 0:                                     # RPO / DPO+SFT (Pang et al. 2024)
+        loss = loss + args.rpo_alpha * nll
     metrics = {
         "margin": (cr - rr).mean().item(),
         "acc": (cr > rr).float().mean().item(),
+        "nll": nll.item(),
         "sup": int((labels[:, 1:] != -100).sum()),
         "tot": int(attn.sum()),
         "n": b,
@@ -433,6 +437,12 @@ def _run_main():
                          "on the CHOSEN completions (TRL CPOTrainer's "
                          "cpo_alpha). 0 = the pure SimPO paper objective; "
                          "> 0 = the CPO-SimPO mix.")
+    ap.add_argument("--rpo-alpha", type=float, default=0.0,
+                    help="(dpo) RPO / DPO+SFT: weight on an auxiliary length-"
+                         "normalized NLL loss over the CHOSEN completion (Pang "
+                         "et al. 2024; TRL rpo_alpha). 0 = pure DPO; 1.0 is a "
+                         "sane start. Raises the ABSOLUTE prob of chosen so it "
+                         "actually generates, not just its reward vs rejected.")
     ap.add_argument("--dpo-loss", choices=list(DPO_LOSS_TYPES), default="sigmoid",
                     help="DPO variant: sigmoid (default), hinge (SLiC), ipo "
                          "(length-normalized).")
@@ -1005,6 +1015,7 @@ def _hparam_note(args):
     knobs)."""
     if args.method == "dpo":
         return (f"method=dpo beta={args.beta} loss={args.dpo_loss} "
+                f"rpo_alpha={args.rpo_alpha} "
                 f"label_smoothing={args.label_smoothing}")
     if args.method == "simpo":
         return (f"method=simpo beta={args.beta} gamma={args.gamma} "

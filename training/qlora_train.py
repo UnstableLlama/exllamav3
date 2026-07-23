@@ -142,7 +142,7 @@ PREF_KEYS = {
     "r", "alpha", "use_rslora", "targets", "expert_r", "init_lora",
     "init_svd_niter", "init_ref_model", "init_eva_tokens",
     # preference objective (all methods' knobs live on one parser)
-    "beta", "label_smoothing", "gamma", "sft_weight",
+    "beta", "label_smoothing", "gamma", "sft_weight", "rpo_alpha",
     "dpo_loss", "kto_loss", "desirable_weight", "undesirable_weight",
     # optimization
     "lr", "weight_decay", "optim", "scheduler", "warmup_ratio",
@@ -173,6 +173,7 @@ PREF_DEFAULTS = {
     "label_smoothing": 0.0,
     "gamma": 0.5,
     "sft_weight": 0.0,
+    "rpo_alpha": 0.0,
     "dpo_loss": "sigmoid",
     "kto_loss": "kto",
     "desirable_weight": 1.0,
